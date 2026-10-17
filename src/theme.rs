@@ -58,6 +58,13 @@ pub const INFO_BG: Color32 = Color32::from_rgb(232, 240, 253);
 pub const VIOLET: Color32 = Color32::from_rgb(110, 58, 205); // #6E3ACD
 pub const VIOLET_BG: Color32 = Color32::from_rgb(242, 236, 253);
 
+/// Status bar: near-black slate band anchored across the window base.
+pub const SB_BG: Color32 = Color32::from_rgb(27, 30, 38); // #1B1E26
+/// Light text on the status bar band.
+pub const SB_TEXT: Color32 = Color32::from_rgb(168, 176, 192); // #A8B0C0
+/// Faint text (version, secondary) on the status bar band.
+pub const SB_TEXT_FAINT: Color32 = Color32::from_rgb(112, 120, 136); // #707888
+
 /// Named text style for the big page title.
 pub fn h1() -> TextStyle {
     TextStyle::Name("app.h1".into())

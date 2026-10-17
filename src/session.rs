@@ -292,6 +292,118 @@ pub fn save_groups(groups: &[SessionGroup]) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+// ---------------------------------------------------------------------------
+// Standalone tunnels
+// ---------------------------------------------------------------------------
+
+/// A tunnel with its own SSH endpoint — carries its connection details, so it
+/// works without any saved session. Stored in `tunnels.json`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StandaloneTunnel {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    pub username: String,
+    pub auth_type: AuthType,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub key_path: String,
+    #[serde(default)]
+    pub key_passphrase: String,
+    #[serde(default)]
+    pub forwards: Vec<PortForward>,
+}
+
+fn default_ssh_port() -> u16 {
+    22
+}
+
+impl StandaloneTunnel {
+    /// Connection-level validation (same rules as sessions).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.host.trim().is_empty() {
+            return Err("SSH host is required".to_string());
+        }
+        if self.port == 0 {
+            return Err("SSH port must be > 0".to_string());
+        }
+        if self.username.trim().is_empty() {
+            return Err("SSH username is required".to_string());
+        }
+        match self.auth_type {
+            AuthType::Password => {
+                if self.password.is_empty() {
+                    return Err("Password is required for password auth".to_string());
+                }
+            }
+            AuthType::Key => {
+                if self.key_path.trim().is_empty() {
+                    return Err("Private key file is required for key auth".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `user@host:port`, as shown in UI lists.
+    pub fn connection_label(&self) -> String {
+        format!("{}@{}:{}", self.username.trim(), self.host.trim(), self.port)
+    }
+
+    /// Display name: optional label, falling back to the connection.
+    pub fn label(&self) -> String {
+        let n = self.name.trim();
+        if n.is_empty() {
+            self.connection_label()
+        } else {
+            n.to_string()
+        }
+    }
+
+    /// The tunnel engine is session-shaped; hand it a matching value so a
+    /// standalone tunnel can start/stop with the same code path.
+    pub fn to_ssh_session(&self) -> SshSession {
+        SshSession {
+            id: format!("tunnel-{}", self.id),
+            name: self.label(),
+            group: None,
+            host: self.host.clone(),
+            port: self.port,
+            username: self.username.clone(),
+            auth_type: self.auth_type.clone(),
+            password: self.password.clone(),
+            key_path: self.key_path.clone(),
+            key_passphrase: self.key_passphrase.clone(),
+            forwards: self.forwards.clone(),
+        }
+    }
+}
+
+pub fn tunnels_file() -> PathBuf {
+    config_base().join("culvert").join("tunnels.json")
+}
+
+pub fn load_tunnels() -> Vec<StandaloneTunnel> {
+    match fs::read_to_string(tunnels_file()) {
+        Ok(s) => serde_json::from_str::<Vec<StandaloneTunnel>>(strip_bom(&s)).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub fn save_tunnels(tunnels: &[StandaloneTunnel]) -> anyhow::Result<PathBuf> {
+    let path = tunnels_file();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(tunnels)?;
+    fs::write(&path, json)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

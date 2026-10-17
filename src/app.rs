@@ -6,8 +6,8 @@
 
 use crate::log::{LogEntry, LogLevel, SharedLogs};
 use crate::session::{
-    load_groups, load_sessions, save_groups, save_sessions, AuthType, ForwardType, PortForward,
-    SessionGroup, SshSession,
+    load_groups, load_sessions, load_tunnels, save_groups, save_sessions, save_tunnels, AuthType,
+    ForwardType, PortForward, SessionGroup, SshSession, StandaloneTunnel,
 };
 use crate::terminal::{TermStatus, TerminalSession};
 use crate::theme;
@@ -26,6 +26,8 @@ pub struct TunnelApp {
     /// Session buckets (Production, Staging, Home lab…). Sessions store the
     /// group id; groups live in their own file (order + dot color).
     groups: Vec<SessionGroup>,
+    /// Tunnels with their own SSH endpoint (no saved session required).
+    standalone_tunnels: Vec<StandaloneTunnel>,
     rt: tokio::runtime::Handle,
     logs: SharedLogs,
     tunnels: TunnelManager,
@@ -114,7 +116,23 @@ impl SessionEditor {
     }
 }
 
+/// Sentinel session id for tunnels that carry their own SSH connection
+/// (no saved session).
+const STANDALONE_TUNNEL: &str = "__standalone__";
+
 struct TunnelEditor {
+    /// True: tunnel stores its own SSH endpoint (nothing else required).
+    standalone: bool,
+    /// For standalone edits: the tunnel's id.
+    tunnel_id: Option<String>,
+    /// Standalone display label (optional).
+    name: String,
+    host: String,
+    ssh_port: String,
+    username: String,
+    auth_type: AuthType,
+    password: String,
+    key_path: String,
     forward_id: Option<String>,
     session_id: String,
     fwd_type: ForwardType,
@@ -129,6 +147,15 @@ struct TunnelEditor {
 impl TunnelEditor {
     fn new(session_id: String) -> Self {
         Self {
+            standalone: false,
+            tunnel_id: None,
+            name: String::new(),
+            host: String::new(),
+            ssh_port: "22".to_string(),
+            username: String::new(),
+            auth_type: AuthType::Password,
+            password: String::new(),
+            key_path: String::new(),
             forward_id: None,
             session_id,
             fwd_type: ForwardType::Local,
@@ -141,18 +168,44 @@ impl TunnelEditor {
         }
     }
 
-    fn from(session_id: &str, f: &PortForward) -> Self {
+    /// A tunnel that works on its own: fresh SSH details, no saved session.
+    fn new_standalone() -> Self {
         Self {
-            forward_id: Some(f.id.clone()),
-            session_id: session_id.to_string(),
-            fwd_type: f.fwd_type.clone(),
-            listen_host: f.listen_host.clone(),
-            listen_port: f.listen_port.to_string(),
-            dest_host: f.dest_host.clone(),
-            dest_port: f.dest_port.to_string(),
-            auto_reconnect: f.auto_reconnect,
-            error: None,
+            standalone: true,
+            ..Self::new(String::new())
         }
+    }
+
+    fn from(session_id: &str, f: &PortForward) -> Self {
+        Self::new_dirless(session_id, Some(f), false)
+    }
+
+    fn from_standalone(t: &StandaloneTunnel) -> Self {
+        let mut ed = Self::new_dirless(STANDALONE_TUNNEL, t.forwards.first(), true);
+        ed.tunnel_id = Some(t.id.clone());
+        ed.name = t.name.clone();
+        ed.host = t.host.clone();
+        ed.ssh_port = t.port.to_string();
+        ed.username = t.username.clone();
+        ed.auth_type = t.auth_type.clone();
+        ed.password = t.password.clone();
+        ed.key_path = t.key_path.clone();
+        ed
+    }
+
+    fn new_dirless(session_id: &str, f: Option<&PortForward>, standalone: bool) -> Self {
+        let mut ed = Self::new(session_id.to_string());
+        ed.standalone = standalone;
+        if let Some(f) = f {
+            ed.forward_id = Some(f.id.clone());
+            ed.fwd_type = f.fwd_type.clone();
+            ed.listen_host = f.listen_host.clone();
+            ed.listen_port = f.listen_port.to_string();
+            ed.dest_host = f.dest_host.clone();
+            ed.dest_port = f.dest_port.to_string();
+            ed.auto_reconnect = f.auto_reconnect;
+        }
+        ed
     }
 }
 
@@ -266,10 +319,12 @@ impl TunnelApp {
     fn new_inner(rt: tokio::runtime::Handle, logs: SharedLogs) -> Self {
         let sessions = load_sessions();
         let groups = load_groups();
+        let standalone_tunnels = load_tunnels();
         let selected = sessions.first().map(|s| s.id.clone());
         Self {
             sessions,
             groups,
+            standalone_tunnels,
             tunnels: TunnelManager::new(rt.clone(), logs.clone()),
             rt,
             logs,
@@ -370,22 +425,42 @@ impl TunnelApp {
     /// applies it live to a running instance).
     fn toggle_tunnel_auto(&mut self, session_id: &str, forward_id: &str) {
         let key = forward_key(session_id, forward_id);
-        let found = self
+        if let Some(f) = self
             .sessions
             .iter_mut()
             .find(|s| s.id == session_id)
-            .and_then(|s| s.forwards.iter_mut().find(|f| f.id == forward_id));
-        let Some(f) = found else { return };
-        f.auto_reconnect = !f.auto_reconnect;
-        let (on, desc) = (f.auto_reconnect, forward_desc(f));
-        if self.tunnels.is_running(&key) {
-            self.tunnels.set_auto_reconnect(&key, on);
-            self.toast(
-                ToastKind::Info,
-                format!("{desc} — auto-reconnect {} for the running tunnel", if on { "enabled" } else { "disabled" }),
-            );
+            .and_then(|s| s.forwards.iter_mut().find(|f| f.id == forward_id))
+        {
+            f.auto_reconnect = !f.auto_reconnect;
+            let (on, desc) = (f.auto_reconnect, forward_desc(f));
+            if self.tunnels.is_running(&key) {
+                self.tunnels.set_auto_reconnect(&key, on);
+                self.toast(
+                    ToastKind::Info,
+                    format!("{desc} — auto-reconnect {} for the running tunnel", if on { "enabled" } else { "disabled" }),
+                );
+            }
+            self.persist(if on { "Auto-reconnect enabled" } else { "Auto-reconnect disabled" });
+            return;
         }
-        self.persist(if on { "Auto-reconnect enabled" } else { "Auto-reconnect disabled" });
+        // Standalone tunnel (own SSH endpoint, lives in tunnels.json).
+        if let Some(f) = self
+            .standalone_tunnels
+            .iter_mut()
+            .find(|t| t.id == session_id)
+            .and_then(|t| t.forwards.iter_mut().find(|f| f.id == forward_id))
+        {
+            f.auto_reconnect = !f.auto_reconnect;
+            let (on, desc) = (f.auto_reconnect, forward_desc(f));
+            if self.tunnels.is_running(&key) {
+                self.tunnels.set_auto_reconnect(&key, on);
+                self.toast(
+                    ToastKind::Info,
+                    format!("{desc} — auto-reconnect {} for the running tunnel", if on { "enabled" } else { "disabled" }),
+                );
+            }
+            self.persist_tunnels(if on { "Auto-reconnect enabled" } else { "Auto-reconnect disabled" });
+        }
     }
 
     /// Move a session into a group (empty target = ungroup).
@@ -416,6 +491,8 @@ impl TunnelApp {
             self.toast(ToastKind::Info, "Tunnel stopped");
             return;
         }
+        // Session-bound tunnel first; standalone tunnels (own SSH endpoint)
+        // fall back to an engine-shaped session built on the fly.
         let found = self
             .sessions
             .iter()
@@ -425,6 +502,17 @@ impl TunnelApp {
                     .iter()
                     .find(|f| f.id == forward_id)
                     .map(|f| (s.clone(), f.clone()))
+            })
+            .or_else(|| {
+                self.standalone_tunnels
+                    .iter()
+                    .find(|t| t.id == session_id)
+                    .and_then(|t| {
+                        t.forwards
+                            .iter()
+                            .find(|f| f.id == forward_id)
+                            .map(|f| (t.to_ssh_session(), f.clone()))
+                    })
             });
         let Some((session, forward)) = found else { return };
         match self.tunnels.start(&session, &forward) {
@@ -440,6 +528,13 @@ impl TunnelApp {
         match save_sessions(&self.sessions) {
             Ok(_) => self.toast(ToastKind::Success, ok_msg),
             Err(e) => self.toast(ToastKind::Error, format!("Could not save sessions: {e}")),
+        }
+    }
+
+    fn persist_tunnels(&mut self, ok_msg: impl Into<String>) {
+        match save_tunnels(&self.standalone_tunnels) {
+            Ok(_) => self.toast(ToastKind::Success, ok_msg),
+            Err(e) => self.toast(ToastKind::Error, format!("Could not save tunnels: {e}")),
         }
     }
 
@@ -531,6 +626,70 @@ impl TunnelApp {
         }
         if let Err(e) = forward.validate() {
             ed.error = Some(e);
+            return;
+        }
+        if ed.session_id == STANDALONE_TUNNEL {
+            // Tunnel with its own SSH endpoint — no saved session involved.
+            let host = ed.host.trim().to_string();
+            if host.is_empty() {
+                ed.error = Some("SSH host is required".to_string());
+                return;
+            }
+            if ed.username.trim().is_empty() {
+                ed.error = Some("SSH username is required".to_string());
+                return;
+            }
+            match ed.auth_type {
+                AuthType::Password => {
+                    if ed.password.is_empty() {
+                        ed.error = Some("Password is required for password auth".to_string());
+                        return;
+                    }
+                }
+                AuthType::Key => {
+                    if ed.key_path.trim().is_empty() {
+                        ed.error = Some("Private key file is required for key auth".to_string());
+                        return;
+                    }
+                }
+            }
+            let tunnel = StandaloneTunnel {
+                id: ed
+                    .tunnel_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                name: ed.name.trim().to_string(),
+                host,
+                port: 22, // overwritten right below
+                username: ed.username.trim().to_string(),
+                auth_type: ed.auth_type.clone(),
+                password: ed.password.clone(),
+                key_path: ed.key_path.trim().to_string(),
+                key_passphrase: String::new(),
+                forwards: vec![forward],
+            };
+            let mut tunnel = tunnel;
+            match ed.ssh_port.trim().parse::<u16>() {
+                Ok(p) if p > 0 => tunnel.port = p,
+                _ => {
+                    ed.error = Some("SSH port must be a number between 1 and 65535".to_string());
+                    return;
+                }
+            }
+            if let Err(e) = tunnel.validate() {
+                ed.error = Some(e);
+                return;
+            }
+            match self
+                .standalone_tunnels
+                .iter()
+                .position(|t| t.id == tunnel.id)
+            {
+                Some(i) => self.standalone_tunnels[i] = tunnel,
+                None => self.standalone_tunnels.push(tunnel),
+            }
+            self.tunnel_editor = None;
+            self.persist_tunnels("Tunnel saved");
             return;
         }
         let Some(session) = self.sessions.iter_mut().find(|s| s.id == ed.session_id) else {
@@ -646,8 +805,23 @@ impl TunnelApp {
         self.tunnels.stop(&key);
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             session.forwards.retain(|f| f.id != forward_id);
+            self.persist("Tunnel deleted");
+            return;
         }
-        self.persist("Tunnel deleted");
+        if let Some(tunnel) = self
+            .standalone_tunnels
+            .iter_mut()
+            .find(|t| t.id == session_id)
+        {
+            tunnel.forwards.retain(|f| f.id != forward_id);
+            // A standalone tunnel carries exactly one forward; drop the
+            // empty shell entirely.
+            if tunnel.forwards.is_empty() {
+                self.standalone_tunnels
+                    .retain(|t| t.id != session_id);
+            }
+            self.persist_tunnels("Tunnel deleted");
+        }
     }
 
     fn duplicate_session(&mut self, id: &str) {
@@ -720,13 +894,7 @@ impl TunnelApp {
                 self.session_editor = Some(SessionEditor::new());
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::T)) {
-                if !self.sessions.is_empty() {
-                    let id = self
-                        .selected
-                        .clone()
-                        .unwrap_or_else(|| self.sessions[0].id.clone());
-                    self.tunnel_editor = Some(TunnelEditor::new(id));
-                }
+                self.tunnel_editor = Some(TunnelEditor::new_standalone());
             }
         }
 
@@ -734,8 +902,8 @@ impl TunnelApp {
             .exact_height(26.0)
             .frame(
                 Frame::NONE
-                    .fill(theme::BG_PANEL_ALT)
-                    .stroke(Stroke::new(1.0_f32, theme::BORDER)),
+                    .fill(theme::SB_BG)
+                    .stroke(Stroke::new(1.0_f32, theme::SB_BG)),
             )
             .show(ctx, |ui| self.statusbar(ui));
 
@@ -826,6 +994,8 @@ impl TunnelApp {
         }
         ui.add_space(14.0);
         ui.horizontal(|ui| {
+            let (title_bar, _) = ui.allocate_exact_size(egui::vec2(4.0, 16.0), Sense::hover());
+            ui.painter().rect_filled(title_bar, 2.0, theme::ACCENT);
             ui.label(RichText::new("Sessions").text_style(theme::h2()).strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ghost_button(
@@ -1079,19 +1249,16 @@ impl TunnelApp {
             {
                 self.session_editor = Some(SessionEditor::new());
             }
-            let tip = if self.sessions.is_empty() {
-                "Add a session first — tunnels need an SSH host."
-            } else {
-                "New port tunnel"
-            };
-            let tun = tool_button(ui, RailIcon::Tunnel, theme::INFO, "Tunnel", false, tip);
-            if !self.sessions.is_empty() && tun.clicked() {
-                let id = self
-                    .selected
-                    .clone()
-                    .filter(|id| self.sessions.iter().any(|s| &s.id == id))
-                    .unwrap_or_else(|| self.sessions[0].id.clone());
-                self.tunnel_editor = Some(TunnelEditor::new(id));
+            let tun = tool_button(
+                ui,
+                RailIcon::Tunnel,
+                theme::INFO,
+                "Tunnel",
+                false,
+                "New tunnel — any SSH host; a saved session is optional",
+            );
+            if tun.clicked() {
+                self.tunnel_editor = Some(TunnelEditor::new_standalone());
             }
             // Slim vertical separator between the action and view groups.
             {
@@ -1374,6 +1541,9 @@ impl TunnelApp {
 
     fn tunnels_page(&mut self, ui: &mut Ui, _ctx: &egui::Context) {
         ui.horizontal(|ui| {
+            // A deliberate color bar anchoring the page title.
+            let (title_bar, _) = ui.allocate_exact_size(egui::vec2(4.0, 30.0), Sense::hover());
+            ui.painter().rect_filled(title_bar, 2.0, theme::ACCENT);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(
@@ -1383,44 +1553,26 @@ impl TunnelApp {
                 );
                 ui.label(
                     RichText::new(
-                        "Tunnels run over any saved session — pick one, choose a type, fill in the ports. No commands.",
+                        "Runs over a saved session or on its own SSH host. Pick the connection, choose a type, fill in the ports.",
                     )
                     .size(11.5)
                     .color(theme::TEXT_DIM),
                 );
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let enabled = !self.sessions.is_empty();
                 let new_tunnel = styled_button(
                     ui,
                     RichText::new("+  New tunnel").size(12.5),
-                    enabled,
+                    true,
                     false,
                     None,
                 );
                 if new_tunnel.clicked() {
-                    let id = self
-                        .selected
-                        .clone()
-                        .filter(|id| self.sessions.iter().any(|s| &s.id == id))
-                        .unwrap_or_else(|| self.sessions[0].id.clone());
-                    self.tunnel_editor = Some(TunnelEditor::new(id));
-                }
-                if !enabled {
-                    new_tunnel.on_hover_text("Add a session first — tunnels need an SSH host.");
+                    self.tunnel_editor = Some(TunnelEditor::new_standalone());
                 }
             });
         });
         ui.add_space(12.0);
-
-        if self.sessions.is_empty() {
-            empty_hint(
-                ui,
-                "No sessions yet",
-                "Add an SSH session in the sidebar, then create tunnels that run over it.",
-            );
-            return;
-        }
 
         // Snapshot rows, render, then apply actions (keeps borrows simple).
         struct Row {
@@ -1431,42 +1583,77 @@ impl TunnelApp {
             running: bool,
             reconnecting: bool,
             auth: &'static str,
+            /// None: bound to a saved session. Some: standalone tunnel id.
+            standalone: bool,
         }
         let rows: Vec<Row> = {
             let tunnels = &self.tunnels;
-            self.sessions
+            self.standalone_tunnels
                 .iter()
-                .flat_map(|s| {
-                    let session_id = s.id.clone();
-                    let session_name = s.name.clone();
-                    let conn = s.connection_label();
-                    let auth = match s.auth_type {
+                .flat_map(|t| {
+                    let tunnel_id = t.id.clone();
+                    let label = t.label();
+                    let conn = t.connection_label();
+                    let auth = match t.auth_type {
                         AuthType::Password => "Password",
                         AuthType::Key => "Key",
                     };
-                    s.forwards.iter().map(move |f| Row {
-                        session_id: session_id.clone(),
-                        session_name: session_name.clone(),
+                    t.forwards.iter().map(move |f| Row {
+                        session_id: tunnel_id.clone(),
+                        session_name: label.clone(),
                         conn: conn.clone(),
                         forward: f.clone(),
-                        running: tunnels.is_running(&forward_key(&session_id, &f.id)),
-                        reconnecting: tunnels.is_reconnecting(&forward_key(&session_id, &f.id)),
+                        running: tunnels.is_running(&forward_key(&tunnel_id, &f.id)),
+                        reconnecting: tunnels
+                            .is_reconnecting(&forward_key(&tunnel_id, &f.id)),
                         auth,
+                        standalone: true,
                     })
                 })
+                .chain(
+                    self.sessions
+                        .iter()
+                        .flat_map(|s| {
+                            let session_id = s.id.clone();
+                            let session_name = s.name.clone();
+                            let conn = s.connection_label();
+                            let auth = match s.auth_type {
+                                AuthType::Password => "Password",
+                                AuthType::Key => "Key",
+                            };
+                            s.forwards.iter().map(move |f| Row {
+                                session_id: session_id.clone(),
+                                session_name: session_name.clone(),
+                                conn: conn.clone(),
+                                forward: f.clone(),
+                                running: tunnels.is_running(&forward_key(&session_id, &f.id)),
+                                reconnecting: tunnels
+                                    .is_reconnecting(&forward_key(&session_id, &f.id)),
+                                auth,
+                                standalone: false,
+                            })
+                        }),
+                )
                 .collect()
         };
 
         if rows.is_empty() {
-            empty_hint(
-                ui,
-                "No tunnels yet",
-                "Click “New tunnel” to forward a port over one of your sessions. Start and stop each tunnel any time.",
-            );
+            let hint = if self.sessions.is_empty() {
+                (
+                    "No tunnels yet",
+                    "Click “New tunnel”, type an SSH host and the ports to forward. A saved session is not required.",
+                )
+            } else {
+                (
+                    "No tunnels yet",
+                    "Click “New tunnel” to forward a port over one of your sessions. Start and stop each tunnel any time.",
+                )
+            };
+            empty_hint(ui, hint.0, hint.1);
             return;
         }
 
-        let mut actions: Vec<(RowAction, String, String)> = Vec::new();
+        let mut actions: Vec<(RowAction, String, String, bool)> = Vec::new();
         egui::ScrollArea::vertical()
             .id_salt("tunnel_scroll")
             .auto_shrink([false, false])
@@ -1481,18 +1668,31 @@ impl TunnelApp {
                         row.reconnecting,
                         row.auth,
                     ) {
-                        actions.push((a, row.session_id.clone(), row.forward.id.clone()));
+                        actions.push((
+                            a,
+                            row.session_id.clone(),
+                            row.forward.id.clone(),
+                            row.standalone,
+                        ));
                     }
                 }
                 ui.add_space(12.0);
             });
 
-        for (action, session_id, forward_id) in actions {
+        for (action, session_id, forward_id, standalone) in actions {
             match action {
                 RowAction::Toggle => self.toggle_tunnel(&session_id, &forward_id),
                 RowAction::ToggleAuto => self.toggle_tunnel_auto(&session_id, &forward_id),
                 RowAction::Edit => {
-                    if let Some(f) = self
+                    if standalone {
+                        if let Some(t) = self
+                            .standalone_tunnels
+                            .iter()
+                            .find(|t| t.id == session_id)
+                        {
+                            self.tunnel_editor = Some(TunnelEditor::from_standalone(t));
+                        }
+                    } else if let Some(f) = self
                         .sessions
                         .iter()
                         .find(|s| s.id == session_id)
@@ -1736,27 +1936,133 @@ impl TunnelApp {
                     .strong(),
             );
             ui.label(
-                RichText::new("Forwards over a saved session. Runs in the background while you work.")
+                RichText::new("Runs in the background while you work — over a saved session or its own SSH host.")
                     .size(10.5)
                     .color(theme::TEXT_FAINT),
             );
             ui.add_space(12.0);
 
             field(ui, "Via session", |ui| {
-                let selected_label = session_names
-                    .iter()
-                    .find(|(id, _)| id == &ed.session_id)
-                    .map(|(_, l)| l.clone())
-                    .unwrap_or_else(|| "Choose a session…".to_string());
+                let selected_label = if ed.standalone {
+                    "No session — enter SSH details below".to_string()
+                } else {
+                    session_names
+                        .iter()
+                        .find(|(id, _)| id == &ed.session_id)
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_else(|| "Choose a session…".to_string())
+                };
                 egui::ComboBox::from_id_salt("tunnel_session")
                     .selected_text(selected_label)
                     .width(ui.available_width())
                     .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(ed.standalone, "No session — enter SSH details below")
+                            .clicked()
+                        {
+                            ed.standalone = true;
+                        }
                         for (id, label) in &session_names {
-                            ui.selectable_value(&mut ed.session_id, id.clone(), label);
+                            if ui.selectable_label(!ed.standalone && id == &ed.session_id, label)
+                                .clicked()
+                            {
+                                ed.standalone = false;
+                                ed.session_id = id.clone();
+                            }
                         }
                     });
             });
+
+            if ed.standalone {
+                field(ui, "Label (optional)", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut ed.name)
+                            .hint_text("my database tunnel")
+                            .desired_width(ui.available_width())
+                            .margin(egui::vec2(8.0, 6.0)),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    let w = (ui.available_width() - 74.0).max(120.0);
+                    ui.vertical(|ui| {
+                        field(ui, "SSH host", |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut ed.host)
+                                    .hint_text("jam.example.com")
+                                    .desired_width(w)
+                                    .margin(egui::vec2(8.0, 6.0)),
+                            );
+                        });
+                    });
+                    field(ui, "Port", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut ed.ssh_port)
+                                .desired_width(62.0)
+                                .margin(egui::vec2(8.0, 6.0)),
+                        );
+                    });
+                });
+                ui.horizontal(|ui| {
+                    let w = (ui.available_width() - 74.0).max(120.0);
+                    ui.vertical(|ui| {
+                        field(ui, "SSH username", |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut ed.username)
+                                    .hint_text("deploy")
+                                    .desired_width(w)
+                                    .margin(egui::vec2(8.0, 6.0)),
+                            );
+                        });
+                    });
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Auth")
+                                .size(11.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.horizontal(|ui| {
+                            if choice_pill(ui, "Password", ed.auth_type == AuthType::Password)
+                                .clicked()
+                            {
+                                ed.auth_type = AuthType::Password;
+                            }
+                            if choice_pill(ui, "Key", ed.auth_type == AuthType::Key).clicked() {
+                                ed.auth_type = AuthType::Key;
+                            }
+                        });
+                    });
+                });
+                match ed.auth_type {
+                    AuthType::Password => {
+                        field(ui, "Password", |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut ed.password)
+                                    .password(true)
+                                    .desired_width(ui.available_width())
+                                    .margin(egui::vec2(8.0, 6.0)),
+                            );
+                        });
+                    }
+                    AuthType::Key => {
+                        field(ui, "Private key file", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut ed.key_path)
+                                        .hint_text(r"C:\Users\you\.ssh\id_ed25519")
+                                        .desired_width(ui.available_width() - 70.0)
+                                        .margin(egui::vec2(8.0, 6.0)),
+                                );
+                                if ui.button("Browse…").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new().pick_file() {
+                                        ed.key_path = p.display().to_string();
+                                    }
+                                }
+                            });
+                        });
+                    }
+                }
+                ui.add_space(6.0);
+            }
 
             ui.label(
                 RichText::new("Type")
@@ -2223,21 +2529,25 @@ impl TunnelApp {
             ui.label(
                 RichText::new(parts.join("  ·  "))
                     .size(10.5)
-                    .color(theme::TEXT_DIM),
+                    .color(theme::SB_TEXT),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(10.0);
                 ui.label(
                     RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                         .size(10.0)
-                        .color(theme::TEXT_FAINT),
+                        .color(theme::SB_TEXT_FAINT),
                 );
                 ui.add_space(8.0);
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("Activity").size(10.5))
-                            .fill(Color32::TRANSPARENT)
-                            .stroke(Stroke::NONE),
+                        egui::Button::new(
+                            RichText::new("Activity")
+                                .size(10.5)
+                                .color(theme::SB_TEXT),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::NONE),
                     )
                     .on_hover_text("Tunnel, shell and error log")
                     .clicked()
@@ -2305,7 +2615,10 @@ fn session_card(
 ) -> Option<CardAction> {
     let mut action = None;
     let (a_fg, a_bg) = auth_palette(auth_label);
-    let resp = Frame::NONE
+    // Tile color doubles as the row's left status bar color (group color
+    // when grouped, brand accent otherwise).
+    let bar_color = group_dot.unwrap_or(theme::ACCENT);
+    let frame = Frame::NONE
         .fill(if selected {
             theme::BG_CARD_SEL
         } else {
@@ -2363,8 +2676,15 @@ fn session_card(
                 });
             });
         })
-        .response
-        .interact(Sense::click());
+        ;
+    // Thin colored bar hugging the card's left edge — real group color.
+    let rr = frame.response.rect;
+    let bar = egui::Rect::from_min_size(
+        egui::pos2(rr.left() + 2.0, rr.top() + 3.0),
+        egui::vec2(3.0, rr.height() - 6.0),
+    );
+    ui.painter().rect_filled(bar, 1.6, bar_color);
+    let resp = frame.response.interact(Sense::click());
 
     if resp.clicked() {
         action = Some(CardAction::Select);
@@ -2504,11 +2824,11 @@ fn tunnel_row(
     } else if running {
         (theme::SUCCESS, "Running")
     } else {
-        (theme::TEXT_FAINT, "Stopped")
+        (theme::INFO, "Stopped")
     };
     let (a_fg, a_bg) = auth_palette(auth_label);
 
-    Frame::NONE
+    let frame = Frame::NONE
         .fill(theme::BG_CARD)
         .corner_radius(CornerRadius::same(10))
         .stroke(Stroke::new(1.0_f32, theme::BORDER))
@@ -2579,6 +2899,13 @@ fn tunnel_row(
                 });
             });
         });
+    // Colored left status bar: a 3px state stripe inside the card edge.
+    let rr = frame.response.rect;
+    let bar = egui::Rect::from_min_size(
+        egui::pos2(rr.left() + 2.0, rr.top() + 4.0),
+        egui::vec2(3.0, rr.height() - 8.0),
+    );
+    ui.painter().rect_filled(bar, 1.6, dot_color);
     ui.add_space(6.0);
     action
 }
@@ -2656,17 +2983,22 @@ fn tool_button(
     tip: &str,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(48.0, 35.0), Sense::click());
-    let (fill, icon_c, label_c) = if active {
-        (theme::ACCENT_SOFT, theme::ACCENT_TEXT, theme::ACCENT_TEXT)
-    } else if resp.hovered() {
-        (theme::BG_BTN_HOVER, tint, theme::TEXT)
-    } else {
-        (Color32::TRANSPARENT, tint, theme::TEXT_DIM)
-    };
     let p = ui.painter();
-    if fill != Color32::TRANSPARENT {
-        p.rect_filled(rect, 8.0, fill);
-    }
+    // Solid colored tile behind the icon — a real color bar per action:
+    // resting = tinted tile with its full-strength icon, hover = solid tile
+    // with a white glyph, active = accent tile.
+    let (tile_fill, icon_c, label_c) = if active {
+        (theme::ACCENT, Color32::WHITE, Color32::WHITE)
+    } else if resp.hovered() {
+        (tint, Color32::WHITE, theme::TEXT)
+    } else {
+        (
+            Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 36),
+            tint,
+            theme::TEXT_DIM,
+        )
+    };
+    p.rect_filled(rect, 8.0, tile_fill);
     paint_rail_icon(
         p,
         egui::Rect::from_min_size(
@@ -2697,14 +3029,10 @@ fn tab_chip(
     let mut closed = false;
     let mut menu = None;
     Frame::NONE
-        .fill(if active {
-            theme::BG_CARD
-        } else {
-            Color32::TRANSPARENT
-        })
+        .fill(if active { theme::ACCENT } else { Color32::TRANSPARENT })
         .corner_radius(CornerRadius::same(8))
         .stroke(if active {
-            Stroke::new(1.0_f32, theme::BORDER_STRONG)
+            Stroke::NONE
         } else {
             Stroke::NONE
         })
@@ -2717,7 +3045,7 @@ fn tab_chip(
                 }
                 let mut label = RichText::new(title).size(12.0);
                 if active {
-                    label = label.strong();
+                    label = label.strong().color(Color32::WHITE);
                 }
                 let label = ui
                     .add(egui::Label::new(label).sense(Sense::click()))
@@ -2747,7 +3075,11 @@ fn tab_chip(
                     let x = ui
                         .add(
                             egui::Button::new(
-                                RichText::new("×").size(9.5).color(theme::TEXT_FAINT),
+                                RichText::new("×").size(9.5).color(if active {
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 200)
+                                } else {
+                                    theme::TEXT_FAINT
+                                }),
                             )
                             .fill(Color32::TRANSPARENT)
                             .stroke(Stroke::NONE)
