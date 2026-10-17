@@ -2624,7 +2624,15 @@ fn session_card(
         } else {
             theme::BG_CARD
         })
-        .corner_radius(CornerRadius::same(10))
+        .corner_radius(CornerRadius::same(12))
+        .shadow(
+            egui::Shadow {
+                offset: [0, 1],
+                blur: 9,
+                spread: 0,
+                color: Color32::from_rgba_unmultiplied(15, 23, 42, 22),
+            },
+        )
         .stroke(Stroke::new(
             1.0_f32,
             if selected {
@@ -2830,7 +2838,15 @@ fn tunnel_row(
 
     let frame = Frame::NONE
         .fill(theme::BG_CARD)
-        .corner_radius(CornerRadius::same(10))
+        .corner_radius(CornerRadius::same(12))
+        .shadow(
+            egui::Shadow {
+                offset: [0, 1],
+                blur: 9,
+                spread: 0,
+                color: Color32::from_rgba_unmultiplied(15, 23, 42, 22),
+            },
+        )
         .stroke(Stroke::new(1.0_f32, theme::BORDER))
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
@@ -2924,51 +2940,53 @@ enum RailIcon {
 
 fn paint_rail_icon(p: &egui::Painter, rect: egui::Rect, icon: RailIcon, color: Color32) {
     let c = rect.center();
+    // All glyphs are drawn inside a 16×16 box centered on `rect` so they can
+    // never spill over a button tile or misalign with its edges.
     let line = |a: egui::Pos2, b: egui::Pos2, w: f32| p.line_segment([a, b], Stroke::new(w, color));
     let w = 2.0_f32;
     match icon {
         RailIcon::Session => {
             // A small terminal window with a ">_" prompt inside.
-            let r = egui::Rect::from_center_size(c, egui::vec2(18.0, 15.0));
+            let r = egui::Rect::from_center_size(c, egui::vec2(15.0, 12.5));
             p.rect_stroke(r, 3.0, Stroke::new(w, color), egui::StrokeKind::Inside);
             line(
-                egui::pos2(c.x - 4.5, c.y - 1.0),
+                egui::pos2(c.x - 3.5, c.y - 1.0),
                 egui::pos2(c.x - 1.0, c.y + 1.0),
                 w,
             );
             line(
                 egui::pos2(c.x - 1.0, c.y + 1.0),
-                egui::pos2(c.x - 4.5, c.y + 3.0),
+                egui::pos2(c.x - 3.5, c.y + 3.0),
                 w,
             );
             line(
                 egui::pos2(c.x + 1.0, c.y + 3.0),
-                egui::pos2(c.x + 4.5, c.y + 3.0),
+                egui::pos2(c.x + 3.5, c.y + 3.0),
                 w,
             );
         }
         RailIcon::Tunnel => {
             // Two opposing arrows: traffic flowing through a tunnel.
-            line(egui::pos2(c.x - 8.0, c.y - 3.0), egui::pos2(c.x + 8.0, c.y - 3.0), w);
-            line(egui::pos2(c.x + 5.5, c.y - 5.5), egui::pos2(c.x + 8.0, c.y - 3.0), w);
-            line(egui::pos2(c.x + 5.5, c.y - 0.5), egui::pos2(c.x + 8.0, c.y - 3.0), w);
-            line(egui::pos2(c.x + 8.0, c.y + 3.0), egui::pos2(c.x - 8.0, c.y + 3.0), w);
-            line(egui::pos2(c.x - 5.5, c.y + 0.5), egui::pos2(c.x - 8.0, c.y + 3.0), w);
-            line(egui::pos2(c.x - 5.5, c.y + 5.5), egui::pos2(c.x - 8.0, c.y + 3.0), w);
+            line(egui::pos2(c.x - 7.0, c.y - 3.0), egui::pos2(c.x + 7.0, c.y - 3.0), w);
+            line(egui::pos2(c.x + 4.8, c.y - 5.2), egui::pos2(c.x + 7.0, c.y - 3.0), w);
+            line(egui::pos2(c.x + 4.8, c.y - 0.8), egui::pos2(c.x + 7.0, c.y - 3.0), w);
+            line(egui::pos2(c.x + 7.0, c.y + 3.0), egui::pos2(c.x - 7.0, c.y + 3.0), w);
+            line(egui::pos2(c.x - 4.8, c.y + 0.8), egui::pos2(c.x - 7.0, c.y + 3.0), w);
+            line(egui::pos2(c.x - 4.8, c.y + 5.2), egui::pos2(c.x - 7.0, c.y + 3.0), w);
         }
         RailIcon::Split => {
             for (dx, dy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
                 let quad = egui::Rect::from_center_size(
-                    egui::pos2(c.x + dx * 4.5, c.y + dy * 4.5),
-                    egui::vec2(7.0, 7.0),
+                    egui::pos2(c.x + dx * 4.0, c.y + dy * 4.0),
+                    egui::vec2(6.0, 6.0),
                 );
-                p.rect_filled(quad, 2.0, color);
+                p.rect_filled(quad, 1.6, color);
             }
         }
         RailIcon::Activity => {
-            p.circle_stroke(c, 7.5, Stroke::new(w, color));
-            line(c, egui::pos2(c.x, c.y - 4.5), w);
-            line(c, egui::pos2(c.x + 3.5, c.y + 1.5), w);
+            p.circle_stroke(c, 6.5, Stroke::new(w, color));
+            line(c, egui::pos2(c.x, c.y - 3.8), w);
+            line(c, egui::pos2(c.x + 3.0, c.y + 1.3), w);
         }
     }
 }
@@ -2982,10 +3000,14 @@ fn tool_button(
     active: bool,
     tip: &str,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(48.0, 35.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(50.0, 40.0), Sense::click());
     let p = ui.painter();
-    // Solid, full-strength colored tiles: white glyph on the tint at rest,
-    // a slightly darker tile on hover, accent when active.
+    // Mac-style soft lift under each tile.
+    p.rect_filled(
+        rect.translate(egui::vec2(0.0, 1.5)),
+        10.0,
+        Color32::from_rgba_unmultiplied(15, 23, 42, 26),
+    );
     let (tile_fill, icon_c, label_c) = if active {
         (theme::ACCENT, Color32::WHITE, Color32::WHITE)
     } else if resp.hovered() {
@@ -3001,18 +3023,18 @@ fn tool_button(
             Color32::from_rgba_unmultiplied(255, 255, 255, 225),
         )
     };
-    p.rect_filled(rect, 8.0, tile_fill);
+    p.rect_filled(rect, 10.0, tile_fill);
     paint_rail_icon(
         p,
-        egui::Rect::from_min_size(
-            egui::pos2(rect.center().x - 6.5, rect.top() + 1.0),
-            egui::vec2(13.0, 13.0),
+        egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.top() + 13.0),
+            egui::vec2(16.0, 16.0),
         ),
         icon,
         icon_c,
     );
     p.text(
-        egui::pos2(rect.center().x, rect.bottom() - 5.5),
+        egui::pos2(rect.center().x, rect.bottom() - 6.5),
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(9.0),
