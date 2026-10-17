@@ -2984,18 +2984,21 @@ fn tool_button(
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(48.0, 35.0), Sense::click());
     let p = ui.painter();
-    // Solid colored tile behind the icon — a real color bar per action:
-    // resting = tinted tile with its full-strength icon, hover = solid tile
-    // with a white glyph, active = accent tile.
+    // Solid, full-strength colored tiles: white glyph on the tint at rest,
+    // a slightly darker tile on hover, accent when active.
     let (tile_fill, icon_c, label_c) = if active {
         (theme::ACCENT, Color32::WHITE, Color32::WHITE)
     } else if resp.hovered() {
-        (tint, Color32::WHITE, theme::TEXT)
+        (
+            Color32::from_rgb(tint.r() * 220 / 255, tint.g() * 220 / 255, tint.b() * 220 / 255),
+            Color32::WHITE,
+            Color32::WHITE,
+        )
     } else {
         (
-            Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 36),
             tint,
-            theme::TEXT_DIM,
+            Color32::WHITE,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 225),
         )
     };
     p.rect_filled(rect, 8.0, tile_fill);
