@@ -161,7 +161,7 @@ impl TerminalSession {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, TERM_BG);
 
-        let font_id = FontId::new(13.0, FontFamily::Monospace);
+        let font_id = FontId::new(12.0, FontFamily::Monospace);
         let (cell_w, cell_h) = ui.fonts(|f| {
             (
                 f.glyph_width(&font_id, 'M').max(1.0),
@@ -176,7 +176,7 @@ impl TerminalSession {
         }
         let focused = ui.memory(|m| m.has_focus(self.focus_id));
 
-        let inner = rect.shrink(6.0);
+        let inner = rect.shrink(4.0);
         let cols = ((inner.width() / cell_w).floor() as i64).clamp(2, 500) as u16;
         let rows = ((inner.height() / cell_h).floor() as i64).clamp(2, 300) as u16;
         if cols != self.cols || rows != self.rows {
@@ -253,7 +253,7 @@ impl TerminalSession {
                     rect.center() + egui::vec2(0.0, 30.0),
                     egui::Align2::CENTER_CENTER,
                     format!("Connecting to {} …", self.connection_label()),
-                    FontId::proportional(13.0),
+                    FontId::proportional(11.5),
                     theme::TEXT_DIM,
                 );
             }
@@ -271,14 +271,14 @@ impl TerminalSession {
                     card.center() + egui::vec2(0.0, -34.0),
                     egui::Align2::CENTER_CENTER,
                     "Disconnected",
-                    FontId::proportional(16.0),
+                    FontId::proportional(14.0),
                     theme::TEXT,
                 );
                 painter.text(
                     card.center() + egui::vec2(0.0, -10.0),
                     egui::Align2::CENTER_CENTER,
                     reason.clone(),
-                    FontId::proportional(12.5),
+                    FontId::proportional(11.5),
                     theme::TEXT_DIM,
                 );
                 let mut child = ui.new_child(
@@ -420,7 +420,7 @@ impl TerminalSession {
                 egui::pos2(inner.right() - 8.0, inner.top() + 6.0),
                 egui::Align2::RIGHT_TOP,
                 format!("↑ {scrollback} lines — press any key to return"),
-                FontId::proportional(11.0),
+                FontId::proportional(10.0),
                 theme::TEXT_FAINT,
             );
         }

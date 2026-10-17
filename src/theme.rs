@@ -82,14 +82,14 @@ pub fn apply(ctx: &egui::Context) {
     style.text_styles = text_styles();
     {
         let s = &mut style.spacing;
-        s.item_spacing = egui::vec2(8.0, 8.0);
-        s.button_padding = egui::vec2(13.0, 7.0);
-        s.window_margin = Margin::same(14);
-        s.menu_margin = Margin::same(6);
-        s.indent = 16.0;
-        s.interact_size = egui::vec2(40.0, 26.0);
-        s.combo_width = 132.0;
-        s.tooltip_width = 460.0;
+        s.item_spacing = egui::vec2(7.0, 4.0);
+        s.button_padding = egui::vec2(8.0, 3.0);
+        s.window_margin = Margin::same(10);
+        s.menu_margin = Margin::same(4);
+        s.indent = 14.0;
+        s.interact_size = egui::vec2(30.0, 22.0);
+        s.combo_width = 120.0;
+        s.tooltip_width = 420.0;
     }
     ctx.set_style(style);
 }
@@ -146,13 +146,13 @@ fn install_fonts(ctx: &egui::Context) {
 fn text_styles() -> std::collections::BTreeMap<TextStyle, FontId> {
     use FontFamily::{Monospace, Proportional};
     [
-        (TextStyle::Heading, FontId::new(19.0, Proportional)),
-        (h1(), FontId::new(21.0, Proportional)),
-        (h2(), FontId::new(15.5, Proportional)),
-        (TextStyle::Body, FontId::new(14.0, Proportional)),
-        (TextStyle::Button, FontId::new(14.0, Proportional)),
-        (TextStyle::Small, FontId::new(12.0, Proportional)),
-        (TextStyle::Monospace, FontId::new(12.5, Monospace)),
+        (TextStyle::Heading, FontId::new(17.0, Proportional)),
+        (h1(), FontId::new(18.0, Proportional)),
+        (h2(), FontId::new(13.5, Proportional)),
+        (TextStyle::Body, FontId::new(12.5, Proportional)),
+        (TextStyle::Button, FontId::new(12.5, Proportional)),
+        (TextStyle::Small, FontId::new(10.5, Proportional)),
+        (TextStyle::Monospace, FontId::new(11.0, Monospace)),
     ]
     .into()
 }

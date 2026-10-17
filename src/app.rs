@@ -731,7 +731,7 @@ impl TunnelApp {
         }
 
         egui::TopBottomPanel::bottom("statusbar")
-            .exact_height(30.0)
+            .exact_height(26.0)
             .frame(
                 Frame::NONE
                     .fill(theme::BG_PANEL_ALT)
@@ -739,34 +739,53 @@ impl TunnelApp {
             )
             .show(ctx, |ui| self.statusbar(ui));
 
+        // Thin menu bar across the top (original, generic wording).
+        egui::TopBottomPanel::top("menu_bar")
+            .frame(Frame::NONE.fill(theme::BG_CARD).stroke(Stroke::new(1.0_f32, theme::BORDER)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.add_space(4.0);
+                    self.menu_file(ui);
+                    self.menu_view(ui);
+                    self.menu_help(ui);
+                });
+            });
+
         egui::SidePanel::left("rail")
-            .exact_width(48.0)
+            .exact_width(40.0)
             .resizable(false)
             .frame(Frame::NONE.fill(theme::BG_CARD).stroke(Stroke::new(1.0_f32, theme::BORDER)))
             .show(ctx, |ui| self.rail(ui));
 
         egui::SidePanel::left("sessions")
-            .exact_width(266.0)
+            .exact_width(238.0)
             .resizable(false)
             .frame(
                 Frame::NONE
                     .fill(theme::BG_PANEL)
                     .inner_margin(Margin {
-                        left: 14,
-                        right: 14,
-                        top: 14,
-                        bottom: 10,
+                        left: 10,
+                        right: 10,
+                        top: 12,
+                        bottom: 8,
                     }),
             )
             .show(ctx, |ui| self.sidebar(ui, ctx));
 
             egui::CentralPanel::default()
-                .frame(Frame::NONE.fill(theme::BG_WINDOW).inner_margin(Margin::symmetric(16, 10)))
+                .frame(Frame::NONE.fill(theme::BG_WINDOW).inner_margin(Margin::symmetric(12, 8)))
                 .show(ctx, |ui| {
                     self.toolbar(ui);
                     ui.add_space(6.0);
-                    self.tab_strip(ui, ctx);
-                    ui.add_space(6.0);
+                    // While split view is showing a grid of shells, the tab
+                    // strip hides — terminals fill the workspace (panes have
+                    // their own title bars with close buttons).
+                    let hide_strip = self.split_view && self.terminal_tab_count() >= 2;
+                    if !hide_strip {
+                        self.tab_strip(ui, ctx);
+                        ui.add_space(6.0);
+                    }
                     self.workspace(ui, ctx);
                 });
 
@@ -796,10 +815,10 @@ impl TunnelApp {
             ui.add_space(2.0);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(RichText::new("Culvert").size(14.5).strong());
+                ui.label(RichText::new("Culvert").size(13.5).strong());
                 ui.label(
                     RichText::new(format!("v{} · open source", env!("CARGO_PKG_VERSION")))
-                        .size(10.5)
+                        .size(9.5)
                         .color(theme::TEXT_FAINT),
                 );
             });
@@ -807,15 +826,15 @@ impl TunnelApp {
         ui.add_space(4.0);
         ui.label(
             RichText::new("Double-click a session to open a shell")
-                .size(11.0)
+                .size(10.0)
                 .color(theme::TEXT_FAINT),
         );
         ui.add_space(10.0);
 
-        let full = egui::vec2(ui.available_width(), 31.0);
+        let full = egui::vec2(ui.available_width(), 26.0);
         if styled_button(
             ui,
-            RichText::new("+  New session").size(13.5),
+            RichText::new("+  New session").size(12.5),
             true,
             false,
             Some(full),
@@ -830,7 +849,7 @@ impl TunnelApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ghost_button(
                     ui,
-                    RichText::new("+ Group").size(11.5).color(theme::TEXT_DIM),
+                    RichText::new("+ Group").size(10.5).color(theme::TEXT_DIM),
                     false,
                 )
                 .on_hover_text("Create a group to organize sessions (Prod, Staging, Home…)")
@@ -846,7 +865,7 @@ impl TunnelApp {
             egui::TextEdit::singleline(&mut self.search)
                 .hint_text("Search sessions…")
                 .desired_width(ui.available_width())
-                .margin(egui::vec2(8.0, 5.0)),
+                .margin(egui::vec2(6.0, 3.0)),
         );
         ui.add_space(6.0);
 
@@ -885,7 +904,7 @@ impl TunnelApp {
                     ui.add_space(12.0);
                     ui.label(
                         RichText::new("Nothing matches your search.")
-                            .size(12.0)
+                            .size(11.0)
                             .color(theme::TEXT_DIM),
                     );
                     return;
@@ -945,7 +964,7 @@ impl TunnelApp {
                         ui.add_space(2.0);
                         ui.label(
                             RichText::new("No group")
-                                .size(11.0)
+                                .size(10.0)
                                 .color(theme::TEXT_FAINT),
                         );
                         ui.add_space(2.0);
@@ -1140,6 +1159,61 @@ impl TunnelApp {
         });
     }
 
+    // -----------------------------------------------------------------------
+    // Menu bar
+    // -----------------------------------------------------------------------
+
+    fn menu_file(&mut self, ui: &mut Ui) {
+        ui.menu_button("File", |ui| {
+            if ui.button("New session").clicked() {
+                self.session_editor = Some(SessionEditor::new());
+                ui.close();
+            }
+            if ui.button("New tunnel").clicked() {
+                if !self.sessions.is_empty() {
+                    let id = self
+                        .selected
+                        .clone()
+                        .filter(|id| self.sessions.iter().any(|s| &s.id == id))
+                        .unwrap_or_else(|| self.sessions[0].id.clone());
+                    self.tunnel_editor = Some(TunnelEditor::new(id));
+                }
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Exit").clicked() {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                ui.close();
+            }
+        });
+    }
+
+    fn menu_view(&mut self, ui: &mut Ui) {
+        ui.menu_button("View", |ui| {
+            if ui.button("Toggle split view").clicked() {
+                self.split_view = !self.split_view;
+                ui.close();
+            }
+            if ui.button("Activity log").clicked() {
+                self.show_logs = !self.show_logs;
+                ui.close();
+            }
+        });
+    }
+
+    fn menu_help(&mut self, ui: &mut Ui) {
+        let about = format!("About Culvert (v{})", env!("CARGO_PKG_VERSION"));
+        ui.menu_button("Help", |ui| {
+            if ui.button(about).clicked() {
+                self.toast(
+                    ToastKind::Info,
+                    "Culvert — a small SSH session & tunnel manager built with Rust + egui.",
+                );
+                ui.close();
+            }
+        });
+    }
+
     fn tab_strip(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
@@ -1194,7 +1268,7 @@ impl TunnelApp {
             }
             // + opens a shell for the selected session (quick-connect style).
             let plus_resp = ui.add(
-                egui::Button::new(RichText::new("+").size(14.0).color(theme::ACCENT))
+                egui::Button::new(RichText::new("+").size(13.0).color(theme::ACCENT))
                     .fill(Color32::TRANSPARENT)
                     .stroke(Stroke::NONE)
                     .min_size(egui::vec2(24.0, 24.0)),
@@ -1410,7 +1484,7 @@ impl TunnelApp {
                     RichText::new(
                         "Tunnels run over any saved session — pick one, choose a type, fill in the ports. No commands.",
                     )
-                    .size(12.5)
+                    .size(11.5)
                     .color(theme::TEXT_DIM),
                 );
             });
@@ -1418,7 +1492,7 @@ impl TunnelApp {
                 let enabled = !self.sessions.is_empty();
                 let new_tunnel = styled_button(
                     ui,
-                    RichText::new("+  New tunnel").size(13.5),
+                    RichText::new("+  New tunnel").size(12.5),
                     enabled,
                     false,
                     None,
@@ -1561,12 +1635,12 @@ impl TunnelApp {
             ui.set_width(430.0);
             ui.label(
                 RichText::new(if is_new { "New session" } else { "Edit session" })
-                    .size(17.0)
+                    .size(16.0)
                     .strong(),
             );
             ui.label(
                 RichText::new("Saved locally. Used for shells and tunnels alike.")
-                    .size(11.5)
+                    .size(10.5)
                     .color(theme::TEXT_FAINT),
             );
             ui.add_space(12.0);
@@ -1624,7 +1698,7 @@ impl TunnelApp {
                     .unwrap_or_else(|| "No group".to_string());
                 egui::ComboBox::from_id_salt("session_group")
                     .selected_text(
-                        RichText::new(selected_text).size(13.0).color(theme::TEXT),
+                        RichText::new(selected_text).size(12.0).color(theme::TEXT),
                     )
                     .width(ui.available_width() - 2.0)
                     .show_ui(ui, |ui| {
@@ -1647,7 +1721,7 @@ impl TunnelApp {
 
             ui.label(
                 RichText::new("Authentication")
-                    .size(12.0)
+                    .size(11.0)
                     .color(theme::TEXT_DIM),
             );
             ui.horizontal(|ui| {
@@ -1706,7 +1780,7 @@ impl TunnelApp {
 
             if let Some(err) = &ed.error {
                 ui.add_space(4.0);
-                ui.label(RichText::new(err).size(12.0).color(theme::DANGER));
+                ui.label(RichText::new(err).size(11.0).color(theme::DANGER));
             }
 
             ui.add_space(14.0);
@@ -1717,7 +1791,7 @@ impl TunnelApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if styled_button(
                         ui,
-                        RichText::new("Save").size(13.5).strong(),
+                        RichText::new("Save").size(12.5).strong(),
                         true,
                         false,
                         None,
@@ -1757,12 +1831,12 @@ impl TunnelApp {
             ui.set_width(460.0);
             ui.label(
                 RichText::new(if is_new { "New tunnel" } else { "Edit tunnel" })
-                    .size(17.0)
+                    .size(16.0)
                     .strong(),
             );
             ui.label(
                 RichText::new("Forwards over a saved session. Runs in the background while you work.")
-                    .size(11.5)
+                    .size(10.5)
                     .color(theme::TEXT_FAINT),
             );
             ui.add_space(12.0);
@@ -1785,7 +1859,7 @@ impl TunnelApp {
 
             ui.label(
                 RichText::new("Type")
-                    .size(12.0)
+                    .size(11.0)
                     .color(theme::TEXT_DIM),
             );
             ui.horizontal(|ui| {
@@ -1842,7 +1916,7 @@ impl TunnelApp {
                         "Dynamic (-D): start a local SOCKS5 proxy and route any app through the server."
                     }
                 })
-                .size(11.5)
+                .size(10.5)
                 .color(theme::TEXT_FAINT),
             );
             ui.add_space(10.0);
@@ -1909,7 +1983,7 @@ impl TunnelApp {
 
             if let Some(err) = &ed.error {
                 ui.add_space(4.0);
-                ui.label(RichText::new(err).size(12.0).color(theme::DANGER));
+                ui.label(RichText::new(err).size(11.0).color(theme::DANGER));
             }
 
             ui.add_space(14.0);
@@ -1920,7 +1994,7 @@ impl TunnelApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if styled_button(
                         ui,
-                        RichText::new("Save").size(13.5).strong(),
+                        RichText::new("Save").size(12.5).strong(),
                         true,
                         false,
                         None,
@@ -1976,7 +2050,7 @@ impl TunnelApp {
             ui.set_width(360.0);
             ui.label(
                 RichText::new(if is_new { "New group" } else { "Edit group" })
-                    .size(17.0)
+                    .size(16.0)
                     .strong(),
             );
             ui.label(
@@ -1989,7 +2063,7 @@ impl TunnelApp {
                 } else {
                     "Rename or recolor; sessions keep their membership.".to_string()
                 })
-                .size(11.5)
+                .size(10.5)
                 .color(theme::TEXT_FAINT),
             );
             ui.add_space(12.0);
@@ -2036,7 +2110,7 @@ impl TunnelApp {
                         if i == 0 {
                             ui.label(
                                 RichText::new("(none) = gray-free")
-                                    .size(10.5)
+                                    .size(9.5)
                                     .color(theme::TEXT_FAINT),
                             );
                         }
@@ -2044,7 +2118,7 @@ impl TunnelApp {
                 });
             });
             if let Some(err) = &ed_ref.error {
-                ui.label(RichText::new(err).size(12.0).color(theme::DANGER));
+                ui.label(RichText::new(err).size(11.0).color(theme::DANGER));
             }
             ui.add_space(14.0);
             ui.horizontal(|ui| {
@@ -2052,7 +2126,7 @@ impl TunnelApp {
                     keep = false;
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if styled_button(ui, RichText::new("Save").size(13.5).strong(), true, false, None)
+                    if styled_button(ui, RichText::new("Save").size(12.5).strong(), true, false, None)
                         .clicked()
                     {
                         save = true;
@@ -2099,9 +2173,9 @@ impl TunnelApp {
         };
         let resp = egui::Modal::new(egui::Id::new("confirm_delete")).show(ctx, |ui| {
             ui.set_width(400.0);
-            ui.label(RichText::new(title).size(16.0).strong());
+            ui.label(RichText::new(title).size(15.0).strong());
             ui.add_space(4.0);
-            ui.label(RichText::new(body).size(12.5).color(theme::TEXT_DIM));
+            ui.label(RichText::new(body).size(11.5).color(theme::TEXT_DIM));
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 if ui.button("Cancel").clicked() {
@@ -2110,7 +2184,7 @@ impl TunnelApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if styled_button(
                         ui,
-                        RichText::new(ok_label).size(13.5).strong(),
+                        RichText::new(ok_label).size(12.5).strong(),
                         true,
                         danger,
                         None,
@@ -2157,7 +2231,7 @@ impl TunnelApp {
         let resp = egui::Modal::new(egui::Id::new("logs_modal")).show(ctx, |ui| {
             ui.set_width(640.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Activity").size(17.0).strong());
+                ui.label(RichText::new("Activity").size(16.0).strong());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Clear").clicked() {
                         if let Ok(mut l) = self.logs.lock() {
@@ -2174,7 +2248,7 @@ impl TunnelApp {
                     if entries.is_empty() {
                         ui.label(
                             RichText::new("Nothing here yet.")
-                                .size(12.0)
+                                .size(11.0)
                                 .color(theme::TEXT_DIM),
                         );
                     }
@@ -2183,7 +2257,7 @@ impl TunnelApp {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             ui.label(
                                 RichText::new(&e.time)
-                                    .size(11.0)
+                                    .size(10.0)
                                     .color(theme::TEXT_FAINT)
                                     .monospace(),
                             );
@@ -2192,11 +2266,11 @@ impl TunnelApp {
                                 LogLevel::Success => (" ok ", theme::SUCCESS),
                                 LogLevel::Error => ("err ", theme::DANGER),
                             };
-                            ui.label(RichText::new(tag).size(11.0).color(color).monospace());
-                            ui.label(RichText::new(&e.session).size(11.5).strong());
+                            ui.label(RichText::new(tag).size(10.0).color(color).monospace());
+                            ui.label(RichText::new(&e.session).size(10.5).strong());
                             ui.label(
                                 RichText::new(&e.message)
-                                    .size(12.0)
+                                    .size(11.0)
                                     .color(theme::TEXT_DIM),
                             );
                         });
@@ -2247,20 +2321,20 @@ impl TunnelApp {
             ];
             ui.label(
                 RichText::new(parts.join("  ·  "))
-                    .size(11.5)
+                    .size(10.5)
                     .color(theme::TEXT_DIM),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(10.0);
                 ui.label(
                     RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .size(11.0)
+                        .size(10.0)
                         .color(theme::TEXT_FAINT),
                 );
                 ui.add_space(8.0);
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("Activity").size(11.5))
+                        egui::Button::new(RichText::new("Activity").size(10.5))
                             .fill(Color32::TRANSPARENT)
                             .stroke(Stroke::NONE),
                     )
@@ -2295,16 +2369,16 @@ impl TunnelApp {
                     .fill(with_alpha(theme::BG_CARD, fade))
                     .corner_radius(CornerRadius::same(10))
                     .stroke(Stroke::new(1.0_f32, with_alpha(stroke_c, fade)))
-                    .inner_margin(Margin::symmetric(12, 9))
+                    .inner_margin(Margin::symmetric(10, 6))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(icon)
-                                    .size(12.0)
+                                    .size(11.0)
                                     .color(with_alpha(stroke_c, fade))
                                     .strong(),
                             );
-                            ui.label(RichText::new(text).size(12.5).color(with_alpha(theme::TEXT, fade)));
+                            ui.label(RichText::new(text).size(11.5).color(with_alpha(theme::TEXT, fade)));
                         });
                     });
             });
@@ -2345,7 +2419,7 @@ fn session_card(
                 theme::BORDER
             },
         ))
-        .inner_margin(Margin::symmetric(12, 9))
+        .inner_margin(Margin::symmetric(8, 3))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -2357,30 +2431,26 @@ fn session_card(
                     .next()
                     .map(|c| c.to_string().to_uppercase())
                     .unwrap_or_else(|| "?".to_string());
+                // Single-line MobaXterm-dense tree row: icon tile, name,
+                // tiny auth chip, live dot. Host lives in the tooltip.
                 let (tile, _) =
-                    ui.allocate_exact_size(egui::vec2(22.0, 22.0), Sense::hover());
-                ui.painter().rect_filled(tile, 6.0, tile_color);
+                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
+                ui.painter().rect_filled(tile, 4.0, tile_color);
                 ui.painter().text(
                     tile.center(),
                     egui::Align2::CENTER_CENTER,
                     &letter,
-                    egui::FontId::proportional(11.5),
+                    egui::FontId::proportional(8.5),
                     Color32::WHITE,
                 );
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 3.0;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(RichText::new(name).size(13.5).color(theme::TEXT));
-                        chip(ui, auth_label, a_fg, a_bg);
-                    });
-                    ui.label(
-                        RichText::new(conn)
-                            .size(11.5)
-                            .color(theme::TEXT_DIM)
-                            .monospace(),
-                    );
-                });
+                let shown: String = if name.chars().count() > 16 {
+                    name.chars().take(15).collect::<String>() + "…"
+                } else {
+                    name.to_string()
+                };
+                ui.label(RichText::new(shown).size(12.0).color(theme::TEXT))
+                    .on_hover_text(conn);
+                chip(ui, auth_label, a_fg, a_bg);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if tunnel_live {
                         ui.label(RichText::new("●").size(9.0).color(theme::SUCCESS))
@@ -2421,7 +2491,7 @@ fn session_card(
         }
         ui.separator();
         ui.label(
-            RichText::new("Move to group").size(11.0).color(theme::TEXT_FAINT),
+            RichText::new("Move to group").size(10.0).color(theme::TEXT_FAINT),
         );
         if ui.button("— No group —").clicked() {
             action = Some(CardAction::MoveToGroup(String::new()));
@@ -2429,7 +2499,7 @@ fn session_card(
         }
         if groups_menu.is_empty() {
             ui.label(
-                RichText::new("(no groups yet — create one)").size(10.5).color(theme::TEXT_FAINT),
+                RichText::new("(no groups yet — create one)").size(9.5).color(theme::TEXT_FAINT),
             );
         } else {
             for (gid, gname) in groups_menu {
@@ -2472,7 +2542,7 @@ fn group_header_row(
         if ghost_button(
             ui,
             RichText::new(format!("{caret} {name}"))
-                .size(12.0)
+                .size(11.0)
                 .strong()
                 .color(theme::TEXT_DIM),
             false,
@@ -2483,17 +2553,17 @@ fn group_header_row(
         }
         ui.label(
             RichText::new(count.to_string())
-                .size(10.5)
+                .size(9.5)
                 .color(theme::TEXT_FAINT),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let plus = ghost_button(ui, RichText::new("+").size(13.0).color(theme::TEXT_DIM), false)
+            let plus = ghost_button(ui, RichText::new("+").size(12.0).color(theme::TEXT_DIM), false)
                 .on_hover_text("New session in this group");
             if plus.clicked() {
                 cmd = Some(GroupCmd::AddSession);
             }
             ui.menu_button(
-                RichText::new("⋯").size(12.0).color(theme::TEXT_FAINT),
+                RichText::new("⋯").size(11.0).color(theme::TEXT_FAINT),
                 |menu| {
                     if menu.button("Edit group").clicked() {
                         cmd = Some(GroupCmd::Edit);
@@ -2541,15 +2611,15 @@ fn tunnel_row(
         .fill(theme::BG_CARD)
         .corner_radius(CornerRadius::same(10))
         .stroke(Stroke::new(1.0_f32, theme::BORDER))
-        .inner_margin(Margin::symmetric(12, 9))
+        .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new("●").size(10.0).color(dot_color))
+                ui.label(RichText::new("●").size(9.0).color(dot_color))
                     .on_hover_text(dot_tip);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
-                    ui.label(RichText::new(forward_desc(forward)).size(13.0));
+                    ui.label(RichText::new(forward_desc(forward)).size(12.0));
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         let (t_fg, t_bg) = fwd_palette(&forward.fwd_type);
@@ -2561,7 +2631,7 @@ fn tunnel_row(
                         }
                         ui.label(
                             RichText::new(format!("{session_name} · {conn}"))
-                                .size(11.0)
+                                .size(10.0)
                                 .color(theme::TEXT_FAINT),
                         );
                     });
@@ -2577,12 +2647,12 @@ fn tunnel_row(
                     {
                         action = Some(RowAction::Toggle);
                     }
-                    if ghost_button(ui, RichText::new("Edit").size(11.5).color(theme::TEXT_DIM), false)
+                    if ghost_button(ui, RichText::new("Edit").size(10.5).color(theme::TEXT_DIM), false)
                         .clicked()
                     {
                         action = Some(RowAction::Edit);
                     }
-                    if ghost_button(ui, RichText::new("×").size(12.0).color(theme::TEXT_DIM), true)
+                    if ghost_button(ui, RichText::new("×").size(11.0).color(theme::TEXT_DIM), true)
                         .on_hover_text("Delete tunnel")
                         .clicked()
                     {
@@ -2683,9 +2753,9 @@ fn paint_rail_icon(p: &egui::Painter, rect: egui::Rect, icon: RailIcon, color: C
 }
 
 fn rail_button(ui: &mut Ui, icon: RailIcon, active: bool, tip: &str) -> egui::Response {
-    let pad = ((ui.available_width() - 38.0) / 2.0).max(0.0);
+    let pad = ((ui.available_width() - 34.0) / 2.0).max(0.0);
     ui.allocate_exact_size(egui::vec2(pad, 0.0), Sense::hover());
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), Sense::click());
     ui.allocate_exact_size(egui::vec2(pad, 0.0), Sense::hover());
 
     let (fill, icon_color) = if active {
@@ -2712,7 +2782,7 @@ fn tool_button(
     active: bool,
     tip: &str,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(58.0, 42.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(48.0, 35.0), Sense::click());
     let (fill, icon_c, label_c) = if active {
         (theme::ACCENT_SOFT, theme::ACCENT_TEXT, theme::ACCENT_TEXT)
     } else if resp.hovered() {
@@ -2727,14 +2797,14 @@ fn tool_button(
     paint_rail_icon(
         p,
         egui::Rect::from_min_size(
-            egui::pos2(rect.center().x - 8.0, rect.top() + 2.0),
-            egui::vec2(16.0, 16.0),
+            egui::pos2(rect.center().x - 6.5, rect.top() + 1.0),
+            egui::vec2(13.0, 13.0),
         ),
         icon,
         icon_c,
     );
     p.text(
-        egui::pos2(rect.center().x, rect.bottom() - 6.5),
+        egui::pos2(rect.center().x, rect.bottom() - 5.5),
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(9.0),
@@ -2772,7 +2842,7 @@ fn tab_chip(
                 if let Some(c) = dot {
                     ui.label(RichText::new("●").size(9.0).color(c));
                 }
-                let mut label = RichText::new(title).size(13.0);
+                let mut label = RichText::new(title).size(12.0);
                 if active {
                     label = label.strong();
                 }
@@ -2804,7 +2874,7 @@ fn tab_chip(
                     let x = ui
                         .add(
                             egui::Button::new(
-                                RichText::new("×").size(10.5).color(theme::TEXT_FAINT),
+                                RichText::new("×").size(9.5).color(theme::TEXT_FAINT),
                             )
                             .fill(Color32::TRANSPARENT)
                             .stroke(Stroke::NONE)
@@ -2826,14 +2896,14 @@ fn chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) -> egui::Response {
         .corner_radius(CornerRadius::same(5))
         .inner_margin(Margin::symmetric(6, 1))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).size(10.5).color(fg).strong());
+            ui.label(RichText::new(text).size(9.5).color(fg).strong());
         })
         .response
 }
 
 fn choice_pill(ui: &mut Ui, label: &str, active: bool) -> egui::Response {
     ui.add(
-        egui::Button::new(RichText::new(label).size(12.5))
+        egui::Button::new(RichText::new(label).size(11.5))
             .fill(if active {
                 theme::ACCENT_SOFT
             } else {
@@ -2852,7 +2922,7 @@ fn choice_pill(ui: &mut Ui, label: &str, active: bool) -> egui::Response {
 }
 
 fn field(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
-    ui.label(RichText::new(label).size(12.0).color(theme::TEXT_DIM));
+    ui.label(RichText::new(label).size(11.0).color(theme::TEXT_DIM));
     add(ui);
     ui.add_space(8.0);
 }
@@ -2918,7 +2988,7 @@ fn soft_pill(ui: &mut Ui, label: &str, fg: Color32, bg: Color32, hover_bg: Color
         }
         ui.spacing_mut().button_padding = egui::vec2(9.0, 3.0);
         ui.add(
-            egui::Button::new(RichText::new(label).size(11.5).strong().color(fg))
+            egui::Button::new(RichText::new(label).size(10.5).strong().color(fg))
                 .corner_radius(CornerRadius::same(7)),
         )
     })
@@ -2968,11 +3038,11 @@ fn empty_hint(ui: &mut Ui, title: &str, body: &str) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new(title).size(14.0).strong());
+                ui.label(RichText::new(title).size(13.0).strong());
                 ui.add_space(2.0);
                 ui.label(
                     RichText::new(body)
-                        .size(12.0)
+                        .size(11.0)
                         .color(theme::TEXT_DIM),
                 );
             });
