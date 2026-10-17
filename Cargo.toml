@@ -1,0 +1,38 @@
+[package]
+name = "culvert"
+version = "0.3.0"
+edition = "2021"
+description = "Modern, native SSH client and tunnel manager for the desktop — local, remote and dynamic port forwarding with a built-in terminal"
+authors = ["Shinjiru-stack"]
+license = "MIT"
+
+[[bin]]
+name = "culvert"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.32"
+egui = "0.32"
+tokio = { version = "1", features = ["full"] }
+russh = "0.64"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+chrono = "0.4"
+anyhow = "1"
+futures = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+rfd = "0.15"
+tokio-util = { version = "0.7", features = ["full"] }
+vt100 = "0.16"
+
+[build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+png = "0.17"
+ico = "0.3"
+
+[profile.release]
+opt-level = 2
+strip = true

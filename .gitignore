@@ -1,0 +1,12 @@
+# Rust build output
+/target
+
+# Local build/check scratch logs
+*.log
+
+# Release packaging staging
+/dist
+
+# OS cruft
+.DS_Store
+Thumbs.db

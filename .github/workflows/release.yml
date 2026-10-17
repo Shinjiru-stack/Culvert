@@ -1,0 +1,69 @@
+name: Release
+
+# Builds a Windows .exe whenever something lands on `main` and publishes it
+# as a GitHub Release. Bump `version` in Cargo.toml to cut a new release tag;
+# otherwise the existing release for that version is refreshed with the new
+# binary.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Windows release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Read version from Cargo.toml
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=v$version"      >> $env:GITHUB_OUTPUT
+          Write-Host "Building Culvert v$version"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/culvert.exe dist/
+          New-Item -ItemType Directory -Path dist/assets -Force | Out-Null
+          Copy-Item assets/icon.png dist/assets/
+          Copy-Item README.md dist/
+          Copy-Item LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath "culvert-${{ steps.version.outputs.version }}-windows-x64.zip"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: culvert-windows-x64
+          path: culvert-*-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Culvert ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: culvert-*-windows-x64.zip
