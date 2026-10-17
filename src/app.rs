@@ -739,25 +739,6 @@ impl TunnelApp {
             )
             .show(ctx, |ui| self.statusbar(ui));
 
-        // Thin menu bar across the top (original, generic wording).
-        egui::TopBottomPanel::top("menu_bar")
-            .frame(Frame::NONE.fill(theme::BG_CARD).stroke(Stroke::new(1.0_f32, theme::BORDER)))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    ui.add_space(4.0);
-                    self.menu_file(ui);
-                    self.menu_view(ui);
-                    self.menu_help(ui);
-                });
-            });
-
-        egui::SidePanel::left("rail")
-            .exact_width(40.0)
-            .resizable(false)
-            .frame(Frame::NONE.fill(theme::BG_CARD).stroke(Stroke::new(1.0_f32, theme::BORDER)))
-            .show(ctx, |ui| self.rail(ui));
-
         egui::SidePanel::left("sessions")
             .exact_width(238.0)
             .resizable(false)
@@ -1085,31 +1066,6 @@ impl TunnelApp {
         self.groups.iter().find(|g| Some(g.id.as_str()) == gid).and_then(|g| g.color).map(|c| Color32::from_rgb(c[0], c[1], c[2]))
     }
 
-    /// Left icon rail: session home, split view, activity.
-    fn rail(&mut self, ui: &mut Ui) {
-        ui.add_space(10.0);
-        if rail_button(ui, RailIcon::Home, self.active == 0 && !self.split_view, "Sessions & tunnels (home)")
-            .clicked()
-        {
-            self.active = 0;
-        }
-        ui.add_space(4.0);
-        if rail_button(
-            ui,
-            RailIcon::Split,
-            self.split_view,
-            "Split view — show every open shell side by side",
-        )
-        .clicked()
-        {
-            self.split_view = !self.split_view;
-        }
-        ui.add_space(4.0);
-        if rail_button(ui, RailIcon::Activity, self.show_logs, "Activity log").clicked() {
-            self.show_logs = !self.show_logs;
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Tab strip
     // -----------------------------------------------------------------------
@@ -1155,61 +1111,6 @@ impl TunnelApp {
                 .clicked()
             {
                 self.show_logs = !self.show_logs;
-            }
-        });
-    }
-
-    // -----------------------------------------------------------------------
-    // Menu bar
-    // -----------------------------------------------------------------------
-
-    fn menu_file(&mut self, ui: &mut Ui) {
-        ui.menu_button("File", |ui| {
-            if ui.button("New session").clicked() {
-                self.session_editor = Some(SessionEditor::new());
-                ui.close();
-            }
-            if ui.button("New tunnel").clicked() {
-                if !self.sessions.is_empty() {
-                    let id = self
-                        .selected
-                        .clone()
-                        .filter(|id| self.sessions.iter().any(|s| &s.id == id))
-                        .unwrap_or_else(|| self.sessions[0].id.clone());
-                    self.tunnel_editor = Some(TunnelEditor::new(id));
-                }
-                ui.close();
-            }
-            ui.separator();
-            if ui.button("Exit").clicked() {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                ui.close();
-            }
-        });
-    }
-
-    fn menu_view(&mut self, ui: &mut Ui) {
-        ui.menu_button("View", |ui| {
-            if ui.button("Toggle split view").clicked() {
-                self.split_view = !self.split_view;
-                ui.close();
-            }
-            if ui.button("Activity log").clicked() {
-                self.show_logs = !self.show_logs;
-                ui.close();
-            }
-        });
-    }
-
-    fn menu_help(&mut self, ui: &mut Ui) {
-        let about = format!("About Culvert (v{})", env!("CARGO_PKG_VERSION"));
-        ui.menu_button("Help", |ui| {
-            if ui.button(about).clicked() {
-                self.toast(
-                    ToastKind::Info,
-                    "Culvert — a small SSH session & tunnel manager built with Rust + egui.",
-                );
-                ui.close();
             }
         });
     }
@@ -2688,7 +2589,6 @@ fn tunnel_row(
 /// availability worries).
 #[derive(Clone, Copy)]
 enum RailIcon {
-    Home,
     Session,
     Tunnel,
     Split,
@@ -2700,12 +2600,6 @@ fn paint_rail_icon(p: &egui::Painter, rect: egui::Rect, icon: RailIcon, color: C
     let line = |a: egui::Pos2, b: egui::Pos2, w: f32| p.line_segment([a, b], Stroke::new(w, color));
     let w = 2.0_f32;
     match icon {
-        RailIcon::Home => {
-            for (i, len) in [16.0_f32, 11.0, 6.0].iter().enumerate() {
-                let y = c.y - 6.0 + i as f32 * 6.0;
-                line(egui::pos2(c.x - 8.0, y), egui::pos2(c.x - 8.0 + len, y), w);
-            }
-        }
         RailIcon::Session => {
             // A small terminal window with a ">_" prompt inside.
             let r = egui::Rect::from_center_size(c, egui::vec2(18.0, 15.0));
@@ -2750,27 +2644,6 @@ fn paint_rail_icon(p: &egui::Painter, rect: egui::Rect, icon: RailIcon, color: C
             line(c, egui::pos2(c.x + 3.5, c.y + 1.5), w);
         }
     }
-}
-
-fn rail_button(ui: &mut Ui, icon: RailIcon, active: bool, tip: &str) -> egui::Response {
-    let pad = ((ui.available_width() - 34.0) / 2.0).max(0.0);
-    ui.allocate_exact_size(egui::vec2(pad, 0.0), Sense::hover());
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), Sense::click());
-    ui.allocate_exact_size(egui::vec2(pad, 0.0), Sense::hover());
-
-    let (fill, icon_color) = if active {
-        (theme::ACCENT, Color32::WHITE)
-    } else if resp.hovered() {
-        (theme::BG_BTN_HOVER, theme::TEXT)
-    } else {
-        (Color32::TRANSPARENT, theme::TEXT_DIM)
-    };
-    let p = ui.painter();
-    if fill != Color32::TRANSPARENT {
-        p.rect_filled(rect, 9.0, fill);
-    }
-    paint_rail_icon(p, rect, icon, icon_color);
-    resp.on_hover_text(tip)
 }
 
 /// Small labeled icon button for the top toolbar.
