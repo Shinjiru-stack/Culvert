@@ -117,6 +117,29 @@ fn install_fonts(ctx: &egui::Context) {
         .entry(FontFamily::Monospace)
         .or_default()
         .insert(0, "JetBrainsMono".to_owned());
+    // System fonts as last-resort fallbacks: Segoe UI Symbol covers glyphs
+    // missing from the bundled fonts (●, ×, triangles, arrows…) so they
+    // render instead of tofu boxes on Windows.
+    for (name, path) in [
+        ("SegoeUISymbol", "C:\\Windows\\Fonts\\seguisym.ttf"),
+        ("SegoeUI", "C:\\Windows\\Fonts\\segoeui.ttf"),
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert(name.to_owned(), Arc::new(FontData::from_owned(bytes)));
+            fonts
+                .families
+                .entry(FontFamily::Proportional)
+                .or_default()
+                .push(name.to_owned());
+            fonts
+                .families
+                .entry(FontFamily::Monospace)
+                .or_default()
+                .push(name.to_owned());
+        }
+    }
     ctx.set_fonts(fonts);
 }
 

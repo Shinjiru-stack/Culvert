@@ -235,12 +235,18 @@ fn legacy_sessions_file() -> PathBuf {
     config_base().join("ssh-tunnel-manager").join("sessions.json")
 }
 
+/// Strip a leading UTF-8 BOM — editors like Notepad (and some tools) write
+/// one, and serde_json chokes on it.
+fn strip_bom(s: &str) -> &str {
+    s.strip_prefix('\u{feff}').unwrap_or(s)
+}
+
 pub fn load_sessions() -> Vec<SshSession> {
     let path = sessions_file();
     if !path.exists() {
         // First launch after the rename: import and persist old sessions.
         if let Ok(s) = fs::read_to_string(legacy_sessions_file()) {
-            if let Ok(sessions) = serde_json::from_str::<Vec<SshSession>>(&s) {
+            if let Ok(sessions) = serde_json::from_str::<Vec<SshSession>>(strip_bom(&s)) {
                 let _ = save_sessions(&sessions);
                 return sessions;
             }
@@ -248,7 +254,9 @@ pub fn load_sessions() -> Vec<SshSession> {
         return Vec::new();
     }
     match fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str::<Vec<SshSession>>(&s).unwrap_or_else(|_| Vec::new()),
+        Ok(s) => {
+            serde_json::from_str::<Vec<SshSession>>(strip_bom(&s)).unwrap_or_else(|_| Vec::new())
+        }
         Err(_) => Vec::new(),
     }
 }
@@ -269,7 +277,7 @@ pub fn groups_file() -> PathBuf {
 
 pub fn load_groups() -> Vec<SessionGroup> {
     match fs::read_to_string(groups_file()) {
-        Ok(s) => serde_json::from_str::<Vec<SessionGroup>>(&s).unwrap_or_default(),
+        Ok(s) => serde_json::from_str::<Vec<SessionGroup>>(strip_bom(&s)).unwrap_or_default(),
         Err(_) => Vec::new(),
     }
 }

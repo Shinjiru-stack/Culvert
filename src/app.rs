@@ -42,6 +42,8 @@ pub struct TunnelApp {
     confirm: Option<Confirm>,
     toast: Option<Toast>,
     show_logs: bool,
+    /// Split view: show every open shell side-by-side in a grid.
+    split_view: bool,
     now: f64,
     mark_texture: Option<egui::TextureHandle>,
 }
@@ -234,6 +236,8 @@ enum GroupCmd {
     Toggle,
     Edit,
     Delete,
+    /// Open a pre-filled "new session in this group" editor.
+    AddSession,
 }
 
 /// Chrome-style tab context menu (right-click a chip), resolved against the
@@ -278,6 +282,7 @@ impl TunnelApp {
             confirm: None,
             toast: None,
             show_logs: false,
+            split_view: false,
             group_editor: None,
             now: 0.0,
             mark_texture: None,
@@ -734,6 +739,12 @@ impl TunnelApp {
             )
             .show(ctx, |ui| self.statusbar(ui));
 
+        egui::SidePanel::left("rail")
+            .exact_width(48.0)
+            .resizable(false)
+            .frame(Frame::NONE.fill(theme::BG_CARD).stroke(Stroke::new(1.0_f32, theme::BORDER)))
+            .show(ctx, |ui| self.rail(ui));
+
         egui::SidePanel::left("sessions")
             .exact_width(266.0)
             .resizable(false)
@@ -749,13 +760,13 @@ impl TunnelApp {
             )
             .show(ctx, |ui| self.sidebar(ui, ctx));
 
-        egui::CentralPanel::default()
-            .frame(Frame::NONE.fill(theme::BG_WINDOW).inner_margin(Margin::symmetric(16, 10)))
-            .show(ctx, |ui| {
-                self.tab_strip(ui);
-                ui.add_space(6.0);
-                self.workspace(ui, ctx);
-            });
+            egui::CentralPanel::default()
+                .frame(Frame::NONE.fill(theme::BG_WINDOW).inner_margin(Margin::symmetric(16, 10)))
+                .show(ctx, |ui| {
+                    self.tab_strip(ui, ctx);
+                    ui.add_space(6.0);
+                    self.workspace(ui, ctx);
+                });
 
         self.session_editor_modal(ctx);
         self.tunnel_editor_modal(ctx);
@@ -802,7 +813,7 @@ impl TunnelApp {
         let full = egui::vec2(ui.available_width(), 31.0);
         if styled_button(
             ui,
-            RichText::new("＋  New session").size(13.5),
+            RichText::new("+  New session").size(13.5),
             true,
             false,
             Some(full),
@@ -817,7 +828,7 @@ impl TunnelApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ghost_button(
                     ui,
-                    RichText::new("＋ Group").size(11.5).color(theme::TEXT_DIM),
+                    RichText::new("+ Group").size(11.5).color(theme::TEXT_DIM),
                     false,
                 )
                 .on_hover_text("Create a group to organize sessions (Prod, Staging, Home…)")
@@ -829,15 +840,13 @@ impl TunnelApp {
         });
         ui.add_space(6.0);
 
-        if self.sessions.len() > 6 {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("Search sessions…")
-                    .desired_width(ui.available_width())
-                    .margin(egui::vec2(8.0, 5.0)),
-            );
-            ui.add_space(6.0);
-        }
+        ui.add(
+            egui::TextEdit::singleline(&mut self.search)
+                .hint_text("Search sessions…")
+                .desired_width(ui.available_width())
+                .margin(egui::vec2(8.0, 5.0)),
+        );
+        ui.add_space(6.0);
 
         let filter = self.search.trim().to_lowercase();
         let ids: Vec<String> = self
@@ -965,6 +974,11 @@ impl TunnelApp {
                         });
                     }
                 }
+                GroupCmd::AddSession => {
+                    let mut ed = SessionEditor::new();
+                    ed.group = Some(gid.clone());
+                    self.session_editor = Some(ed);
+                }
             }
         }
         for (id, action) in card_actions {
@@ -1050,11 +1064,36 @@ impl TunnelApp {
         self.groups.iter().find(|g| Some(g.id.as_str()) == gid).and_then(|g| g.color).map(|c| Color32::from_rgb(c[0], c[1], c[2]))
     }
 
+    /// Left icon rail: session home, split view, activity.
+    fn rail(&mut self, ui: &mut Ui) {
+        ui.add_space(10.0);
+        if rail_button(ui, RailIcon::Home, self.active == 0 && !self.split_view, "Sessions & tunnels (home)")
+            .clicked()
+        {
+            self.active = 0;
+        }
+        ui.add_space(4.0);
+        if rail_button(
+            ui,
+            RailIcon::Split,
+            self.split_view,
+            "Split view — show every open shell side by side",
+        )
+        .clicked()
+        {
+            self.split_view = !self.split_view;
+        }
+        ui.add_space(4.0);
+        if rail_button(ui, RailIcon::Activity, self.show_logs, "Activity log").clicked() {
+            self.show_logs = !self.show_logs;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Tab strip
     // -----------------------------------------------------------------------
 
-    fn tab_strip(&mut self, ui: &mut Ui) {
+    fn tab_strip(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let active = self.active == 0;
@@ -1106,6 +1145,29 @@ impl TunnelApp {
                     TabMenu::CloseAll => self.close_all_terminal_tabs(),
                 }
             }
+            // + opens a shell for the selected session (quick-connect style).
+            let plus_resp = ui.add(
+                egui::Button::new(RichText::new("+").size(14.0).color(theme::ACCENT))
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::NONE)
+                    .min_size(egui::vec2(24.0, 24.0)),
+            );
+            if plus_resp.clicked() {
+                match self
+                    .selected
+                    .clone()
+                    .filter(|id| self.sessions.iter().any(|s| &s.id == id))
+                {
+                    Some(id) => self.open_terminal(ctx, &id),
+                    None => match self.sessions.first().map(|s| s.id.clone()) {
+                        Some(id) => self.open_terminal(ctx, &id),
+                        None => {
+                            self.toast(ToastKind::Info, "Add a session first — the + opens a shell.");
+                        }
+                    },
+                }
+            }
+            plus_resp.on_hover_text("Open a shell for the selected session");
         });
     }
 
@@ -1115,11 +1177,144 @@ impl TunnelApp {
 
     fn workspace(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let active = self.active;
+        let use_grid = self.split_view && self.terminal_tab_count() >= 2;
+        if use_grid {
+            self.terminal_grid(ui, ctx);
+            return;
+        }
         if let Some(Tab::Terminal(term)) = self.tabs.get_mut(active) {
             term.ui(ui);
             return;
         }
         self.tunnels_page(ui, ctx);
+    }
+
+    fn terminal_tab_count(&self) -> usize {
+        self.tabs
+            .iter()
+            .filter(|t| matches!(t, Tab::Terminal(_)))
+            .count()
+    }
+
+    /// Split view: every open shell in a 2-column grid, each pane with its
+    /// own title bar (live, individually interactive).
+    fn terminal_grid(&mut self, ui: &mut Ui, _ctx: &egui::Context) {
+        let avail = ui.available_size();
+        let gap = 8.0;
+        let cell = egui::vec2(
+            (((avail.x - gap) / 2.0) - 2.0).max(220.0),
+            ((avail.y - gap) / 2.0).max(150.0),
+        );
+        let idxs: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| matches!(t, Tab::Terminal(_)))
+            .map(|(i, _)| i)
+            .collect();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .id_salt("terminal_grid")
+            .show(ui, |ui| {
+                for pair in idxs.chunks(2) {
+                    ui.horizontal(|ui| {
+                        for &i in pair {
+                            self.terminal_pane(ui, i, cell);
+                            ui.add_space(gap);
+                        }
+                    });
+                    ui.add_space(gap);
+                }
+            });
+    }
+
+    fn terminal_pane(&mut self, ui: &mut Ui, index: usize, cell: egui::Vec2) {
+        let (title, dot) = match &self.tabs[index] {
+            Tab::Terminal(t) => {
+                let dot = match t.status {
+                    TermStatus::Connected => theme::SUCCESS,
+                    TermStatus::Connecting => theme::WARNING,
+                    TermStatus::Closed(_) => theme::DANGER,
+                };
+                (t.title.clone(), dot)
+            }
+            _ => return,
+        };
+        let selected = self.active == index;
+        let mut go_active = false;
+        let mut want_close = false;
+        Frame::NONE
+            .fill(theme::BG_CARD)
+            .corner_radius(CornerRadius::same(10))
+            .stroke(Stroke::new(
+                1.0_f32,
+                if selected {
+                    theme::ACCENT
+                } else {
+                    theme::BORDER
+                },
+            ))
+            .inner_margin(Margin::same(0))
+            .show(ui, |ui| {
+                ui.set_width(cell.x);
+                // Title bar: fixed-size row, painted + positioned manually so
+                // the close × and click-to-focus coexist safely.
+                ui.allocate_ui(egui::vec2(cell.x, 26.0), |ui| {
+                    let (bar_rect, bar_resp) =
+                        ui.allocate_exact_size(egui::vec2(cell.x, 26.0), Sense::click());
+                    if selected {
+                        ui.painter().rect_filled(bar_rect, 0.0, theme::BG_CARD_SEL);
+                    }
+                    ui.painter().circle_filled(
+                        egui::pos2(bar_rect.left() + 14.0, bar_rect.center().y),
+                        3.0,
+                        dot,
+                    );
+                    let font = egui::TextStyle::Body.resolve(ui.style());
+                    ui.painter().text(
+                        egui::pos2(bar_rect.left() + 24.0, bar_rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        &title,
+                        font,
+                        theme::TEXT_DIM,
+                    );
+                    let x_rect = egui::Rect::from_min_size(
+                        egui::pos2(bar_rect.right() - 22.0, bar_rect.top() + 4.0),
+                        egui::vec2(18.0, 18.0),
+                    );
+                    if ui
+                        .put(
+                            x_rect,
+                            egui::Button::new(
+                                RichText::new("×").size(10.0).color(theme::TEXT_FAINT),
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE),
+                        )
+                        .on_hover_text("Close this shell")
+                        .clicked()
+                    {
+                        want_close = true;
+                    }
+                    if bar_resp.clicked() {
+                        go_active = true;
+                    }
+                });
+                let Some(Tab::Terminal(t)) = self.tabs.get_mut(index) else {
+                    return;
+                };
+                ui.allocate_ui(egui::vec2(cell.x, cell.y - 26.0), |ui| {
+                    t.ui(ui);
+                });
+            });
+        if go_active {
+            self.active = index;
+        }
+        if want_close {
+            if let Some(Tab::Terminal(t)) = self.tabs.get_mut(index) {
+                t.want_close = true;
+            }
+        }
     }
 
     fn tunnels_page(&mut self, ui: &mut Ui, _ctx: &egui::Context) {
@@ -1143,7 +1338,7 @@ impl TunnelApp {
                 let enabled = !self.sessions.is_empty();
                 let new_tunnel = styled_button(
                     ui,
-                    RichText::new("＋  New tunnel").size(13.5),
+                    RichText::new("+  New tunnel").size(13.5),
                     enabled,
                     false,
                     None,
@@ -2074,11 +2269,24 @@ fn session_card(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                if let Some(c) = group_dot {
-                    let (r, _) =
-                        ui.allocate_exact_size(egui::vec2(9.0, 9.0), Sense::hover());
-                    ui.painter().rect_filled(r, 3.0, c);
-                }
+                // Colorful per-session tile like a host-list icon: group
+                // color when grouped, brand accent otherwise, letter inside.
+                let tile_color = group_dot.unwrap_or(theme::ACCENT);
+                let letter: String = name
+                    .chars()
+                    .next()
+                    .map(|c| c.to_string().to_uppercase())
+                    .unwrap_or_else(|| "?".to_string());
+                let (tile, _) =
+                    ui.allocate_exact_size(egui::vec2(22.0, 22.0), Sense::hover());
+                ui.painter().rect_filled(tile, 6.0, tile_color);
+                ui.painter().text(
+                    tile.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &letter,
+                    egui::FontId::proportional(11.5),
+                    Color32::WHITE,
+                );
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     ui.horizontal(|ui| {
@@ -2151,7 +2359,7 @@ fn session_card(
                 }
             }
         }
-        if ui.button("＋ New group…").clicked() {
+        if ui.button("+ New group…").clicked() {
             action = Some(CardAction::NewGroup(session_id.to_string()));
             ui.close();
         }
@@ -2199,6 +2407,11 @@ fn group_header_row(
                 .color(theme::TEXT_FAINT),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let plus = ghost_button(ui, RichText::new("+").size(13.0).color(theme::TEXT_DIM), false)
+                .on_hover_text("New session in this group");
+            if plus.clicked() {
+                cmd = Some(GroupCmd::AddSession);
+            }
             ui.menu_button(
                 RichText::new("⋯").size(12.0).color(theme::TEXT_FAINT),
                 |menu| {
@@ -2289,7 +2502,7 @@ fn tunnel_row(
                     {
                         action = Some(RowAction::Edit);
                     }
-                    if ghost_button(ui, RichText::new("✕").size(12.0).color(theme::TEXT_DIM), true)
+                    if ghost_button(ui, RichText::new("×").size(12.0).color(theme::TEXT_DIM), true)
                         .on_hover_text("Delete tunnel")
                         .clicked()
                     {
@@ -2321,6 +2534,62 @@ fn tunnel_row(
 
 /// Terminal-style tab chip; right-click opens the Chrome-style tab menu.
 /// Returns (clicked-activate, clicked-close, context-menu command).
+/// Left-rail icon button with a painter-drawn glyph (original vector art —
+/// no font-symbol availability worries).
+#[derive(Clone, Copy)]
+enum RailIcon {
+    Home,
+    Split,
+    Activity,
+}
+
+fn rail_button(ui: &mut Ui, icon: RailIcon, active: bool, tip: &str) -> egui::Response {
+    let pad = ((ui.available_width() - 38.0) / 2.0).max(0.0);
+    ui.allocate_exact_size(egui::vec2(pad, 0.0), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), Sense::click());
+    ui.allocate_exact_size(egui::vec2(pad, 0.0), Sense::hover());
+
+    let (fill, icon_color) = if active {
+        (theme::ACCENT, Color32::WHITE)
+    } else if resp.hovered() {
+        (theme::BG_BTN_HOVER, theme::TEXT)
+    } else {
+        (Color32::TRANSPARENT, theme::TEXT_DIM)
+    };
+    let p = ui.painter();
+    if fill != Color32::TRANSPARENT {
+        p.rect_filled(rect, 9.0, fill);
+    }
+    let c = rect.center();
+    let stroke = |w: f32| Stroke::new(w, icon_color);
+    match icon {
+        RailIcon::Home => {
+            for (i, w) in [16.0_f32, 11.0, 6.0].iter().enumerate() {
+                let y = c.y - 6.0 + i as f32 * 6.0;
+                p.line_segment(
+                    [egui::pos2(c.x - 8.0, y), egui::pos2(c.x - 8.0 + w, y)],
+                    stroke(2.0),
+                );
+            }
+        }
+        RailIcon::Split => {
+            for (dx, dy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                let quad = egui::Rect::from_center_size(
+                    egui::pos2(c.x + dx * 4.5, c.y + dy * 4.5),
+                    egui::vec2(7.0, 7.0),
+                );
+                p.rect_filled(quad, 2.0, icon_color);
+            }
+        }
+        RailIcon::Activity => {
+            p.circle_stroke(c, 7.5, stroke(2.0));
+            p.line_segment([c, egui::pos2(c.x, c.y - 4.5)], stroke(2.0));
+            p.line_segment([c, egui::pos2(c.x + 3.5, c.y + 1.5)], stroke(2.0));
+        }
+    }
+    resp.on_hover_text(tip)
+}
+
 fn tab_chip(
     ui: &mut Ui,
     title: &str,
@@ -2345,14 +2614,6 @@ fn tab_chip(
         })
         .inner_margin(Margin::symmetric(10, 4))
         .show(ui, |ui| {
-            if active {
-                // Top accent strip — a quiet callback to browser tabs.
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 2.0),
-                    Sense::hover(),
-                );
-                ui.painter().rect_filled(rect, 1.0, theme::ACCENT);
-            }
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 if let Some(c) = dot {
@@ -2390,7 +2651,7 @@ fn tab_chip(
                     let x = ui
                         .add(
                             egui::Button::new(
-                                RichText::new("✕").size(10.5).color(theme::TEXT_FAINT),
+                                RichText::new("×").size(10.5).color(theme::TEXT_FAINT),
                             )
                             .fill(Color32::TRANSPARENT)
                             .stroke(Stroke::NONE)
