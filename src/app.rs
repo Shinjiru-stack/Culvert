@@ -763,6 +763,8 @@ impl TunnelApp {
             egui::CentralPanel::default()
                 .frame(Frame::NONE.fill(theme::BG_WINDOW).inner_margin(Margin::symmetric(16, 10)))
                 .show(ctx, |ui| {
+                    self.toolbar(ui);
+                    ui.add_space(6.0);
                     self.tab_strip(ui, ctx);
                     ui.add_space(6.0);
                     self.workspace(ui, ctx);
@@ -1093,6 +1095,51 @@ impl TunnelApp {
     // Tab strip
     // -----------------------------------------------------------------------
 
+    /// Icon toolbar across the top of the workspace (original painted icons).
+    fn toolbar(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if tool_button(ui, RailIcon::Session, theme::SUCCESS, "Session", false, "New session")
+                .clicked()
+            {
+                self.session_editor = Some(SessionEditor::new());
+            }
+            let tip = if self.sessions.is_empty() {
+                "Add a session first — tunnels need an SSH host."
+            } else {
+                "New port tunnel"
+            };
+            let tun = tool_button(ui, RailIcon::Tunnel, theme::INFO, "Tunnel", false, tip);
+            if !self.sessions.is_empty() && tun.clicked() {
+                let id = self
+                    .selected
+                    .clone()
+                    .filter(|id| self.sessions.iter().any(|s| &s.id == id))
+                    .unwrap_or_else(|| self.sessions[0].id.clone());
+                self.tunnel_editor = Some(TunnelEditor::new(id));
+            }
+            // Slim vertical separator between the action and view groups.
+            {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(2.0, 26.0), Sense::hover());
+                ui.painter().line_segment(
+                    [egui::pos2(r.center().x, r.top() + 4.0), egui::pos2(r.center().x, r.bottom() - 4.0)],
+                    Stroke::new(1.0_f32, theme::BORDER),
+                );
+            }
+            let split_active = self.split_view && self.terminal_tab_count() >= 2;
+            if tool_button(ui, RailIcon::Split, theme::VIOLET, "Split", split_active, "Toggle split view")
+                .clicked()
+            {
+                self.split_view = !self.split_view;
+            }
+            if tool_button(ui, RailIcon::Activity, theme::WARNING, "Activity", self.show_logs, "Activity log")
+                .clicked()
+            {
+                self.show_logs = !self.show_logs;
+            }
+        });
+    }
+
     fn tab_strip(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
@@ -1237,10 +1284,10 @@ impl TunnelApp {
             return;
         };
         let title = t.title.clone();
-        let dot = match t.status {
-            TermStatus::Connected => theme::SUCCESS,
-            TermStatus::Connecting => theme::WARNING,
-            TermStatus::Closed(_) => theme::DANGER,
+        let (dot, word) = match t.status {
+            TermStatus::Connected => (theme::SUCCESS, "connected"),
+            TermStatus::Connecting => (theme::WARNING, "connecting"),
+            TermStatus::Closed(_) => (theme::DANGER, "closed"),
         };
         // The focused pane is the one with keyboard focus (falls back to the
         // selected tab), so the highlight follows clicks into terminals.
@@ -1251,9 +1298,13 @@ impl TunnelApp {
             pane.min,
             egui::vec2(pane.width(), 26.0),
         );
+        let strip = egui::Rect::from_min_max(
+            egui::pos2(pane.left() + 1.0, pane.bottom() - 18.0),
+            egui::pos2(pane.right() - 1.0, pane.bottom() - 1.0),
+        );
         let body = egui::Rect::from_min_max(
             egui::pos2(pane.left() + 1.0, pane.top() + 27.0),
-            egui::pos2(pane.right() - 1.0, pane.bottom() - 1.0),
+            egui::pos2(pane.right() - 1.0, strip.top()),
         );
 
         let p = ui.painter();
@@ -1278,6 +1329,16 @@ impl TunnelApp {
             &title,
             font,
             theme::TEXT_DIM,
+        );
+
+        // Bottom status strip, like a pane footer.
+        p.rect_filled(strip, 0.0, theme::BG_PANEL_ALT);
+        p.text(
+            egui::pos2(strip.left() + 10.0, strip.center().y),
+            egui::Align2::LEFT_CENTER,
+            format!("{} · {}", title, word),
+            egui::FontId::proportional(9.5),
+            theme::TEXT_FAINT,
         );
 
         // Close ×: painted + hit-tested manually so it sits cleanly at the
@@ -2553,13 +2614,72 @@ fn tunnel_row(
 
 /// Terminal-style tab chip; right-click opens the Chrome-style tab menu.
 /// Returns (clicked-activate, clicked-close, context-menu command).
-/// Left-rail icon button with a painter-drawn glyph (original vector art —
-/// no font-symbol availability worries).
+/// Left-rail/toolbar icon button glyph (original vector art — no font-symbol
+/// availability worries).
 #[derive(Clone, Copy)]
 enum RailIcon {
     Home,
+    Session,
+    Tunnel,
     Split,
     Activity,
+}
+
+fn paint_rail_icon(p: &egui::Painter, rect: egui::Rect, icon: RailIcon, color: Color32) {
+    let c = rect.center();
+    let line = |a: egui::Pos2, b: egui::Pos2, w: f32| p.line_segment([a, b], Stroke::new(w, color));
+    let w = 2.0_f32;
+    match icon {
+        RailIcon::Home => {
+            for (i, len) in [16.0_f32, 11.0, 6.0].iter().enumerate() {
+                let y = c.y - 6.0 + i as f32 * 6.0;
+                line(egui::pos2(c.x - 8.0, y), egui::pos2(c.x - 8.0 + len, y), w);
+            }
+        }
+        RailIcon::Session => {
+            // A small terminal window with a ">_" prompt inside.
+            let r = egui::Rect::from_center_size(c, egui::vec2(18.0, 15.0));
+            p.rect_stroke(r, 3.0, Stroke::new(w, color), egui::StrokeKind::Inside);
+            line(
+                egui::pos2(c.x - 4.5, c.y - 1.0),
+                egui::pos2(c.x - 1.0, c.y + 1.0),
+                w,
+            );
+            line(
+                egui::pos2(c.x - 1.0, c.y + 1.0),
+                egui::pos2(c.x - 4.5, c.y + 3.0),
+                w,
+            );
+            line(
+                egui::pos2(c.x + 1.0, c.y + 3.0),
+                egui::pos2(c.x + 4.5, c.y + 3.0),
+                w,
+            );
+        }
+        RailIcon::Tunnel => {
+            // Two opposing arrows: traffic flowing through a tunnel.
+            line(egui::pos2(c.x - 8.0, c.y - 3.0), egui::pos2(c.x + 8.0, c.y - 3.0), w);
+            line(egui::pos2(c.x + 5.5, c.y - 5.5), egui::pos2(c.x + 8.0, c.y - 3.0), w);
+            line(egui::pos2(c.x + 5.5, c.y - 0.5), egui::pos2(c.x + 8.0, c.y - 3.0), w);
+            line(egui::pos2(c.x + 8.0, c.y + 3.0), egui::pos2(c.x - 8.0, c.y + 3.0), w);
+            line(egui::pos2(c.x - 5.5, c.y + 0.5), egui::pos2(c.x - 8.0, c.y + 3.0), w);
+            line(egui::pos2(c.x - 5.5, c.y + 5.5), egui::pos2(c.x - 8.0, c.y + 3.0), w);
+        }
+        RailIcon::Split => {
+            for (dx, dy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                let quad = egui::Rect::from_center_size(
+                    egui::pos2(c.x + dx * 4.5, c.y + dy * 4.5),
+                    egui::vec2(7.0, 7.0),
+                );
+                p.rect_filled(quad, 2.0, color);
+            }
+        }
+        RailIcon::Activity => {
+            p.circle_stroke(c, 7.5, Stroke::new(w, color));
+            line(c, egui::pos2(c.x, c.y - 4.5), w);
+            line(c, egui::pos2(c.x + 3.5, c.y + 1.5), w);
+        }
+    }
 }
 
 fn rail_button(ui: &mut Ui, icon: RailIcon, active: bool, tip: &str) -> egui::Response {
@@ -2579,33 +2699,47 @@ fn rail_button(ui: &mut Ui, icon: RailIcon, active: bool, tip: &str) -> egui::Re
     if fill != Color32::TRANSPARENT {
         p.rect_filled(rect, 9.0, fill);
     }
-    let c = rect.center();
-    let stroke = |w: f32| Stroke::new(w, icon_color);
-    match icon {
-        RailIcon::Home => {
-            for (i, w) in [16.0_f32, 11.0, 6.0].iter().enumerate() {
-                let y = c.y - 6.0 + i as f32 * 6.0;
-                p.line_segment(
-                    [egui::pos2(c.x - 8.0, y), egui::pos2(c.x - 8.0 + w, y)],
-                    stroke(2.0),
-                );
-            }
-        }
-        RailIcon::Split => {
-            for (dx, dy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                let quad = egui::Rect::from_center_size(
-                    egui::pos2(c.x + dx * 4.5, c.y + dy * 4.5),
-                    egui::vec2(7.0, 7.0),
-                );
-                p.rect_filled(quad, 2.0, icon_color);
-            }
-        }
-        RailIcon::Activity => {
-            p.circle_stroke(c, 7.5, stroke(2.0));
-            p.line_segment([c, egui::pos2(c.x, c.y - 4.5)], stroke(2.0));
-            p.line_segment([c, egui::pos2(c.x + 3.5, c.y + 1.5)], stroke(2.0));
-        }
+    paint_rail_icon(p, rect, icon, icon_color);
+    resp.on_hover_text(tip)
+}
+
+/// Small labeled icon button for the top toolbar.
+fn tool_button(
+    ui: &mut Ui,
+    icon: RailIcon,
+    tint: Color32,
+    label: &str,
+    active: bool,
+    tip: &str,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(58.0, 42.0), Sense::click());
+    let (fill, icon_c, label_c) = if active {
+        (theme::ACCENT_SOFT, theme::ACCENT_TEXT, theme::ACCENT_TEXT)
+    } else if resp.hovered() {
+        (theme::BG_BTN_HOVER, tint, theme::TEXT)
+    } else {
+        (Color32::TRANSPARENT, tint, theme::TEXT_DIM)
+    };
+    let p = ui.painter();
+    if fill != Color32::TRANSPARENT {
+        p.rect_filled(rect, 8.0, fill);
     }
+    paint_rail_icon(
+        p,
+        egui::Rect::from_min_size(
+            egui::pos2(rect.center().x - 8.0, rect.top() + 2.0),
+            egui::vec2(16.0, 16.0),
+        ),
+        icon,
+        icon_c,
+    );
+    p.text(
+        egui::pos2(rect.center().x, rect.bottom() - 6.5),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(9.0),
+        label_c,
+    );
     resp.on_hover_text(tip)
 }
 
