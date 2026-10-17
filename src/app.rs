@@ -5,7 +5,10 @@
 //! one-line status bar. Everything is UI-driven — no commands anywhere.
 
 use crate::log::{LogEntry, LogLevel, SharedLogs};
-use crate::session::{load_sessions, save_sessions, AuthType, ForwardType, PortForward, SshSession};
+use crate::session::{
+    load_groups, load_sessions, save_groups, save_sessions, AuthType, ForwardType, PortForward,
+    SessionGroup, SshSession,
+};
 use crate::terminal::{TermStatus, TerminalSession};
 use crate::theme;
 use crate::tunnel::{forward_key, TunnelManager};
@@ -20,6 +23,9 @@ use std::time::Duration;
 
 pub struct TunnelApp {
     sessions: Vec<SshSession>,
+    /// Session buckets (Production, Staging, Home lab…). Sessions store the
+    /// group id; groups live in their own file (order + dot color).
+    groups: Vec<SessionGroup>,
     rt: tokio::runtime::Handle,
     logs: SharedLogs,
     tunnels: TunnelManager,
@@ -32,6 +38,7 @@ pub struct TunnelApp {
 
     session_editor: Option<SessionEditor>,
     tunnel_editor: Option<TunnelEditor>,
+    group_editor: Option<GroupEditor>,
     confirm: Option<Confirm>,
     toast: Option<Toast>,
     show_logs: bool,
@@ -60,6 +67,7 @@ struct Toast {
 struct SessionEditor {
     id: Option<String>,
     name: String,
+    group: Option<String>,
     host: String,
     port: String,
     username: String,
@@ -75,6 +83,7 @@ impl SessionEditor {
         Self {
             id: None,
             name: String::new(),
+            group: None,
             host: String::new(),
             port: "22".to_string(),
             username: String::new(),
@@ -90,6 +99,7 @@ impl SessionEditor {
         Self {
             id: Some(s.id.clone()),
             name: s.name.clone(),
+            group: s.group.clone(),
             host: s.host.clone(),
             port: s.port.to_string(),
             username: s.username.clone(),
@@ -110,6 +120,7 @@ struct TunnelEditor {
     listen_port: String,
     dest_host: String,
     dest_port: String,
+    auto_reconnect: bool,
     error: Option<String>,
 }
 
@@ -123,6 +134,7 @@ impl TunnelEditor {
             listen_port: "8080".to_string(),
             dest_host: "127.0.0.1".to_string(),
             dest_port: "80".to_string(),
+            auto_reconnect: false,
             error: None,
         }
     }
@@ -136,6 +148,46 @@ impl TunnelEditor {
             listen_port: f.listen_port.to_string(),
             dest_host: f.dest_host.clone(),
             dest_port: f.dest_port.to_string(),
+            auto_reconnect: f.auto_reconnect,
+            error: None,
+        }
+    }
+}
+
+/// Group create/rename editor. `apply_to` optionally carries a session id
+/// ("move this session into the created group" flow).
+struct GroupEditor {
+    id: Option<String>,
+    name: String,
+    color: Option<[u8; 3]>,
+    apply_to: Option<String>,
+    error: Option<String>,
+}
+
+impl GroupEditor {
+    fn new() -> Self {
+        Self {
+            id: None,
+            name: String::new(),
+            color: None,
+            apply_to: None,
+            error: None,
+        }
+    }
+
+    fn for_session(session_id: &str) -> Self {
+        Self {
+            apply_to: Some(session_id.to_string()),
+            ..Self::new()
+        }
+    }
+
+    fn from(g: &SessionGroup) -> Self {
+        Self {
+            id: Some(g.id.clone()),
+            name: g.name.clone(),
+            color: g.color,
+            apply_to: None,
             error: None,
         }
     }
@@ -149,9 +201,10 @@ enum Confirm {
         forward_id: String,
         label: String,
     },
+    Group { id: String, name: String },
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum CardAction {
     Select,
     Connect,
@@ -159,13 +212,38 @@ enum CardAction {
     Duplicate,
     Delete,
     CopyCommand,
+    /// Move the session into the group with this id; empty string = ungroup.
+    MoveToGroup(String),
+    /// Open the group editor pre-targeted at this session: saving it creates
+    /// the group AND moves the session in.
+    NewGroup(String),
 }
 
+/// Row-owned actions; the "session_id"-slash-"forward_id" pair is carried
+/// outside (see the tunnels page action plumbing).
 #[derive(Clone, Copy)]
 enum RowAction {
     Toggle,
+    ToggleAuto,
     Edit,
     Delete,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum GroupCmd {
+    Toggle,
+    Edit,
+    Delete,
+}
+
+/// Chrome-style tab context menu (right-click a chip), resolved against the
+/// tab index it was opened on.
+#[derive(Clone, Copy, PartialEq)]
+enum TabMenu {
+    CloseSelf,
+    CloseOthers,
+    CloseRight,
+    CloseAll,
 }
 
 // ---------------------------------------------------------------------------
@@ -183,9 +261,11 @@ impl TunnelApp {
 
     fn new_inner(rt: tokio::runtime::Handle, logs: SharedLogs) -> Self {
         let sessions = load_sessions();
+        let groups = load_groups();
         let selected = sessions.first().map(|s| s.id.clone());
         Self {
             sessions,
+            groups,
             tunnels: TunnelManager::new(rt.clone(), logs.clone()),
             rt,
             logs,
@@ -198,6 +278,7 @@ impl TunnelApp {
             confirm: None,
             toast: None,
             show_logs: false,
+            group_editor: None,
             now: 0.0,
             mark_texture: None,
         }
@@ -258,6 +339,71 @@ impl TunnelApp {
         }
     }
 
+    /// Chrome-style close operations. Iterating from the end keeps the
+    /// earlier indices stable while tabs shift.
+    fn close_right_tabs(&mut self, from: usize) {
+        for i in (from + 1..self.tabs.len()).rev() {
+            self.close_tab(i);
+        }
+    }
+
+    fn close_other_tabs(&mut self, keep: usize) {
+        for i in (1..self.tabs.len()).rev() {
+            if i != keep {
+                self.close_tab(i);
+            }
+        }
+    }
+
+    fn close_all_terminal_tabs(&mut self) {
+        for i in (1..self.tabs.len()).rev() {
+            self.close_tab(i);
+        }
+    }
+
+    /// Flip the auto-reconnect switch of one tunnel (persists the field and
+    /// applies it live to a running instance).
+    fn toggle_tunnel_auto(&mut self, session_id: &str, forward_id: &str) {
+        let key = forward_key(session_id, forward_id);
+        let found = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == session_id)
+            .and_then(|s| s.forwards.iter_mut().find(|f| f.id == forward_id));
+        let Some(f) = found else { return };
+        f.auto_reconnect = !f.auto_reconnect;
+        let (on, desc) = (f.auto_reconnect, forward_desc(f));
+        if self.tunnels.is_running(&key) {
+            self.tunnels.set_auto_reconnect(&key, on);
+            self.toast(
+                ToastKind::Info,
+                format!("{desc} — auto-reconnect {} for the running tunnel", if on { "enabled" } else { "disabled" }),
+            );
+        }
+        self.persist(if on { "Auto-reconnect enabled" } else { "Auto-reconnect disabled" });
+    }
+
+    /// Move a session into a group (empty target = ungroup).
+    fn move_session_to_group(&mut self, session_id: &str, group_id: &str) {
+        let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) else {
+            return;
+        };
+        let moved_to = if group_id.is_empty() {
+            "No group".to_string()
+        } else {
+            match self.groups.iter().find(|g| g.id == group_id) {
+                Some(g) => g.name.clone(),
+                None => "a group".to_string(),
+            }
+        };
+        s.group = if group_id.is_empty() {
+            None
+        } else {
+            Some(group_id.to_string())
+        };
+        self.persist(format!("Session moved to {moved_to}"));
+    }
+
     fn toggle_tunnel(&mut self, session_id: &str, forward_id: &str) {
         let key = forward_key(session_id, forward_id);
         if self.tunnels.is_running(&key) {
@@ -285,7 +431,7 @@ impl TunnelApp {
         }
     }
 
-    fn persist(&mut self, ok_msg: &str) {
+    fn persist(&mut self, ok_msg: impl Into<String>) {
         match save_sessions(&self.sessions) {
             Ok(_) => self.toast(ToastKind::Success, ok_msg),
             Err(e) => self.toast(ToastKind::Error, format!("Could not save sessions: {e}")),
@@ -313,6 +459,7 @@ impl TunnelApp {
             None => SshSession::default(),
         };
         session.name = ed.name.trim().to_string();
+        session.group = ed.group.clone();
         session.host = ed.host.trim().to_string();
         session.port = port;
         session.username = ed.username.trim().to_string();
@@ -372,6 +519,7 @@ impl TunnelApp {
             listen_port,
             dest_host: ed.dest_host.trim().to_string(),
             dest_port,
+            auto_reconnect: ed.auto_reconnect,
         };
         if forward.dest_host.is_empty() && forward.fwd_type != ForwardType::Dynamic {
             forward.dest_host = "127.0.0.1".to_string();
@@ -392,8 +540,82 @@ impl TunnelApp {
             Some(i) => session.forwards[i] = forward,
             None => session.forwards.push(forward),
         }
+        // Apply live to a running tunnel: future drops honor the new flag.
+        let key = forward_key(&ed.session_id, &ed.forward_id.clone().unwrap_or_default());
+        if ed.forward_id.is_some() && self.tunnels.is_running(&key) {
+            self.tunnels.set_auto_reconnect(&key, ed.auto_reconnect);
+        }
         self.tunnel_editor = None;
         self.persist("Tunnel saved");
+    }
+
+    /// Group editor plumbing -------------------------------------------------
+
+    fn persist_groups(&mut self, ok_msg: &str) {
+        match save_groups(&self.groups) {
+            Ok(_) => self.toast(ToastKind::Success, ok_msg),
+            Err(e) => self.toast(ToastKind::Error, format!("Could not save groups: {e}")),
+        }
+    }
+
+    fn save_group_editor(&mut self) {
+        let Some(mut ed) = self.group_editor.take() else {
+            return;
+        };
+        let name = ed.name.trim().to_string();
+        if name.is_empty() {
+            ed.error = Some("Group name is required".to_string());
+            self.group_editor = Some(ed);
+            return;
+        }
+        if let Some(existing) = &ed.id {
+            if let Some(g) = self.groups.iter_mut().find(|g| &g.id == existing) {
+                g.name = name.clone();
+                g.color = ed.color;
+            }
+            self.group_editor = None;
+            self.persist_groups("Group saved");
+        } else {
+            let g = SessionGroup {
+                id: uuid::Uuid::new_v4().to_string(),
+                name,
+                color: ed.color,
+                expanded: true,
+            };
+            let (created_for, group_id) = (ed.apply_to.take(), g.id.clone());
+            self.groups.push(g);
+            self.group_editor = None;
+            if let Some(sid) = created_for {
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == sid) {
+                    s.group = Some(group_id);
+                }
+                self.persist("Group created — session moved in");
+            } else {
+                self.toast(ToastKind::Success, "Group created");
+            }
+            if let Err(e) = save_groups(&self.groups) {
+                self.toast(ToastKind::Error, format!("Could not save groups: {e}"));
+            }
+        }
+    }
+
+    fn delete_group(&mut self, id: &str) {
+        self.groups.retain(|g| g.id != id);
+        for s in &mut self.sessions {
+            if s.group.as_deref() == Some(id) {
+                s.group = None;
+            }
+        }
+        self.group_editor = None;
+        // Sessions (members unassigned) and groups both changed; save both.
+        let g_ok = save_groups(&self.groups).is_ok();
+        match save_sessions(&self.sessions) {
+            Ok(_) if g_ok => {
+                self.toast(ToastKind::Success, "Group deleted — sessions kept")
+            }
+            Ok(_) => self.toast(ToastKind::Error, "Could not save groups"),
+            Err(e) => self.toast(ToastKind::Error, format!("Could not save sessions: {e}")),
+        }
     }
 
     fn delete_session(&mut self, id: &str) {
@@ -537,6 +759,7 @@ impl TunnelApp {
 
         self.session_editor_modal(ctx);
         self.tunnel_editor_modal(ctx);
+        self.group_editor_modal(ctx);
         self.confirm_modal(ctx);
         self.logs_modal(ctx);
         self.toast_ui(ctx);
@@ -589,7 +812,21 @@ impl TunnelApp {
             self.session_editor = Some(SessionEditor::new());
         }
         ui.add_space(14.0);
-        ui.label(RichText::new("Sessions").text_style(theme::h2()).strong());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Sessions").text_style(theme::h2()).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ghost_button(
+                    ui,
+                    RichText::new("＋ Group").size(11.5).color(theme::TEXT_DIM),
+                    false,
+                )
+                .on_hover_text("Create a group to organize sessions (Prod, Staging, Home…)")
+                .clicked()
+                {
+                    self.group_editor = Some(GroupEditor::new());
+                }
+            });
+        });
         ui.add_space(6.0);
 
         if self.sessions.len() > 6 {
@@ -615,6 +852,12 @@ impl TunnelApp {
             .map(|s| s.id.clone())
             .collect();
 
+        // Snapshot for rendering; toggles applied after the frame.
+        let groups: Vec<SessionGroup> = self.groups.clone();
+
+        let mut card_actions: Vec<(String, CardAction)> = Vec::new();
+        let mut group_cmds: Vec<(String, GroupCmd)> = Vec::new();
+
         egui::ScrollArea::vertical()
             .id_salt("session_scroll")
             .auto_shrink([false, false])
@@ -636,48 +879,175 @@ impl TunnelApp {
                     );
                     return;
                 }
-                for id in &ids {
-                    let Some(session) = self.sessions.iter().find(|s| &s.id == id) else {
-                        continue;
-                    };
-                    let selected = self.selected.as_deref() == Some(id.as_str());
-                    let tunnel_live = self.tunnels.session_has_active(id);
-                    let tab_open = self.find_tab_for_session(id).is_some();
-                    let action = session_card(
-                        ui,
-                        selected,
-                        &session.name,
-                        &session.connection_label(),
-                        tunnel_live,
-                        tab_open,
-                    );
-                    match action {
-                        Some(CardAction::Select) => self.selected = Some(id.clone()),
-                        Some(CardAction::Connect) => self.open_terminal(ctx, id),
-                        Some(CardAction::Edit) => {
-                            if let Some(s) = self.sessions.iter().find(|s| &s.id == id) {
-                                self.session_editor = Some(SessionEditor::from(s));
-                            }
+
+                if groups.is_empty() {
+                    // Flat classic list when the user hasn't grouped anything.
+                    for id in &ids {
+                        self.push_session_card(ui, ctx, id, &mut card_actions);
+                    }
+                } else {
+                    for g in &groups {
+                        let members: Vec<String> = ids
+                            .iter()
+                            .filter(|id| {
+                                self.sessions
+                                    .iter()
+                                    .find(|s| s.id == **id)
+                                    .map(|s| s.group.as_deref() == Some(g.id.as_str()))
+                                    .unwrap_or(false)
+                            })
+                            .cloned()
+                            .collect();
+                        if members.is_empty() {
+                            continue; // filtered out / empty groups hide away
                         }
-                        Some(CardAction::Duplicate) => self.duplicate_session(id),
-                        Some(CardAction::Delete) => {
-                            if let Some(s) = self.sessions.iter().find(|s| &s.id == id) {
-                                self.confirm = Some(Confirm::Session {
-                                    id: id.clone(),
-                                    name: s.name.clone(),
-                                });
-                            }
+                        let cmd = group_header_row(
+                            ui,
+                            &g.name,
+                            g.color.map(|c| Color32::from_rgb(c[0], c[1], c[2])),
+                            g.expanded,
+                            members.len(),
+                        );
+                        if let Some(cmd) = cmd {
+                            group_cmds.push((g.id.clone(), cmd));
                         }
-                        Some(CardAction::CopyCommand) => {
-                            if let Some(s) = self.sessions.iter().find(|s| &s.id == id) {
-                                ctx.copy_text(ssh_command(s));
-                                self.toast(ToastKind::Info, "SSH command copied");
+                        if g.expanded {
+                            for id in &members {
+                                self.push_session_card(ui, ctx, id, &mut card_actions);
                             }
+                            ui.add_space(8.0);
                         }
-                        None => {}
+                    }
+                    let ungrouped: Vec<String> = ids
+                        .iter()
+                        .filter(|id| {
+                            self.sessions.iter().find(|s| s.id == **id).map(|s| {
+                                match &s.group {
+                                    None => true,
+                                    Some(gid) => !groups.iter().any(|g| &g.id == gid),
+                                }
+                            }).unwrap_or(false)
+                        })
+                        .cloned()
+                        .collect();
+                    if !ungrouped.is_empty() {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new("No group")
+                                .size(11.0)
+                                .color(theme::TEXT_FAINT),
+                        );
+                        ui.add_space(2.0);
+                        for id in &ungrouped {
+                            self.push_session_card(ui, ctx, id, &mut card_actions);
+                        }
                     }
                 }
             });
+
+        for (gid, cmd) in group_cmds {
+            match cmd {
+                GroupCmd::Toggle => {
+                    if let Some(g) = self.groups.iter_mut().find(|g| g.id == gid) {
+                        g.expanded = !g.expanded;
+                    }
+                }
+                GroupCmd::Edit => {
+                    if let Some(g) = self.groups.iter().find(|g| g.id == gid) {
+                        self.group_editor = Some(GroupEditor::from(g));
+                    }
+                }
+                GroupCmd::Delete => {
+                    if let Some(g) = self.groups.iter().find(|g| g.id == gid) {
+                        self.confirm = Some(Confirm::Group {
+                            id: g.id.clone(),
+                            name: g.name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        for (id, action) in card_actions {
+            match action {
+                CardAction::Select => self.selected = Some(id.clone()),
+                CardAction::Connect => self.open_terminal(ctx, &id),
+                CardAction::Edit => {
+                    if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
+                        self.session_editor = Some(SessionEditor::from(s));
+                    }
+                }
+                CardAction::Duplicate => self.duplicate_session(&id),
+                CardAction::Delete => {
+                    if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
+                        self.confirm = Some(Confirm::Session {
+                            id: id.clone(),
+                            name: s.name.clone(),
+                        });
+                    }
+                }
+                CardAction::CopyCommand => {
+                    if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
+                        ctx.copy_text(ssh_command(s));
+                        self.toast(ToastKind::Info, "SSH command copied");
+                    }
+                }
+                CardAction::MoveToGroup(target) => self.move_session_to_group(&id, &target),
+                CardAction::NewGroup(sid) => {
+                    self.group_editor = Some(GroupEditor::for_session(&sid));
+                }
+            }
+        }
+    }
+
+    /// Renders one session card for `id`, queuing its action for the caller.
+    fn push_session_card(
+        &mut self,
+        ui: &mut Ui,
+        _ctx: &egui::Context,
+        id: &str,
+        out: &mut Vec<(String, CardAction)>,
+    ) {
+        let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
+            return;
+        };
+        let selected = self.selected.as_deref() == Some(id);
+        let tunnel_live = self.tunnels.session_has_active(id);
+        let tab_open = self.find_tab_for_session(id).is_some();
+        let dot = self.group_dot_color(&session.group.clone().unwrap_or_default());
+        let auth_label = match session.auth_type {
+            AuthType::Password => "Password",
+            AuthType::Key => "Key",
+        };
+        let groups_menu: Vec<(String, String)> = self
+            .groups
+            .iter()
+            .filter(|g| Some(g.id.as_str()) != session.group.as_deref())
+            .map(|g| (g.id.clone(), g.name.clone()))
+            .collect();
+        let action = session_card(
+            ui,
+            id,
+            selected,
+            &session.name,
+            &session.connection_label(),
+            auth_label,
+            tunnel_live,
+            tab_open,
+            dot,
+            &groups_menu,
+        );
+        if let Some(a) = action {
+            out.push((id.to_string(), a));
+        }
+    }
+
+    fn group_dot_color(&self, session_group: &str) -> Option<Color32> {
+        let gid: Option<&str> = if session_group.is_empty() {
+            None
+        } else {
+            Some(session_group)
+        };
+        self.groups.iter().find(|g| Some(g.id.as_str()) == gid).and_then(|g| g.color).map(|c| Color32::from_rgb(c[0], c[1], c[2]))
     }
 
     // -----------------------------------------------------------------------
@@ -688,12 +1058,20 @@ impl TunnelApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let active = self.active == 0;
-            let (clicked, _) = tab_chip(ui, "Tunnels", None, active, false);
+            let (clicked, _, menu) = tab_chip(ui, "Tunnels", None, active, false);
             if clicked {
                 self.active = 0;
             }
+            match menu {
+                Some(TabMenu::CloseOthers) => self.close_other_tabs(0),
+                Some(TabMenu::CloseRight) | Some(TabMenu::CloseAll) => {
+                    self.close_all_terminal_tabs()
+                }
+                _ => {}
+            }
             let mut activate: Option<usize> = None;
             let mut close: Option<usize> = None;
+            let mut menu_cmd: Option<(usize, TabMenu)> = None;
             for (i, tab) in self.tabs.iter().enumerate().skip(1) {
                 if let Tab::Terminal(t) = tab {
                     let dot = match &t.status {
@@ -701,12 +1079,16 @@ impl TunnelApp {
                         TermStatus::Connecting => Some(theme::WARNING),
                         TermStatus::Closed(_) => Some(theme::DANGER),
                     };
-                    let (clicked, closed) = tab_chip(ui, &t.title, dot, self.active == i, true);
+                    let (clicked, closed, menu) =
+                        tab_chip(ui, &t.title, dot, self.active == i, true);
                     if clicked {
                         activate = Some(i);
                     }
                     if closed {
                         close = Some(i);
+                    }
+                    if let Some(m) = menu {
+                        menu_cmd = Some((i, m));
                     }
                 }
             }
@@ -715,6 +1097,14 @@ impl TunnelApp {
             }
             if let Some(i) = close {
                 self.close_tab(i);
+            }
+            if let Some((i, m)) = menu_cmd {
+                match m {
+                    TabMenu::CloseSelf => self.close_tab(i),
+                    TabMenu::CloseRight => self.close_right_tabs(i),
+                    TabMenu::CloseOthers => self.close_other_tabs(i),
+                    TabMenu::CloseAll => self.close_all_terminal_tabs(),
+                }
             }
         });
     }
@@ -789,6 +1179,8 @@ impl TunnelApp {
             conn: String,
             forward: PortForward,
             running: bool,
+            reconnecting: bool,
+            auth: &'static str,
         }
         let rows: Vec<Row> = {
             let tunnels = &self.tunnels;
@@ -798,12 +1190,18 @@ impl TunnelApp {
                     let session_id = s.id.clone();
                     let session_name = s.name.clone();
                     let conn = s.connection_label();
+                    let auth = match s.auth_type {
+                        AuthType::Password => "Password",
+                        AuthType::Key => "Key",
+                    };
                     s.forwards.iter().map(move |f| Row {
                         session_id: session_id.clone(),
                         session_name: session_name.clone(),
                         conn: conn.clone(),
                         forward: f.clone(),
                         running: tunnels.is_running(&forward_key(&session_id, &f.id)),
+                        reconnecting: tunnels.is_reconnecting(&forward_key(&session_id, &f.id)),
+                        auth,
                     })
                 })
                 .collect()
@@ -830,6 +1228,8 @@ impl TunnelApp {
                         &row.conn,
                         &row.forward,
                         row.running,
+                        row.reconnecting,
+                        row.auth,
                     ) {
                         actions.push((a, row.session_id.clone(), row.forward.id.clone()));
                     }
@@ -840,6 +1240,7 @@ impl TunnelApp {
         for (action, session_id, forward_id) in actions {
             match action {
                 RowAction::Toggle => self.toggle_tunnel(&session_id, &forward_id),
+                RowAction::ToggleAuto => self.toggle_tunnel_auto(&session_id, &forward_id),
                 RowAction::Edit => {
                     if let Some(f) = self
                         .sessions
@@ -930,6 +1331,43 @@ impl TunnelApp {
                         .desired_width(ui.available_width())
                         .margin(egui::vec2(8.0, 6.0)),
                 );
+            });
+
+            field(ui, "Group (optional)", |ui| {
+                let mut options: Vec<(String, String)> = self
+                    .groups
+                    .iter()
+                    .map(|g| (g.id.clone(), g.name.clone()))
+                    .collect();
+                options.retain(|(id, _)| Some(id) != ed.group.as_ref());
+                let selected_text = ed
+                    .group
+                    .as_deref()
+                    .and_then(|gid| {
+                        self.groups.iter().find(|g| g.id == gid).map(|g| g.name.clone())
+                    })
+                    .unwrap_or_else(|| "No group".to_string());
+                egui::ComboBox::from_id_salt("session_group")
+                    .selected_text(
+                        RichText::new(selected_text).size(13.0).color(theme::TEXT),
+                    )
+                    .width(ui.available_width() - 2.0)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(ed.group.is_none(), "No group")
+                            .clicked()
+                        {
+                            ed.group = None;
+                        }
+                        for (id, name) in options {
+                            if ui
+                                .selectable_label(ed.group.as_deref() == Some(id.as_str()), name)
+                                .clicked()
+                            {
+                                ed.group = Some(id.clone());
+                            }
+                        }
+                    });
             });
 
             ui.label(
@@ -1190,6 +1628,10 @@ impl TunnelApp {
                 });
             }
 
+            ui.add_space(4.0);
+            ui.checkbox(&mut ed.auto_reconnect, "Auto-reconnect if the tunnel drops")
+                .on_hover_text("Watches the SSH connection and brings the tunnel back up automatically (2–15s backoff).");
+
             if let Some(err) = &ed.error {
                 ui.add_space(4.0);
                 ui.label(RichText::new(err).size(12.0).color(theme::DANGER));
@@ -1226,20 +1668,158 @@ impl TunnelApp {
         }
     }
 
+    /// Create or rename a session group, optionally assigning a session.
+    fn group_editor_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut ed) = self.group_editor.take() else {
+            return;
+        };
+        let mut keep = true;
+        let mut save = false;
+        let is_new = ed.id.is_none();
+        let apply_label = ed
+            .apply_to
+            .as_deref()
+            .and_then(|sid| {
+                self.sessions
+                    .iter()
+                    .find(|s| s.id == sid)
+                    .map(|s| s.name.clone())
+            })
+            .unwrap_or_default();
+        let swatches: [Option<Color32>; 8] = [
+            None,
+            Some(Color32::from_rgb(211, 47, 47)),
+            Some(Color32::from_rgb(184, 110, 8)),
+            Some(Color32::from_rgb(7, 133, 83)),
+            Some(Color32::from_rgb(31, 103, 214)),
+            Some(Color32::from_rgb(110, 58, 205)),
+            Some(Color32::from_rgb(13, 148, 136)),
+            Some(Color32::from_rgb(98, 105, 118)),
+        ];
+        let ed_ref = &mut ed;
+        let resp = egui::Modal::new(egui::Id::new("group_editor")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.label(
+                RichText::new(if is_new { "New group" } else { "Edit group" })
+                    .size(17.0)
+                    .strong(),
+            );
+            ui.label(
+                RichText::new(if is_new {
+                    if apply_label.is_empty() {
+                        "Group sessions by environment, team — whatever works for you.".to_string()
+                    } else {
+                        format!("Group for “{apply_label}” — it will be moved in on save.")
+                    }
+                } else {
+                    "Rename or recolor; sessions keep their membership.".to_string()
+                })
+                .size(11.5)
+                .color(theme::TEXT_FAINT),
+            );
+            ui.add_space(12.0);
+            field(ui, "Name", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut ed_ref.name)
+                        .hint_text("Production")
+                        .desired_width(ui.available_width())
+                        .margin(egui::vec2(8.0, 6.0)),
+                );
+            });
+            field(ui, "Dot color", |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    for (i, sw) in swatches.iter().enumerate() {
+                        let selected = match (ed_ref.color, sw) {
+                            (None, None) => true,
+                            (Some(c), Some(s)) => c == [s.r(), s.g(), s.b()],
+                            _ => false,
+                        };
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(20.0, 20.0),
+                            Sense::click(),
+                        );
+                        match sw {
+                            Some(c) => {
+                                ui.painter()
+                                    .rect_filled(rect.shrink(2.0), 8.0, *c);
+                            }
+                            None => {
+                                ui.painter()
+                                    .rect_filled(rect.shrink(2.0), 8.0, theme::BG_PANEL_ALT);
+                                ui.painter()
+                                    .rect_stroke(rect.shrink(2.0), 8.0, Stroke::new(1.0_f32, theme::BORDER_STRONG), egui::StrokeKind::Inside);
+                            }
+                        }
+                        if selected {
+                            ui.painter()
+                                .rect_stroke(rect, 9.0, Stroke::new(2.0_f32, theme::ACCENT), egui::StrokeKind::Inside);
+                        }
+                        if resp.clicked() {
+                            ed_ref.color = sw.map(|c| [c.r(), c.g(), c.b()]);
+                        }
+                        if i == 0 {
+                            ui.label(
+                                RichText::new("(none) = gray-free")
+                                    .size(10.5)
+                                    .color(theme::TEXT_FAINT),
+                            );
+                        }
+                    }
+                });
+            });
+            if let Some(err) = &ed_ref.error {
+                ui.label(RichText::new(err).size(12.0).color(theme::DANGER));
+            }
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    keep = false;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if styled_button(ui, RichText::new("Save").size(13.5).strong(), true, false, None)
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                });
+            });
+        });
+        if resp.should_close() {
+            keep = false;
+        }
+        if save {
+            self.group_editor = Some(ed);
+            self.save_group_editor();
+        } else if keep {
+            self.group_editor = Some(ed);
+        }
+    }
+
     fn confirm_modal(&mut self, ctx: &egui::Context) {
         let Some(confirm) = self.confirm.take() else {
             return;
         };
         let mut keep = true;
         let mut confirmed = false;
-        let (title, body) = match &confirm {
+        let (title, body, ok_label, danger) = match &confirm {
             Confirm::Session { name, .. } => (
                 format!("Delete “{name}”?"),
                 "Its saved tunnels will be removed and running tunnels stopped.".to_string(),
+                "Delete",
+                true,
             ),
             Confirm::Tunnel { label, .. } => (
                 "Delete this tunnel?".to_string(),
                 format!("{label} — it will be stopped if running."),
+                "Delete",
+                true,
+            ),
+            Confirm::Group { name, .. } => (
+                format!("Delete group “{name}”?"),
+                "Sessions in the group stay — they just become ungrouped.".to_string(),
+                "Delete group",
+                true,
             ),
         };
         let resp = egui::Modal::new(egui::Id::new("confirm_delete")).show(ctx, |ui| {
@@ -1255,12 +1835,9 @@ impl TunnelApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if styled_button(
                         ui,
-                        RichText::new("Delete")
-                            .size(13.5)
-                            .strong()
-                            .color(Color32::WHITE),
+                        RichText::new(ok_label).size(13.5).strong(),
                         true,
-                        true,
+                        danger,
                         None,
                     )
                     .clicked()
@@ -1285,6 +1862,7 @@ impl TunnelApp {
                     let _ = key;
                     self.delete_tunnel(&session_id, &forward_id);
                 }
+                Confirm::Group { id, .. } => self.delete_group(&id),
             }
         } else if keep {
             self.confirm = Some(confirm);
@@ -1465,13 +2043,18 @@ impl TunnelApp {
 
 fn session_card(
     ui: &mut Ui,
+    session_id: &str,
     selected: bool,
     name: &str,
     conn: &str,
+    auth_label: &str,
     tunnel_live: bool,
     tab_open: bool,
+    group_dot: Option<Color32>,
+    groups_menu: &[(String, String)],
 ) -> Option<CardAction> {
     let mut action = None;
+    let (a_fg, a_bg) = auth_palette(auth_label);
     let resp = Frame::NONE
         .fill(if selected {
             theme::BG_CARD_SEL
@@ -1482,7 +2065,7 @@ fn session_card(
         .stroke(Stroke::new(
             1.0_f32,
             if selected {
-                theme::BORDER_STRONG
+                theme::ACCENT
             } else {
                 theme::BORDER
             },
@@ -1491,9 +2074,18 @@ fn session_card(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
+                if let Some(c) = group_dot {
+                    let (r, _) =
+                        ui.allocate_exact_size(egui::vec2(9.0, 9.0), Sense::hover());
+                    ui.painter().rect_filled(r, 3.0, c);
+                }
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
-                    ui.label(RichText::new(name).size(13.5).color(theme::TEXT));
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new(name).size(13.5).color(theme::TEXT));
+                        chip(ui, auth_label, a_fg, a_bg);
+                    });
                     ui.label(
                         RichText::new(conn)
                             .size(11.5)
@@ -1540,6 +2132,30 @@ fn session_card(
             ui.close();
         }
         ui.separator();
+        ui.label(
+            RichText::new("Move to group").size(11.0).color(theme::TEXT_FAINT),
+        );
+        if ui.button("— No group —").clicked() {
+            action = Some(CardAction::MoveToGroup(String::new()));
+            ui.close();
+        }
+        if groups_menu.is_empty() {
+            ui.label(
+                RichText::new("(no groups yet — create one)").size(10.5).color(theme::TEXT_FAINT),
+            );
+        } else {
+            for (gid, gname) in groups_menu {
+                if ui.button(gname).clicked() {
+                    action = Some(CardAction::MoveToGroup(gid.clone()));
+                    ui.close();
+                }
+            }
+        }
+        if ui.button("＋ New group…").clicked() {
+            action = Some(CardAction::NewGroup(session_id.to_string()));
+            ui.close();
+        }
+        ui.separator();
         if ui.button("Delete").clicked() {
             action = Some(CardAction::Delete);
             ui.close();
@@ -1549,14 +2165,85 @@ fn session_card(
     action
 }
 
+/// Small collapsible group divider shown between session cards.
+fn group_header_row(
+    ui: &mut Ui,
+    name: &str,
+    color: Option<Color32>,
+    expanded: bool,
+    count: usize,
+) -> Option<GroupCmd> {
+    let mut cmd = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if let Some(c) = color {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), Sense::hover());
+            ui.painter().rect_filled(r, 3.0, c);
+        }
+        let caret = if expanded { "▾" } else { "▸" };
+        if ghost_button(
+            ui,
+            RichText::new(format!("{caret} {name}"))
+                .size(12.0)
+                .strong()
+                .color(theme::TEXT_DIM),
+            false,
+        )
+        .clicked()
+        {
+            cmd = Some(GroupCmd::Toggle);
+        }
+        ui.label(
+            RichText::new(count.to_string())
+                .size(10.5)
+                .color(theme::TEXT_FAINT),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.menu_button(
+                RichText::new("⋯").size(12.0).color(theme::TEXT_FAINT),
+                |menu| {
+                    if menu.button("Edit group").clicked() {
+                        cmd = Some(GroupCmd::Edit);
+                        menu.close();
+                    }
+                    if menu.button("Delete group").clicked() {
+                        cmd = Some(GroupCmd::Delete);
+                        menu.close();
+                    }
+                },
+            );
+        });
+    });
+    cmd
+}
+
+/// Color pair for the auth badge: text on chip background.
+fn auth_palette(label: &str) -> (Color32, Color32) {
+    match label {
+        "Key" => (theme::VIOLET, theme::VIOLET_BG),
+        _ => (theme::INFO, theme::INFO_BG),
+    }
+}
+
 fn tunnel_row(
     ui: &mut Ui,
     session_name: &str,
     conn: &str,
     forward: &PortForward,
     running: bool,
+    reconnecting: bool,
+    auth_label: &str,
 ) -> Option<RowAction> {
     let mut action = None;
+    let (dot_color, dot_tip) = if reconnecting {
+        (theme::WARNING, "SSH link down — reconnecting automatically")
+    } else if running {
+        (theme::SUCCESS, "Running")
+    } else {
+        (theme::TEXT_FAINT, "Stopped")
+    };
+    let (a_fg, a_bg) = auth_palette(auth_label);
+
     Frame::NONE
         .fill(theme::BG_CARD)
         .corner_radius(CornerRadius::same(10))
@@ -1565,16 +2252,8 @@ fn tunnel_row(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("●")
-                        .size(10.0)
-                        .color(if running {
-                            theme::SUCCESS
-                        } else {
-                            theme::TEXT_FAINT
-                        }),
-                )
-                .on_hover_text(if running { "Running" } else { "Stopped" });
+                ui.label(RichText::new("●").size(10.0).color(dot_color))
+                    .on_hover_text(dot_tip);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     ui.label(RichText::new(forward_desc(forward)).size(13.0));
@@ -1582,6 +2261,11 @@ fn tunnel_row(
                         ui.spacing_mut().item_spacing.x = 6.0;
                         let (t_fg, t_bg) = fwd_palette(&forward.fwd_type);
                         chip(ui, forward.fwd_type.short(), t_fg, t_bg);
+                        chip(ui, auth_label, a_fg, a_bg);
+                        if forward.auto_reconnect {
+                            chip(ui, "↻ auto", theme::ACCENT_TEXT, theme::ACCENT_SOFT)
+                                .on_hover_text("Auto-reconnect enabled");
+                        }
                         ui.label(
                             RichText::new(format!("{session_name} · {conn}"))
                                 .size(11.0)
@@ -1590,37 +2274,43 @@ fn tunnel_row(
                     });
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(if running { "Stop" } else { "Start" })
-                                    .size(12.5)
-                                    .strong(),
-                            )
-                            .fill(if running {
-                                theme::DANGER_BG
-                            } else {
-                                theme::SUCCESS_BG
-                            })
-                            .stroke(Stroke::new(
-                                1.0_f32,
-                                if running {
-                                    theme::DANGER
-                                } else {
-                                    theme::SUCCESS
-                                },
-                            ))
-                            .corner_radius(CornerRadius::same(7)),
-                        )
+                    let (start_fg, start_bg, start_hover) = if running {
+                        (theme::DANGER, theme::DANGER_BG, Color32::from_rgb(248, 226, 226))
+                    } else {
+                        (theme::SUCCESS, theme::SUCCESS_BG, Color32::from_rgb(223, 241, 232))
+                    };
+                    if soft_pill(ui, if running { "Stop" } else { "Start" }, start_fg, start_bg, start_hover)
                         .clicked()
                     {
                         action = Some(RowAction::Toggle);
                     }
-                    if ui.button(RichText::new("✕").size(12.0)).clicked() {
+                    if ghost_button(ui, RichText::new("Edit").size(11.5).color(theme::TEXT_DIM), false)
+                        .clicked()
+                    {
+                        action = Some(RowAction::Edit);
+                    }
+                    if ghost_button(ui, RichText::new("✕").size(12.0).color(theme::TEXT_DIM), true)
+                        .on_hover_text("Delete tunnel")
+                        .clicked()
+                    {
                         action = Some(RowAction::Delete);
                     }
-                    if ui.button(RichText::new("Edit").size(12.0)).clicked() {
-                        action = Some(RowAction::Edit);
+                    let auto = forward.auto_reconnect;
+                    if soft_pill(
+                        ui,
+                        "↻ auto",
+                        if auto { theme::ACCENT_TEXT } else { theme::TEXT_FAINT },
+                        if auto { theme::ACCENT_SOFT } else { theme::BG_PANEL_ALT },
+                        theme::ACCENT_SOFT_HOVER,
+                    )
+                    .on_hover_text(if auto {
+                        "Auto-reconnect: on — click to turn off"
+                    } else {
+                        "Auto-reconnect: off — reconnects the tunnel automatically if it drops"
+                    })
+                    .clicked()
+                    {
+                        action = Some(RowAction::ToggleAuto);
                     }
                 });
             });
@@ -1629,61 +2319,91 @@ fn tunnel_row(
     action
 }
 
+/// Terminal-style tab chip; right-click opens the Chrome-style tab menu.
+/// Returns (clicked-activate, clicked-close, context-menu command).
 fn tab_chip(
     ui: &mut Ui,
     title: &str,
     dot: Option<Color32>,
     active: bool,
     closable: bool,
-) -> (bool, bool) {
+) -> (bool, bool, Option<TabMenu>) {
     let mut clicked = false;
     let mut closed = false;
+    let mut menu = None;
     Frame::NONE
         .fill(if active {
-            theme::ACCENT_SOFT
+            theme::BG_CARD
         } else {
             Color32::TRANSPARENT
         })
         .corner_radius(CornerRadius::same(8))
         .stroke(if active {
-            Stroke::new(1.0_f32, theme::ACCENT)
+            Stroke::new(1.0_f32, theme::BORDER_STRONG)
         } else {
             Stroke::NONE
         })
         .inner_margin(Margin::symmetric(10, 4))
         .show(ui, |ui| {
+            if active {
+                // Top accent strip — a quiet callback to browser tabs.
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 2.0),
+                    Sense::hover(),
+                );
+                ui.painter().rect_filled(rect, 1.0, theme::ACCENT);
+            }
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 if let Some(c) = dot {
                     ui.label(RichText::new("●").size(9.0).color(c));
                 }
+                let mut label = RichText::new(title).size(13.0);
+                if active {
+                    label = label.strong();
+                }
                 let label = ui
-                    .add(
-                        egui::Label::new(RichText::new(title).size(13.0))
-                            .sense(Sense::click()),
-                    )
-                    .on_hover_text(title);
+                    .add(egui::Label::new(label).sense(Sense::click()))
+                    .on_hover_text(format!("{title} — right-click for tab options"));
                 if label.clicked() {
                     clicked = true;
                 }
+                label.context_menu(|ui| {
+                    if closable && ui.button("Close tab").clicked() {
+                        menu = Some(TabMenu::CloseSelf);
+                        ui.close();
+                    }
+                    if ui.button("Close tabs to the right").clicked() {
+                        menu = Some(TabMenu::CloseRight);
+                        ui.close();
+                    }
+                    if ui.button("Close other tabs").clicked() {
+                        menu = Some(TabMenu::CloseOthers);
+                        ui.close();
+                    }
+                    if ui.button("Close all tabs").clicked() {
+                        menu = Some(TabMenu::CloseAll);
+                        ui.close();
+                    }
+                });
                 if closable {
                     let x = ui
                         .add(
-                            egui::Label::new(
-                                RichText::new("✕")
-                                    .size(10.5)
-                                    .color(theme::TEXT_FAINT),
+                            egui::Button::new(
+                                RichText::new("✕").size(10.5).color(theme::TEXT_FAINT),
                             )
-                            .sense(Sense::click()),
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE)
+                            .corner_radius(CornerRadius::same(4)),
                         )
-                        .on_hover_text("Close");
+                        .on_hover_text("Close tab");
                     if x.clicked() {
                         closed = true;
                     }
                 }
             });
         });
-    (clicked, closed)
+    (clicked, closed, menu)
 }
 
 fn chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) -> egui::Response {
@@ -1723,9 +2443,10 @@ fn field(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
     ui.add_space(8.0);
 }
 
-/// Filled accent (or danger) button with real hover feedback. egui paints
+/// Solid primary (or danger) button with real hover feedback. egui paints
 /// regular buttons from `weak_bg_fill`, so we scope style overrides instead
-/// of hard-coding `.fill(...)`, which would kill hover/active states.
+/// of hard-coding `.fill(...)`, which would kill hover/active states. Text
+/// passed without an explicit color follows the widget state fg_stroke.
 fn styled_button(
     ui: &mut Ui,
     text: RichText,
@@ -1733,32 +2454,93 @@ fn styled_button(
     danger: bool,
     size: Option<egui::Vec2>,
 ) -> egui::Response {
+    // Solid buttons read best with white text; leave disabled labels to the
+    // caller (usually a muted color for the grayed-out look).
+    let text = if enabled { text.color(Color32::WHITE) } else { text };
     ui.scope(|ui| {
         let v = &mut ui.style_mut().visuals;
-        let (fill, hover, stroke) = if danger {
-            (theme::DANGER_BTN, theme::DANGER_BTN_HOVER, Stroke::NONE)
+        let (fill, hover) = if danger {
+            (theme::DANGER_BTN, theme::DANGER_BTN_HOVER)
         } else {
-            (
-                theme::ACCENT_SOFT,
-                theme::ACCENT_SOFT_HOVER,
-                Stroke::new(1.0_f32, theme::ACCENT),
-            )
+            (theme::ACCENT, theme::ACCENT_HOVER)
         };
-        v.widgets.inactive.weak_bg_fill = fill;
-        v.widgets.inactive.bg_fill = fill;
-        v.widgets.inactive.bg_stroke = stroke;
+        for w in ["inactive", "hovered", "active"] {
+            let widget = match w {
+                "inactive" => &mut v.widgets.inactive,
+                "hovered" => &mut v.widgets.hovered,
+                _ => &mut v.widgets.active,
+            };
+            widget.weak_bg_fill = fill;
+            widget.bg_fill = fill;
+            widget.bg_stroke = Stroke::NONE;
+            widget.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+        }
         v.widgets.hovered.weak_bg_fill = hover;
         v.widgets.hovered.bg_fill = hover;
-        v.widgets.hovered.bg_stroke = stroke;
-        v.widgets.active.weak_bg_fill = hover;
-        v.widgets.active.bg_fill = hover;
-        v.widgets.active.bg_stroke = stroke;
         let button = egui::Button::new(text).corner_radius(CornerRadius::same(8));
         ui.add_enabled_ui(enabled, |ui| match size {
             Some(s) => ui.add_sized(s, button),
             None => ui.add(button),
         })
         .inner
+    })
+    .inner
+}
+
+/// Small rounded pill used for status actions inside rows (Start/Stop,
+/// auto-reconnect toggle). `fg` colors the label, `bg`/`hover_bg` the chip.
+fn soft_pill(ui: &mut Ui, label: &str, fg: Color32, bg: Color32, hover_bg: Color32) -> egui::Response {
+    ui.scope(|ui| {
+        let v = &mut ui.style_mut().visuals;
+        for (state, fill) in [("inactive", bg), ("hovered", hover_bg), ("active", hover_bg)] {
+            let widget = match state {
+                "inactive" => &mut v.widgets.inactive,
+                "hovered" => &mut v.widgets.hovered,
+                _ => &mut v.widgets.active,
+            };
+            widget.weak_bg_fill = fill;
+            widget.bg_fill = fill;
+            widget.bg_stroke = Stroke::NONE;
+        }
+        ui.spacing_mut().button_padding = egui::vec2(9.0, 3.0);
+        ui.add(
+            egui::Button::new(RichText::new(label).size(11.5).strong().color(fg))
+                .corner_radius(CornerRadius::same(7)),
+        )
+    })
+    .inner
+}
+
+/// Borderless text button that reveals a soft background on hover.
+/// `danger` tints the hover background red (delete-style affordances).
+fn ghost_button(ui: &mut Ui, text: RichText, danger: bool) -> egui::Response {
+    ui.scope(|ui| {
+        let v = &mut ui.style_mut().visuals;
+        let hover = if danger {
+            theme::DANGER_BG
+        } else {
+            theme::BG_BTN_HOVER
+        };
+        for state in ["inactive", "hovered", "active"] {
+            let widget = match state {
+                "inactive" => &mut v.widgets.inactive,
+                "hovered" => &mut v.widgets.hovered,
+                _ => &mut v.widgets.active,
+            };
+            widget.weak_bg_fill = Color32::TRANSPARENT;
+            widget.bg_fill = Color32::TRANSPARENT;
+            widget.bg_stroke = Stroke::NONE;
+        }
+        v.widgets.hovered.weak_bg_fill = hover;
+        v.widgets.hovered.bg_fill = hover;
+        v.widgets.active.weak_bg_fill = hover;
+        v.widgets.active.bg_fill = hover;
+        ui.spacing_mut().button_padding = egui::vec2(5.0, 2.0);
+        ui.add(
+            egui::Button::new(text)
+                .fill(Color32::TRANSPARENT)
+                .corner_radius(CornerRadius::same(6)),
+        )
     })
     .inner
 }
@@ -1946,6 +2728,7 @@ mod tests {
             listen_port: 8080,
             dest_host: "10.0.0.9".into(),
             dest_port: 80,
+            auto_reconnect: true,
         };
         assert_eq!(forward_desc(&local), "127.0.0.1:8080 → 10.0.0.9:80");
         let dynf = PortForward {

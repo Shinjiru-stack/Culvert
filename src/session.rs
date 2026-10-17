@@ -73,6 +73,10 @@ pub struct PortForward {
     pub listen_port: u16,
     pub dest_host: String,
     pub dest_port: u16,
+    /// Bring the tunnel back automatically (with backoff) after the SSH
+    /// connection drops.
+    #[serde(default)]
+    pub auto_reconnect: bool,
 }
 
 impl Default for PortForward {
@@ -84,6 +88,7 @@ impl Default for PortForward {
             listen_port: 8080,
             dest_host: "127.0.0.1".to_string(),
             dest_port: 80,
+            auto_reconnect: false,
         }
     }
 }
@@ -112,6 +117,10 @@ impl PortForward {
 pub struct SshSession {
     pub id: String,
     pub name: String,
+    /// Optional group id (see `SessionGroup`) to segregate sessions by
+    /// environment, customer, team… whatever suites the user.
+    #[serde(default)]
+    pub group: Option<String>,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -129,6 +138,7 @@ impl Default for SshSession {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             name: "New session".to_string(),
+            group: None,
             host: "".to_string(),
             port: 22,
             username: "".to_string(),
@@ -139,6 +149,31 @@ impl Default for SshSession {
             forwards: Vec::new(),
         }
     }
+}
+
+/// A named bucket that sessions can belong to (Production, Staging,
+/// Home lab…). Stored next to the sessions so the order, color and empty
+/// groups survive restarts.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionGroup {
+    #[serde(default = "gen_group_id")]
+    pub id: String,
+    pub name: String,
+    /// Optional accent color as RGB bytes for the sidebar dot.
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
+    /// Sidebar section expanded? Persisted so the UI looks the same after
+    /// a restart.
+    #[serde(default = "default_true")]
+    pub expanded: bool,
+}
+
+fn gen_group_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl SshSession {
@@ -228,6 +263,27 @@ pub fn save_sessions(sessions: &[SshSession]) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+pub fn groups_file() -> PathBuf {
+    config_base().join("culvert").join("groups.json")
+}
+
+pub fn load_groups() -> Vec<SessionGroup> {
+    match fs::read_to_string(groups_file()) {
+        Ok(s) => serde_json::from_str::<Vec<SessionGroup>>(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub fn save_groups(groups: &[SessionGroup]) -> anyhow::Result<PathBuf> {
+    let path = groups_file();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(groups)?;
+    fs::write(&path, json)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +321,15 @@ mod tests {
         let legacy = r#"{"fwd_type":"Local","listen_host":"127.0.0.1","listen_port":8080,"dest_host":"127.0.0.1","dest_port":80}"#;
         let f: PortForward = serde_json::from_str(legacy).unwrap();
         assert!(!f.id.is_empty());
+        // Tunnels recorded before auto-reconnect existed stay opt-in.
+        assert!(!f.auto_reconnect);
+    }
+
+    #[test]
+    fn legacy_session_json_without_group_still_loads() {
+        let legacy = r#"[{"id":"x","name":"n","host":"h","port":22,"username":"u","auth_type":"Password","password":"p","key_path":"","key_passphrase":"","forwards":[]}]"#;
+        let sessions: Vec<SshSession> = serde_json::from_str(legacy).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].group, None);
     }
 }

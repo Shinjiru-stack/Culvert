@@ -37,7 +37,17 @@ small, self-contained tool, out of sight and out of the way.
 - **Activity log** — a colour-coded log of connections, forwards and errors,
   opened from the *Activity* button in the status bar.
 - **Session search** — filter the sidebar once the list grows.
-- **Modern dark theme** — bundled Inter + JetBrains Mono type system.
+- **Session groups** — organise sessions into collapsible groups (Production,
+  Staging, Home lab…) with colored dots; create, rename, recolor and delete
+  groups from the sidebar or a session's right-click menu.
+- **Tunnel auto-reconnect** — opt in per tunnel: if the SSH link drops, the
+  tunnel comes back on its own with a 3–15s backoff (amber status dot while
+  retrying). The switch can be flipped live even while the tunnel is running.
+- **Tab management** — right-click any terminal tab: close it, close others,
+  close tabs to the right or all of them, browser-style.
+- **Modern light theme** — macOS-like white chrome with an indigo accent that
+  matches the app icon, a GitHub-style light terminal palette, and bundled
+  Inter + JetBrains Mono type system.
 
 ## Download
 
@@ -80,7 +90,7 @@ field before saving.
 
 Sessions (including credentials) are stored as JSON:
 
-- Windows: `%APPDATA%\culvert\sessions.json`
+- Windows: `%APPDATA%\culvert\sessions.json` (groups live next to it in `groups.json`)
 - Linux/macOS: `~/.config/culvert/sessions.json`
 
 Upgrading from an earlier build? Your sessions are imported automatically from

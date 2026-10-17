@@ -72,7 +72,13 @@ pub async fn connect(
         ),
     );
 
-    let config = Arc::new(client::Config::default());
+    let mut config = client::Config::default();
+    // Detect dead connections (dropped WiFi, sleeping laptop, killed VPN)
+    // instead of hanging forever: after 25s of server silence send a
+    // keepalive and give up after 3 unanswered ones.
+    config.keepalive_interval = Some(std::time::Duration::from_secs(25));
+    config.keepalive_max = 3;
+    let config = Arc::new(config);
     let mut handle = client::connect(
         config,
         (session.host.trim(), session.port),

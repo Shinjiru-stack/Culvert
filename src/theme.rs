@@ -11,46 +11,52 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 // Palette
 // ---------------------------------------------------------------------------
+// Modern light design (macOS-style white chrome, Linear-like accents):
+// near-white surfaces, hairline borders, one confident indigo accent that
+// matches the brand mark's blue gradient.
 
-/// Window / central panel background (deepest layer).
-pub const BG_WINDOW: Color32 = Color32::from_rgb(8, 12, 22);
-/// Side / top / bottom panel background.
-pub const BG_PANEL: Color32 = Color32::from_rgb(13, 19, 34);
-/// Panel variant used by the status bar and console.
-pub const BG_PANEL_ALT: Color32 = Color32::from_rgb(10, 15, 28);
-/// Raised card background.
-pub const BG_CARD: Color32 = Color32::from_rgb(18, 26, 45);
-pub const BG_CARD_HOVER: Color32 = Color32::from_rgb(23, 33, 57);
-pub const BG_CARD_SEL: Color32 = Color32::from_rgb(27, 40, 70);
+/// Central panel / page canvas.
+pub const BG_WINDOW: Color32 = Color32::from_rgb(250, 250, 251); // #FAFAFB
+/// Side panel background (sidebar) — slightly translucent white-gray.
+pub const BG_PANEL: Color32 = Color32::from_rgb(243, 244, 246); // #F3F4F6
+/// Subtle filled areas (status bar, empty hints, console).
+pub const BG_PANEL_ALT: Color32 = Color32::from_rgb(238, 240, 244); // #EEF0F4
+/// Raised card background (sessions, tunnel rows).
+pub const BG_CARD: Color32 = Color32::WHITE;
+/// Selected card: soft accent tint.
+pub const BG_CARD_SEL: Color32 = Color32::from_rgb(237, 240, 253);
 /// Input / console background.
-pub const BG_INPUT: Color32 = Color32::from_rgb(11, 17, 31);
-/// Resting button background.
-pub const BG_BTN: Color32 = Color32::from_rgb(26, 36, 60);
-pub const BG_BTN_HOVER: Color32 = Color32::from_rgb(35, 48, 78);
+pub const BG_INPUT: Color32 = Color32::WHITE;/// Resting button background (secondary/ghost buttons).
+pub const BG_BTN: Color32 = Color32::from_rgb(255, 255, 255);
+pub const BG_BTN_HOVER: Color32 = Color32::from_rgb(241, 243, 247);
 
-pub const BORDER: Color32 = Color32::from_rgb(31, 43, 68);
-pub const BORDER_STRONG: Color32 = Color32::from_rgb(46, 62, 96);
+pub const BORDER: Color32 = Color32::from_rgb(226, 229, 236);
+pub const BORDER_STRONG: Color32 = Color32::from_rgb(206, 210, 221);
 
-pub const ACCENT: Color32 = Color32::from_rgb(84, 122, 255);
-pub const ACCENT_SOFT: Color32 = Color32::from_rgb(37, 56, 110);
-pub const ACCENT_SOFT_HOVER: Color32 = Color32::from_rgb(48, 72, 140);
-pub const ACCENT_TEXT: Color32 = Color32::from_rgb(170, 190, 255);
+/// Brand accent — indigo/blue family, matches the app icon gradient.
+pub const ACCENT: Color32 = Color32::from_rgb(76, 94, 214); // #4C5ED6
+/// Hover state of the solid accent (primary) buttons.
+pub const ACCENT_HOVER: Color32 = Color32::from_rgb(61, 76, 189);
+pub const ACCENT_SOFT: Color32 = Color32::from_rgb(233, 238, 254);
+pub const ACCENT_SOFT_HOVER: Color32 = Color32::from_rgb(219, 227, 252);
+/// Text color for accent-tinted backgrounds.
+pub const ACCENT_TEXT: Color32 = Color32::from_rgb(58, 72, 180);
 
-pub const TEXT: Color32 = Color32::from_rgb(227, 233, 246);
-pub const TEXT_DIM: Color32 = Color32::from_rgb(152, 166, 193);
-pub const TEXT_FAINT: Color32 = Color32::from_rgb(99, 113, 141);
+pub const TEXT: Color32 = Color32::from_rgb(30, 33, 40); // #1E2128
+pub const TEXT_DIM: Color32 = Color32::from_rgb(98, 105, 118);
+pub const TEXT_FAINT: Color32 = Color32::from_rgb(148, 155, 168);
 
-pub const SUCCESS: Color32 = Color32::from_rgb(61, 214, 155);
-pub const SUCCESS_BG: Color32 = Color32::from_rgb(19, 54, 45);
-pub const WARNING: Color32 = Color32::from_rgb(251, 191, 36);
-pub const DANGER: Color32 = Color32::from_rgb(250, 120, 120);
-pub const DANGER_BTN: Color32 = Color32::from_rgb(196, 58, 58);
-pub const DANGER_BTN_HOVER: Color32 = Color32::from_rgb(224, 78, 78);
-pub const DANGER_BG: Color32 = Color32::from_rgb(62, 25, 32);
-pub const INFO: Color32 = Color32::from_rgb(125, 168, 255);
-pub const INFO_BG: Color32 = Color32::from_rgb(23, 40, 78);
-pub const VIOLET: Color32 = Color32::from_rgb(178, 152, 255);
-pub const VIOLET_BG: Color32 = Color32::from_rgb(45, 34, 84);
+pub const SUCCESS: Color32 = Color32::from_rgb(7, 133, 83); // #078553
+pub const SUCCESS_BG: Color32 = Color32::from_rgb(230, 246, 238);
+pub const WARNING: Color32 = Color32::from_rgb(184, 110, 8); // #B86E08
+pub const DANGER: Color32 = Color32::from_rgb(211, 47, 47); // #D32F2F
+pub const DANGER_BTN: Color32 = Color32::from_rgb(211, 47, 47);
+pub const DANGER_BTN_HOVER: Color32 = Color32::from_rgb(178, 34, 34);
+pub const DANGER_BG: Color32 = Color32::from_rgb(252, 233, 234);
+pub const INFO: Color32 = Color32::from_rgb(31, 103, 214); // #1F67D6
+pub const INFO_BG: Color32 = Color32::from_rgb(232, 240, 253);
+pub const VIOLET: Color32 = Color32::from_rgb(110, 58, 205); // #6E3ACD
+pub const VIOLET_BG: Color32 = Color32::from_rgb(242, 236, 253);
 
 /// Named text style for the big page title.
 pub fn h1() -> TextStyle {
@@ -66,9 +72,10 @@ pub fn h2() -> TextStyle {
 pub fn apply(ctx: &egui::Context) {
     install_fonts(ctx);
 
-    // The design is dark-only; pin the preference so an OS light theme cannot
-    // swap in egui's default (light) style, which would drop our named styles.
-    ctx.set_theme(egui::ThemePreference::Dark);
+    // The design is light-only; pin the preference so an OS dark theme
+    // cannot swap in egui's default (dark) style, which would drop our
+    // named styles (same class of crash as the old light-theme swap).
+    ctx.set_theme(egui::ThemePreference::Light);
 
     let mut style = (*ctx.style()).clone();
     style.visuals = visuals();
@@ -128,42 +135,42 @@ fn text_styles() -> std::collections::BTreeMap<TextStyle, FontId> {
 }
 
 fn visuals() -> Visuals {
-    let mut v = Visuals::dark();
-    v.dark_mode = true;
+    let mut v = Visuals::light();
+    v.dark_mode = false;
     v.panel_fill = BG_PANEL;
     v.window_fill = BG_CARD;
     v.window_stroke = Stroke::new(1.0_f32, BORDER_STRONG);
     v.window_corner_radius = CornerRadius::same(14);
     v.menu_corner_radius = CornerRadius::same(10);
     v.window_shadow = Shadow {
-        offset: [0, 10],
-        blur: 30,
+        offset: [0, 12],
+        blur: 34,
         spread: 0,
-        color: Color32::from_black_alpha(150),
+        color: Color32::from_black_alpha(64),
     };
     v.popup_shadow = Shadow {
-        offset: [0, 6],
-        blur: 20,
+        offset: [0, 5],
+        blur: 16,
         spread: 0,
-        color: Color32::from_black_alpha(130),
+        color: Color32::from_black_alpha(56),
     };
-    v.extreme_bg_color = BG_INPUT;
+    v.extreme_bg_color = BG_PANEL_ALT;
     v.text_edit_bg_color = Some(BG_INPUT);
     v.code_bg_color = BG_INPUT;
-    v.faint_bg_color = BG_CARD_HOVER;
+    v.faint_bg_color = BG_PANEL_ALT;
     v.striped = false;
-    v.override_text_color = Some(TEXT);
-    v.hyperlink_color = ACCENT_TEXT;
-    v.selection.bg_fill = ACCENT_SOFT;
+    v.hyperlink_color = ACCENT;
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied(76, 94, 214, 56);
     v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
 
     let r = CornerRadius::same(8);
     v.widgets.noninteractive = WidgetVisuals {
-        bg_fill: BG_CARD,
-        weak_bg_fill: BG_CARD,
+        bg_fill: BG_PANEL_ALT,
+        weak_bg_fill: BG_PANEL_ALT,
         bg_stroke: Stroke::new(1.0_f32, BORDER),
         corner_radius: CornerRadius::same(10),
-        fg_stroke: Stroke::new(1.0_f32, TEXT_DIM),
+        // Default label color: plain labels without an explicit color land here.
+        fg_stroke: Stroke::new(1.0_f32, TEXT),
         expansion: 0.0,
     };
     v.widgets.inactive = WidgetVisuals {
@@ -179,7 +186,7 @@ fn visuals() -> Visuals {
         weak_bg_fill: BG_BTN_HOVER,
         bg_stroke: Stroke::new(1.0_f32, BORDER_STRONG),
         corner_radius: r,
-        fg_stroke: Stroke::new(1.0_f32, Color32::WHITE),
+        fg_stroke: Stroke::new(1.0_f32, TEXT),
         expansion: 0.0,
     };
     v.widgets.active = WidgetVisuals {
@@ -187,7 +194,7 @@ fn visuals() -> Visuals {
         weak_bg_fill: ACCENT_SOFT,
         bg_stroke: Stroke::new(1.0_f32, ACCENT),
         corner_radius: r,
-        fg_stroke: Stroke::new(1.0_f32, Color32::WHITE),
+        fg_stroke: Stroke::new(1.0_f32, TEXT),
         expansion: 0.0,
     };
     v.widgets.open = v.widgets.active;

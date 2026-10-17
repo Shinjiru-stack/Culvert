@@ -11,8 +11,9 @@ use russh::ChannelMsg;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const SCROLLBACK_LINES: usize = 4000;
-const TERM_BG: Color32 = Color32::from_rgb(9, 13, 24);
-const TERM_FG: Color32 = Color32::from_rgb(214, 222, 240);
+/// Light terminal canvas (GitHub-style light): white paper, dark text.
+const TERM_BG: Color32 = Color32::from_rgb(255, 255, 255);
+const TERM_FG: Color32 = Color32::from_rgb(31, 35, 40);
 
 // ---------------------------------------------------------------------------
 // Messages between UI thread and the async shell task
@@ -400,7 +401,7 @@ impl TerminalSession {
             );
             if focused {
                 if blink_on {
-                    painter.rect_filled(crect, 1.0, Color32::from_rgba_unmultiplied(230, 236, 255, 110));
+                    painter.rect_filled(crect, 1.0, Color32::from_rgba_unmultiplied(76, 94, 214, 48));
                 }
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
             } else {
@@ -676,7 +677,7 @@ fn map_color(c: vt100::Color, default: Color32, bold: bool) -> Color32 {
     match c {
         vt100::Color::Default => {
             if bold && default == TERM_FG {
-                Color32::from_rgb(240, 245, 255)
+                Color32::from_rgb(10, 13, 17)
             } else {
                 default
             }
@@ -687,24 +688,24 @@ fn map_color(c: vt100::Color, default: Color32, bold: bool) -> Color32 {
 }
 
 fn idx_color(i: u8, bold: bool) -> Color32 {
-    // 16 base colors tuned for a dark UI (One Dark family).
+    // 16 base colors tuned for the light terminal (GitHub Light family).
     const BASE: [(u8, u8, u8); 16] = [
-        (36, 42, 58),    // 0 black
-        (224, 108, 117), // 1 red
-        (152, 195, 121), // 2 green
-        (229, 192, 123), // 3 yellow
-        (97, 175, 239),  // 4 blue
-        (198, 120, 221), // 5 magenta
-        (86, 182, 194),  // 6 cyan
-        (220, 223, 228), // 7 white
-        (92, 99, 112),   // 8 bright black
-        (255, 123, 134), // 9 bright red
-        (179, 224, 140), // 10 bright green
-        (245, 209, 147), // 11 bright yellow
-        (125, 195, 255), // 12 bright blue
-        (216, 160, 239), // 13 bright magenta
-        (102, 217, 227), // 14 bright cyan
-        (255, 255, 255), // 15 bright white
+        (37, 41, 48),   // 0 black — #252930
+        (207, 34, 46),  // 1 red — #CF222E
+        (18, 99, 43),   // 2 green — #12632B
+        (154, 103, 0),  // 3 yellow — #9A6700
+        (9, 80, 174),   // 4 blue — #0950AE
+        (130, 80, 223), // 5 magenta — #8250DF
+        (27, 124, 131), // 6 cyan — #1B7C83
+        (110, 119, 129), // 7 white — #6E7781
+        (87, 96, 106),  // 8 bright black — #57606A
+        (164, 14, 38),  // 9 bright red — #A40E26
+        (26, 127, 55),  // 10 bright green — #1A7F37
+        (191, 135, 0),  // 11 bright yellow — #BF8700
+        (33, 139, 255), // 12 bright blue — #218BFF
+        (164, 117, 249), // 13 bright magenta — #A475F9
+        (49, 146, 170), // 14 bright cyan — #3192AA
+        (134, 143, 155), // 15 bright white — #868F9B
     ];
     let i = if bold && i < 8 { i + 8 } else { i };
     if i < 16 {
@@ -793,8 +794,8 @@ mod tests {
 
     #[test]
     fn ansi_palette_bounds() {
-        assert_eq!(idx_color(1, false), Color32::from_rgb(224, 108, 117));
-        assert_eq!(idx_color(9, false), Color32::from_rgb(255, 123, 134));
+        assert_eq!(idx_color(1, false), Color32::from_rgb(207, 34, 46));
+        assert_eq!(idx_color(9, false), Color32::from_rgb(164, 14, 38));
         assert_eq!(idx_color(16, false), Color32::from_rgb(0, 0, 0));
         assert_eq!(idx_color(231, false), Color32::from_rgb(255, 255, 255));
         assert_eq!(idx_color(255, false), Color32::from_rgb(238, 238, 238));
