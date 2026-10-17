@@ -1,9 +1,10 @@
 name: Release
 
 # Builds a Windows .exe whenever something lands on `main` and publishes it
-# as a GitHub Release. Bump `version` in Cargo.toml to cut a new release tag;
-# otherwise the existing release for that version is refreshed with the new
-# binary.
+# as a GitHub Release. Every push rebuilds the release: the release for the
+# current version in Cargo.toml is deleted and recreated at the latest commit
+# with fresh generated notes. Bump `version` in Cargo.toml to cut a new
+# release tag.
 on:
   push:
     branches: [main]
@@ -59,11 +60,19 @@ jobs:
           path: culvert-*-windows-x64.zip
           if-no-files-found: error
 
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: Culvert ${{ steps.version.outputs.tag }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: culvert-*-windows-x64.zip
+      - name: Publish GitHub release (refreshed on every push)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $zip = "culvert-${{ steps.version.outputs.version }}-windows-x64.zip"
+          # One rolling release per versioned tag: replace the previous
+          # release (and its tag) so the new one lands on this exact commit
+          # and shows a fresh publish date and fresh generated notes.
+          gh release delete $tag -y --cleanup-tag
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "No previous release for $tag — creating the first one."
+          }
+          Start-Sleep -Seconds 5
+          gh release create $tag $zip --target ${{ github.sha }} --title "Culvert $tag" --generate-notes
