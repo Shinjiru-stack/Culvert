@@ -1198,13 +1198,16 @@ impl TunnelApp {
 
     /// Split view: every open shell in a 2-column grid, each pane with its
     /// own title bar (live, individually interactive).
-    fn terminal_grid(&mut self, ui: &mut Ui, _ctx: &egui::Context) {
-        let avail = ui.available_size();
+    ///
+    /// Geometry is exact: the whole workspace rect is reserved up front and
+    /// every pane is placed at an absolutely computed rect via `scope_builder`.
+    /// This avoids egui's min-rect/used-size allocation, which would collapse
+    /// the painter-only terminal panes and reflow the grid.
+    fn terminal_grid(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let area = ui.available_rect_before_wrap();
         let gap = 8.0;
-        let cell = egui::vec2(
-            (((avail.x - gap) / 2.0) - 2.0).max(220.0),
-            ((avail.y - gap) / 2.0).max(150.0),
-        );
+        let cell_w = (((area.width() - gap) / 2.0) - 2.0).max(220.0);
+        let cell_h = ((area.height() - gap) / 2.0).max(150.0);
         let idxs: Vec<usize> = self
             .tabs
             .iter()
@@ -1212,108 +1215,124 @@ impl TunnelApp {
             .filter(|(_, t)| matches!(t, Tab::Terminal(_)))
             .map(|(i, _)| i)
             .collect();
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .id_salt("terminal_grid")
-            .show(ui, |ui| {
-                for pair in idxs.chunks(2) {
-                    ui.horizontal(|ui| {
-                        for &i in pair {
-                            self.terminal_pane(ui, i, cell);
-                            ui.add_space(gap);
-                        }
-                    });
-                    ui.add_space(gap);
-                }
-            });
+
+        // Reserve the whole workspace once; panes are painted at absolute
+        // rects afterwards, so nothing after this point reflows.
+        ui.allocate_exact_size(area.size(), Sense::hover());
+
+        for (n, &i) in idxs.iter().enumerate() {
+            let col = (n % 2) as f32;
+            let row = (n / 2) as f32;
+            let pos = egui::pos2(
+                area.left() + col * (cell_w + gap),
+                area.top() + row * (cell_h + gap),
+            );
+            let cell = egui::vec2(cell_w, cell_h);
+            self.terminal_pane(ui, ctx, i, egui::Rect::from_min_size(pos, cell));
+        }
     }
 
-    fn terminal_pane(&mut self, ui: &mut Ui, index: usize, cell: egui::Vec2) {
-        let (title, dot) = match &self.tabs[index] {
-            Tab::Terminal(t) => {
-                let dot = match t.status {
-                    TermStatus::Connected => theme::SUCCESS,
-                    TermStatus::Connecting => theme::WARNING,
-                    TermStatus::Closed(_) => theme::DANGER,
-                };
-                (t.title.clone(), dot)
-            }
-            _ => return,
+    fn terminal_pane(&mut self, ui: &mut Ui, ctx: &egui::Context, index: usize, pane: egui::Rect) {
+        let Some(Tab::Terminal(t)) = self.tabs.get_mut(index) else {
+            return;
         };
-        let selected = self.active == index;
-        let mut go_active = false;
+        let title = t.title.clone();
+        let dot = match t.status {
+            TermStatus::Connected => theme::SUCCESS,
+            TermStatus::Connecting => theme::WARNING,
+            TermStatus::Closed(_) => theme::DANGER,
+        };
+        // The focused pane is the one with keyboard focus (falls back to the
+        // selected tab), so the highlight follows clicks into terminals.
+        let focused = t.is_focused(ctx) || self.active == index;
         let mut want_close = false;
-        Frame::NONE
-            .fill(theme::BG_CARD)
-            .corner_radius(CornerRadius::same(10))
-            .stroke(Stroke::new(
+
+        let bar = egui::Rect::from_min_size(
+            pane.min,
+            egui::vec2(pane.width(), 26.0),
+        );
+        let body = egui::Rect::from_min_max(
+            egui::pos2(pane.left() + 1.0, pane.top() + 27.0),
+            egui::pos2(pane.right() - 1.0, pane.bottom() - 1.0),
+        );
+
+        let p = ui.painter();
+        p.rect_filled(pane, 10.0, theme::BG_CARD);
+        p.rect_stroke(
+            pane,
+            10.0,
+            Stroke::new(
                 1.0_f32,
-                if selected {
-                    theme::ACCENT
-                } else {
-                    theme::BORDER
-                },
-            ))
-            .inner_margin(Margin::same(0))
-            .show(ui, |ui| {
-                ui.set_width(cell.x);
-                // Title bar: fixed-size row, painted + positioned manually so
-                // the close × and click-to-focus coexist safely.
-                ui.allocate_ui(egui::vec2(cell.x, 26.0), |ui| {
-                    let (bar_rect, bar_resp) =
-                        ui.allocate_exact_size(egui::vec2(cell.x, 26.0), Sense::click());
-                    if selected {
-                        ui.painter().rect_filled(bar_rect, 0.0, theme::BG_CARD_SEL);
-                    }
-                    ui.painter().circle_filled(
-                        egui::pos2(bar_rect.left() + 14.0, bar_rect.center().y),
-                        3.0,
-                        dot,
-                    );
-                    let font = egui::TextStyle::Body.resolve(ui.style());
-                    ui.painter().text(
-                        egui::pos2(bar_rect.left() + 24.0, bar_rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        &title,
-                        font,
-                        theme::TEXT_DIM,
-                    );
-                    let x_rect = egui::Rect::from_min_size(
-                        egui::pos2(bar_rect.right() - 22.0, bar_rect.top() + 4.0),
-                        egui::vec2(18.0, 18.0),
-                    );
-                    if ui
-                        .put(
-                            x_rect,
-                            egui::Button::new(
-                                RichText::new("×").size(10.0).color(theme::TEXT_FAINT),
-                            )
-                            .fill(Color32::TRANSPARENT)
-                            .stroke(Stroke::NONE),
-                        )
-                        .on_hover_text("Close this shell")
-                        .clicked()
-                    {
-                        want_close = true;
-                    }
-                    if bar_resp.clicked() {
-                        go_active = true;
-                    }
-                });
-                let Some(Tab::Terminal(t)) = self.tabs.get_mut(index) else {
-                    return;
-                };
-                ui.allocate_ui(egui::vec2(cell.x, cell.y - 26.0), |ui| {
-                    t.ui(ui);
-                });
-            });
-        if go_active {
-            self.active = index;
+                if focused { theme::ACCENT } else { theme::BORDER },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        if focused {
+            p.rect_filled(bar, 0.0, theme::BG_CARD_SEL);
         }
-        if want_close {
-            if let Some(Tab::Terminal(t)) = self.tabs.get_mut(index) {
-                t.want_close = true;
+        p.circle_filled(egui::pos2(bar.left() + 14.0, bar.center().y), 3.0, dot);
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        p.text(
+            egui::pos2(bar.left() + 24.0, bar.center().y),
+            egui::Align2::LEFT_CENTER,
+            &title,
+            font,
+            theme::TEXT_DIM,
+        );
+
+        // Close ×: painted + hit-tested manually so it sits cleanly at the
+        // bar's right edge without disturbing layout.
+        let x_rect = egui::Rect::from_min_size(
+            egui::pos2(bar.right() - 26.0, bar.top() + 4.0),
+            egui::vec2(22.0, 18.0),
+        );
+        {
+            let resp = ui.interact(x_rect, egui::Id::new(("split_pane_x", index)), Sense::click());
+            let (fg, bg) = if resp.hovered() {
+                (theme::TEXT, theme::BG_BTN_HOVER)
+            } else {
+                (theme::TEXT_FAINT, Color32::TRANSPARENT)
+            };
+            if bg != Color32::TRANSPARENT {
+                p.rect_filled(x_rect, 5.0, bg);
             }
+            p.text(
+                x_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "×",
+                egui::FontId::proportional(11.5),
+                fg,
+            );
+            if resp.clicked() {
+                want_close = true;
+            }
+        }
+        // Clicking anywhere else on the title bar selects the pane.
+        let bar_clicked = ui
+            .interact(
+                egui::Rect::from_min_max(
+                    egui::pos2(bar.left() + 4.0, bar.top()),
+                    egui::pos2(x_rect.left(), bar.bottom()),
+                ),
+                egui::Id::new(("split_pane_bar", index)),
+                Sense::click(),
+            )
+            .clicked();
+
+        // Terminal body: pinned to the exact rect; the terminal computes its
+        // grid from this rect and paints with its own painter.
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(body).id_salt(("split_body", index)),
+            |ui| {
+                t.ui(ui);
+            },
+        );
+
+        if want_close {
+            t.want_close = true;
+        }
+        if bar_clicked {
+            self.active = index;
         }
     }
 
