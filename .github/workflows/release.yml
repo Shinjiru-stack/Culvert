@@ -54,14 +54,20 @@ jobs:
           $m = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([0-9]+)\.([0-9]+)').Matches[0].Groups
           # Delete the pre-per-build rolling releases (v<major>.<minor>.0 from
           # Cargo.toml alone); per-build tags are v<major>.<minor>.<count> and
-          # can never collide with commit-count 0.
+          # can never collide with commit-count 0. Once the legacy release is
+          # gone this is a no-op — never let it fail the run.
           $legacy = "v$($m[1].Value).$($m[2].Value).0"
-          gh release delete $legacy -y --cleanup-tag
+          gh release view $legacy 2>$null
           if ($LASTEXITCODE -eq 0) {
-            Write-Host "Deleted superseded release $legacy (old rolling scheme)."
+            gh release delete $legacy -y --cleanup-tag
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "Deleted superseded release $legacy (old rolling scheme)."
+            }
           } else {
-            Write-Host "No legacy release $legacy found."
+            Write-Host "No legacy release $legacy found - nothing to clean."
           }
+          $global:LASTEXITCODE = 0
+          exit 0
 
       - name: Build release binary
         run: cargo build --release --locked

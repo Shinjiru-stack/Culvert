@@ -13,7 +13,10 @@ use crate::terminal::{TermStatus, TerminalSession};
 use crate::theme;
 use crate::tunnel::{forward_key, TunnelManager};
 use crate::version;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use eframe::egui::{
+
     self, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, RichText, Sense, Stroke, Ui,
 };
 use std::time::Duration;
@@ -453,6 +456,69 @@ impl TunnelApp {
         }
     }
 
+    /// Launch the Windows RDP client for a session — MobaXterm-style: when
+    /// the session has a saved username+password they are seeded into the
+    /// Windows Credential Manager (`cmdkey /generic:TERMSRV/…`) so the
+    /// client's NLA prompt pre-fills and the click-through just works.
+    /// NOTE: the password is stored locally in the user's credential store,
+    /// the same tradeoff MobaXterm makes for saved RDP logins.
+    fn launch_rdp(&mut self, session: &SshSession) {
+        let host = session.host.trim();
+        if host.is_empty() {
+            self.toast(ToastKind::Info, "Save this session with a host first");
+            return;
+        }
+        if !session.username.trim().is_empty() && !session.password.is_empty() {
+            let generic = format!("TERMSRV/{host}");
+            match std::process::Command::new("cmdkey")
+                .arg(format!("/generic:{generic}"))
+                .arg(format!("/user:{}", session.username.trim()))
+                .arg(format!("/pass:{}", session.password))
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .output()
+            {
+                Ok(_) => {
+                    push_log(
+                        &self.logs,
+                        LogEntry::new(
+                            LogLevel::Success,
+                            &session.name,
+                            &format!("CredentialManager seeded for {generic}"),
+                        ),
+                    );
+                }
+                Err(e) => {
+                    push_log(
+                        &self.logs,
+                        LogEntry::new(
+                            LogLevel::Error,
+                            &session.name,
+                            &format!("cmdkey failed: {e}"),
+                        ),
+                    );
+                }
+            }
+        }
+        let target = format!("/v:{}:{}", host, session.port);
+        match std::process::Command::new("mstsc").arg(&target).spawn() {
+            Ok(_) => {
+                push_log(
+                    &self.logs,
+                    LogEntry::new(
+                        LogLevel::Success,
+                        &session.name,
+                        &format!("Launched RDP client for {target}"),
+                    ),
+                );
+                self.toast(ToastKind::Success, format!("RDP window opened · {}", session.name));
+            }
+            Err(e) => self.toast(
+                ToastKind::Error,
+                format!("Could not start mstsc: {e}"),
+            ),
+        }
+    }
+
     /// One session window per server: a shell pane whose files live in the
     /// sidebar's docked Files browser (which follows the focused session).
     fn open_session(&mut self, ctx: &egui::Context, session_id: &str) {
@@ -469,26 +535,8 @@ impl TunnelApp {
             return;
         };
         if session.protocol == Protocol::Rdp {
-            // Windows desktop session: hand it to the system RDP client,
-            // which collects its own login credentials.
-            let target = format!("/v:{}:{}", session.host.trim(), session.port);
-            match std::process::Command::new("mstsc").arg(&target).spawn() {
-                Ok(_) => {
-                    push_log(
-                        &self.logs,
-                        LogEntry::new(
-                            LogLevel::Success,
-                            &session.name,
-                            &format!("Launched RDP client for {target}"),
-                        ),
-                    );
-                    self.toast(ToastKind::Success, format!("RDP window opened · {}", session.name));
-                }
-                Err(e) => self.toast(
-                    ToastKind::Error,
-                    format!("Could not start mstsc: {e}"),
-                ),
-            }
+            // Windows desktop session: hand it to the system RDP client.
+            self.launch_rdp(&session);
             return;
         }
         if session.host.trim().is_empty() {
@@ -517,25 +565,15 @@ impl TunnelApp {
             Err(e) => self.toast(ToastKind::Error, e),
             Ok((user, host, port)) => {
                 if port == 3389 {
-                    // Windows desktop target: hand it to the system RDP client.
-                    let target = format!("/v:{host}:{port}");
-                    match std::process::Command::new("mstsc").arg(&target).spawn() {
-                        Ok(_) => {
-                            push_log(
-                                &self.logs,
-                                LogEntry::new(
-                                    LogLevel::Success,
-                                    &host,
-                                    &format!("Launched RDP client for {target}"),
-                                ),
-                            );
-                            self.toast(ToastKind::Success, format!("RDP window opened · {host}"));
-                        }
-                        Err(e) => self.toast(
-                            ToastKind::Error,
-                            format!("Could not start mstsc: {e}"),
-                        ),
-                    }
+                    // Windows desktop target: hand it to the system RDP client
+                    // with saved-credential seeding.
+                    let mut session = SshSession::default();
+                    session.name = format!("{user}@{host}");
+                    session.protocol = Protocol::Rdp;
+                    session.host = host;
+                    session.port = port;
+                    session.username = user;
+                    self.launch_rdp(&session);
                     return;
                 }
                 let mut session = SshSession::default();
@@ -1049,6 +1087,229 @@ impl eframe::App for TunnelApp {
 }
 
 impl TunnelApp {
+    // -----------------------------------------------------------------------
+    // Menu bar (MobaXterm-style top menu strip)
+    // -----------------------------------------------------------------------
+
+    fn menu_bar(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
+
+            // -- Terminal -----------------------------------------------------
+            ui.menu_button("Terminal", |menu| {
+                let mut copied = false;
+                let mut pasted = false;
+                let mut cleared = false;
+                let mut reconnected = false;
+                let mut closed = false;
+                let mut connected = false;
+                if let Some(Tab::Terminal(t)) = self.tabs.get_mut(self.active) {
+                    connected = true;
+                    if menu.button("Copy screen").clicked() {
+                        let text = t.visible_text();
+                        if !text.trim().is_empty() {
+                            menu.ctx().copy_text(text);
+                            copied = true;
+                        }
+                        menu.close();
+                    }
+                    if menu.button("Paste").clicked() {
+                        let text = arboard::Clipboard::new()
+                            .and_then(|mut c| c.get_text())
+                            .unwrap_or_default();
+                        if !text.trim().is_empty() {
+                            t.paste_text(&text);
+                            pasted = true;
+                        }
+                        menu.close();
+                    }
+                    if menu.button("Clear screen").clicked() {
+                        t.clear_screen();
+                        cleared = true;
+                        menu.close();
+                    }
+                    menu.separator();
+                    if menu.button("Reconnect shell").clicked() {
+                        t.reconnect();
+                        reconnected = true;
+                        menu.close();
+                    }
+                    menu.separator();
+                    if menu.button("Close tab").clicked() {
+                        closed = true;
+                        menu.close();
+                    }
+                }
+                if !connected {
+                    menu.label(
+                        RichText::new("No shell open — connect a session first.")
+                            .weak(),
+                    );
+                }
+                // Act after the borrow ends.
+                if copied {
+                    self.toast(ToastKind::Success, "Screen copied to clipboard");
+                }
+                if pasted {
+                    self.toast(ToastKind::Success, "Pasted into shell");
+                }
+                if cleared {
+                    self.toast(ToastKind::Success, "Screen cleared");
+                }
+                if reconnected {
+                    self.toast(ToastKind::Info, "Reconnecting…");
+                }
+                if closed {
+                    if self.active > 0 {
+                        self.close_tab(self.active);
+                    } else {
+                        self.toast(ToastKind::Info, "That tab is not closable");
+                    }
+                }
+            });
+
+            // -- Sessions -----------------------------------------------------
+            ui.menu_button("Sessions", |menu| {
+                if menu.button("New session…  (Ctrl+N)").clicked() {
+                    self.session_editor = Some(SessionEditor::new());
+                    menu.close();
+                }
+                if menu.button("New tunnel…  (Ctrl+T)").clicked() {
+                    self.tunnel_editor = Some(TunnelEditor::new_standalone());
+                    menu.close();
+                }
+                if !self.sessions.is_empty() {
+                    menu.separator();
+                    let mut open_id: Option<String> = None;
+                    for s in self.sessions.iter().take(12) {
+                        if menu.button(RichText::new(&s.name).size(12.0)).clicked() {
+                            open_id = Some(s.id.clone());
+                            menu.close();
+                        }
+                    }
+                    if let Some(id) = open_id {
+                        self.open_session(ctx, &id);
+                    }
+                }
+                if menu.button("Quick connect (sidebar)").clicked() {
+                    menu.close();
+                }
+            });
+
+            // -- View ---------------------------------------------------------
+            ui.menu_button("View", |menu| {
+                if menu.checkbox(&mut self.split_view, "Split view").changed() {
+                    menu.close();
+                }
+                if menu
+                    .checkbox(&mut self.show_logs, "Activity log")
+                    .changed()
+                {
+                    menu.close();
+                }
+                menu.separator();
+                if menu.button("Files tool").clicked() {
+                    self.side_mode = SideMode::Files;
+                    self.sidebar_collapsed = false;
+                    menu.close();
+                }
+                if menu.button("Sessions tool").clicked() {
+                    self.side_mode = SideMode::Sessions;
+                    menu.close();
+                }
+                menu.separator();
+                if self.sidebar_collapsed {
+                    if menu.button("Expand sidebar").clicked() {
+                        self.sidebar_collapsed = false;
+                        menu.close();
+                    }
+                } else if menu.button("Collapse sidebar").clicked() {
+                    self.sidebar_collapsed = true;
+                    menu.close();
+                }
+            });
+
+            // -- Tools ---------------------------------------------------------
+            ui.menu_button("Tools", |menu| {
+                if menu.button("Snippet manager…").clicked() {
+                    self.snippets_backup = self.snippets.clone();
+                    self.snippets_open = true;
+                    menu.close();
+                }
+                menu.separator();
+                if menu.button("Files browser").clicked() {
+                    self.side_mode = SideMode::Files;
+                    self.sidebar_collapsed = false;
+                    menu.close();
+                }
+            });
+
+            // -- Macros --------------------------------------------------------
+            ui.menu_button("Macros", |menu| {
+                if menu.button("Manage snippets…").clicked() {
+                    self.snippets_backup = self.snippets.clone();
+                    self.snippets_open = true;
+                    menu.close();
+                }
+                if !self.snippets.is_empty() {
+                    menu.separator();
+                    for s in self.snippets.clone() {
+                        if menu.button(RichText::new(&s.name).size(12.0)).clicked() {
+                            menu.close();
+                            if let Some(Tab::Terminal(t)) = self.tabs.get_mut(self.active) {
+                                let mut bytes = s.command.as_bytes().to_vec();
+                                if !s.command.ends_with('\n') {
+                                    bytes.push(b'\r');
+                                }
+                                t.send_bytes(bytes);
+                                self.toast(
+                                    ToastKind::Success,
+                                    format!("Macro sent · {}", s.name),
+                                );
+                            } else {
+                                self.toast(
+                                    ToastKind::Info,
+                                    "Open a session shell to run macros",
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+
+            // -- Help ----------------------------------------------------------
+            ui.menu_button("Help", |menu| {
+                if menu.button(format!("About Culvert {}", version::tag())).clicked() {
+                    self.toast(
+                        ToastKind::Info,
+                        format!(
+                            "Culvert {} · {} · MIT · original Rust implementation",
+                            version::tag(),
+                            version::display()
+                        ),
+                    );
+                    menu.close();
+                }
+                if menu.button("Open project page").clicked() {
+                    let _ = std::process::Command::new("explorer")
+                        .arg("https://github.com/Shinjiru-stack/Culvert")
+                        .spawn();
+                    menu.close();
+                }
+            });
+
+            // Right-aligned quiet build tag.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(version::tag())
+                        .size(9.5)
+                        .color(theme::TEXT_FAINT()),
+                );
+            });
+        });
+    }
+
     pub fn ui(&mut self, ctx: &egui::Context) {
         // One-shot CLI autostart (`--open <session>` + `--files`): open the
         // named saved session and optionally flip the sidebar to its file
@@ -1121,6 +1382,15 @@ impl TunnelApp {
                 self.tunnel_editor = Some(TunnelEditor::new_standalone());
             }
         }
+
+        egui::TopBottomPanel::top("menubar")
+            .exact_height(24.0)
+            .frame(
+                Frame::NONE
+                    .fill(theme::BG_PANEL())
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER())),
+            )
+            .show(ctx, |ui| self.menu_bar(ui, ctx));
 
         egui::TopBottomPanel::bottom("statusbar")
             .exact_height(26.0)
@@ -1659,8 +1929,8 @@ impl TunnelApp {
     /// Icon toolbar across the top of the workspace (Tabler glyph tiles).
     fn toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 5.0;
-            if tool_button(ui, tglyph::SESSION, "Session", false, "New session")
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if tool_button(ui, tglyph::SESSION, theme::SUCCESS(), "Session", false, "New session")
                 .clicked()
             {
                 self.session_editor = Some(SessionEditor::new());
@@ -1668,6 +1938,7 @@ impl TunnelApp {
             if tool_button(
                 ui,
                 tglyph::TUNNEL,
+                theme::INFO(),
                 "Tunnel",
                 false,
                 "New tunnel — any SSH host; a saved session is optional",
@@ -1685,26 +1956,37 @@ impl TunnelApp {
                 );
             }
             let split_active = self.split_view && self.terminal_tab_count() >= 2;
-            if tool_button(ui, tglyph::SPLIT, "Split", split_active, "Toggle split view")
+            if tool_button(ui, tglyph::SPLIT, theme::ACCENT(), "Split", split_active, "Toggle split view")
                 .clicked()
             {
                 self.split_view = !self.split_view;
             }
-            if tool_button(ui, tglyph::ACTIVITY, "Activity", self.show_logs, "Activity log")
-                .clicked()
+            if tool_button(
+                ui,
+                tglyph::ACTIVITY,
+                theme::WARNING(),
+                "Activity",
+                self.show_logs,
+                "Activity log",
+            )
+            .clicked()
             {
                 self.show_logs = !self.show_logs;
             }
             // Right edge: light/dark palette switch. The glyph shows the
             // theme you'll get.
             ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                let glyph = if theme::is_dark() { tglyph::SUN } else { tglyph::MOON };
+                let (glyph, tint) = if theme::is_dark() {
+                    (tglyph::SUN, theme::WARNING())
+                } else {
+                    (tglyph::MOON, theme::INFO())
+                };
                 let tip = if theme::is_dark() {
                     "Switch to the light theme"
                 } else {
                     "Switch to the dark theme"
                 };
-                if tool_button(ui, glyph, "Theme", false, tip)
+                if tool_button(ui, glyph, tint, "Theme", false, tip)
                     .clicked()
                 {
                     theme::set_dark(!theme::is_dark());
@@ -2028,7 +2310,13 @@ impl TunnelApp {
         }
     }
 
-    fn tunnels_page(&mut self, ui: &mut Ui, _ctx: &egui::Context) {
+    fn tunnels_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        // MobaXterm-style home hero: brand, quick actions and a theme
+        // picker, shown while no shells are open. Once sessions are running
+        // the tunnel list takes the whole page back.
+        if self.terminal_tab_count() == 0 {
+            welcome_hero(self, ui, ctx);
+        }
         ui.horizontal(|ui| {
             // A deliberate color bar anchoring the page title.
             let (title_bar, _) = ui.allocate_exact_size(egui::vec2(4.0, 30.0), Sense::hover());
@@ -3714,17 +4002,18 @@ mod tglyph {
     pub const PLUG: char = '\u{ebd9}';
 }
 
-/// Neutral icon tile for the main toolbar: Tabler glyph over a small label.
-/// Flat professional chip — card fill, hairline border, accent when active
-/// or hovered; no solid color blocks.
+/// Flat MobaXterm-style toolbar tile: colored Tabler glyph over a small
+/// label, no background fill — a soft rounded highlight appears on hover,
+/// accent wash when active. Professional, quiet, and light on the eyes.
 fn tool_button(
     ui: &mut Ui,
     glyph: char,
+    tint: Color32,
     label: &str,
     active: bool,
     tip: &str,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(50.0, 40.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(46.0, 38.0), Sense::click());
     let p = ui.painter();
     let (fill, stroke) = if active {
         (
@@ -3732,35 +4021,214 @@ fn tool_button(
             Stroke::new(1.0_f32, theme::ACCENT()),
         )
     } else if resp.hovered() {
-        (
-            theme::BG_BTN_HOVER(),
-            Stroke::new(1.0_f32, theme::BORDER_STRONG()),
-        )
+        (theme::BG_BTN_HOVER(), Stroke::NONE)
     } else {
-        (theme::BG_CARD(), Stroke::new(1.0_f32, theme::BORDER()))
+        (Color32::TRANSPARENT, Stroke::NONE)
     };
-    p.rect_filled(rect, 8.0, fill);
+    if fill != Color32::TRANSPARENT {
+        p.rect_filled(rect, 8.0, fill);
+    }
     p.rect_stroke(rect, 8.0, stroke, egui::StrokeKind::Inside);
-    let ic = if active || resp.hovered() {
-        theme::ACCENT()
-    } else {
-        theme::TEXT_DIM()
-    };
     p.text(
-        egui::pos2(rect.center().x, rect.top() + 13.0),
+        egui::pos2(rect.center().x, rect.top() + 12.0),
         egui::Align2::CENTER_CENTER,
         glyph,
-        theme::icon(15.0),
-        ic,
+        theme::icon(16.0),
+        tint,
     );
     p.text(
-        egui::pos2(rect.center().x, rect.bottom() - 6.5),
+        egui::pos2(rect.center().x, rect.bottom() - 6.0),
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(9.0),
-        if active { theme::TEXT() } else { theme::TEXT_DIM() },
+        if active { theme::ACCENT() } else { theme::TEXT_DIM() },
     );
     resp.on_hover_text(tip)
+}
+
+/// Big welcome-screen action button: Tabler glyph in its color + label.
+fn hero_button(
+    ui: &mut Ui,
+    glyph: char,
+    tint: Color32,
+    label: &str,
+    filled: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(160.0, 34.0), Sense::click());
+    let p = ui.painter();
+    if filled {
+        p.rect_filled(rect, 8.0, theme::ACCENT());
+        let w = egui::FontId::proportional(12.5);
+        p.text(
+            egui::pos2(rect.left() + 24.0, rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            theme::icon(14.0),
+            Color32::WHITE,
+        );
+        p.text(
+            egui::pos2(rect.left() + 42.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            w,
+            Color32::WHITE,
+        );
+    } else {
+        p.rect_filled(rect, 8.0, theme::BG_BTN());
+        p.rect_stroke(rect, 8.0, Stroke::new(1.0_f32, theme::BORDER_STRONG()), egui::StrokeKind::Inside);
+        p.text(
+            egui::pos2(rect.left() + 24.0, rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            theme::icon(14.0),
+            tint,
+        );
+        p.text(
+            egui::pos2(rect.left() + 42.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(12.5),
+            theme::TEXT(),
+        );
+    }
+    resp
+}
+
+/// Centered home hero: brand mark, version, quick-action buttons and a
+/// Light/Dark theme picker with live mini previews.
+fn welcome_hero(
+    app: &mut TunnelApp,
+    ui: &mut Ui,
+    ctx: &egui::Context,
+) {
+    let mark = app
+        .mark_texture
+        .get_or_insert_with(|| theme::brand_texture(ctx, 128))
+        .clone();
+    ui.vertical_centered(|ui| {
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
+            ui.add_space((ui.available_width() - 210.0) / 2.0);
+            paint_mark(ui, &mark, 46.0);
+            ui.add_space(12.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(RichText::new("Culvert").size(30.0).strong());
+                ui.label(
+                    RichText::new(format!("{} · native SSH client", version::tag()))
+                        .size(11.0)
+                        .color(theme::TEXT_FAINT()),
+                );
+            });
+        });
+        ui.add_space(18.0);
+        ui.horizontal(|ui| {
+            ui.add_space((ui.available_width() - 330.0) / 2.0);
+            if hero_button(ui, tglyph::SESSION, theme::SUCCESS(), "New session", true).clicked() {
+                app.session_editor = Some(SessionEditor::new());
+            }
+            ui.add_space(10.0);
+            if hero_button(ui, tglyph::TUNNEL, theme::INFO(), "New tunnel", false).clicked() {
+                app.tunnel_editor = Some(TunnelEditor::new_standalone());
+            }
+        });
+        ui.add_space(16.0);
+
+        // Theme picker: two mini previews of the shell chrome.
+        ui.label(
+            RichText::new("Select your favorite theme")
+                .size(11.0)
+                .color(theme::TEXT_DIM()),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space((ui.available_width() - 470.0) / 2.0);
+            let (light_active, dark_active) =
+                (!theme::is_dark(), theme::is_dark());
+            if theme_card(ui, "Light", false, light_active).clicked() {
+                if theme::is_dark() {
+                    theme::set_dark(false);
+                    theme::apply(ctx);
+                }
+            }
+            ui.add_space(14.0);
+            if theme_card(ui, "Dark", true, dark_active).clicked() {
+                if !theme::is_dark() {
+                    theme::set_dark(true);
+                    theme::apply(ctx);
+                }
+            }
+        });
+        ui.add_space(10.0);
+    });
+}
+
+/// Rounded theme preview card: a small mock of the shell chrome in the
+/// palette it selects, with the palette name beneath.
+fn theme_card(ui: &mut Ui, name: &str, dark: bool, active: bool) -> egui::Response {
+    let (bg, panel, dot, fg) = if dark {
+        (
+            Color32::from_rgb(13, 17, 23),
+            Color32::from_rgb(22, 27, 34),
+            Color32::from_rgb(63, 185, 80),
+            Color32::from_rgb(110, 118, 129),
+        )
+    } else {
+        (
+            Color32::from_rgb(255, 255, 255),
+            Color32::from_rgb(246, 248, 250),
+            Color32::from_rgb(26, 127, 55),
+            Color32::from_rgb(140, 150, 160),
+        )
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(228.0, 108.0), Sense::click());
+    let p = ui.painter();
+    let stroke = if active {
+        Stroke::new(2.0_f32, theme::ACCENT())
+    } else {
+        Stroke::new(1.0_f32, theme::BORDER())
+    };
+    p.rect_filled(rect, 10.0, bg);
+    p.rect_stroke(rect, 10.0, stroke, egui::StrokeKind::Inside);
+    // Sidebar hint
+    p.rect_filled(
+        egui::Rect::from_min_size(rect.min, egui::vec2(46.0, rect.height())),
+        0.0,
+        panel,
+    );
+    // Title-bar dots + a prompt line
+    let cy = rect.top() + 12.0;
+    for (i, c) in [(0.0, theme::DANGER()), (10.0, theme::WARNING()), (20.0, theme::SUCCESS())] {
+        p.circle_filled(egui::pos2(rect.left() + 56.0 + i, cy), 3.0, c);
+    }
+    p.rect_filled(
+        egui::Rect::from_min_size(egui::pos2(rect.left() + 12.0, rect.top() + 42.0), egui::vec2(64.0, 5.0)),
+        2.5,
+        fg,
+    );
+    p.rect_filled(
+        egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 58.0, rect.top() + 54.0),
+            egui::vec2(56.0, 5.0),
+        ),
+        2.5,
+        dot,
+    );
+    p.rect_filled(
+        egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 12.0, rect.top() + 66.0),
+            egui::vec2(90.0, 5.0),
+        ),
+        2.5,
+        fg.gamma_multiply(0.7),
+    );
+    // Name below.
+    let label = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), rect.bottom()),
+        egui::vec2(rect.width(), 20.0),
+    );
+    p.text(label.center(), egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(11.0), theme::TEXT());
+    resp
 }
 
 fn tab_chip(
