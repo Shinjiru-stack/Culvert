@@ -25,6 +25,13 @@ small, self-contained tool, out of sight and out of the way.
 
 - **Sessions sidebar** — save host, port, username and auth once; double-click
   any session to open a shell tab (right-click for edit/duplicate/delete).
+- **Full menu bar** — Terminal / Sessions / View / Tools / Macros / Help above
+  a flat tile toolbar (Session · Tunnel · Split · Activity · Theme), all wired
+  to real actions.
+- **Windows RDP pass-through** — double-click an RDP session to launch the
+  system RDP client with saved credentials seeded into Windows Credential
+  Manager; loopback targets (WSL/docker relays at `127.0.0.1`) are remapped to
+  the WSL address so mstsc actually dials them.
 - **Built-in terminal tabs** — real PTY SSH sessions with 256-colour support,
   scrollback, resize, paste and proper key encoding (Ctrl codes, arrows, F-keys).
   If a session drops you get a reconnect card instead of a dead tab.
@@ -66,7 +73,8 @@ small, self-contained tool, out of sight and out of the way.
 ## Screenshots
 
 **One double-click, one shell** — grouped sessions sidebar opens straight
-into a tabbed terminal (real PTY, full colour, scrollback):
+into a tabbed terminal (real PTY, full colour, scrollback), with the menu
+bar, tile toolbar and the session quick-bar above the shell:
 
 ![Connected shell](docs/screenshots/session-shell.png)
 
@@ -77,7 +85,8 @@ focused:
 ![File browser](docs/screenshots/filebrowser.png)
 
 **Tunnel manager** — Local, Remote and Dynamic forwards as rows with
-per-tunnel Start/Stop, auto-reconnect and port-collision guard:
+per-tunnel Start/Stop, auto-reconnect and port-collision guard (the welcome
+hero with the theme picker sits on top when no shell tab is open):
 
 ![Tunnel manager](docs/screenshots/tunnels-dark.png)
 
@@ -129,7 +138,8 @@ field before saving.
 
 Sessions (including credentials) are stored as JSON:
 
-- Windows: `%APPDATA%\culvert\sessions.json` (groups live next to it in `groups.json`)
+- Windows: `%APPDATA%\culvert\sessions.json` (groups, snippets and tunnels live
+  next to it in `groups.json`, `snippets.json` and `tunnels.json`)
 - Linux/macOS: `~/.config/culvert/sessions.json`
 
 Upgrading from an earlier build? Your sessions are imported automatically from
@@ -188,6 +198,7 @@ workflow tags and publishes that version automatically.
 | `src/log.rs` | Activity log types |
 | `build.rs` | Embeds the icon + metadata into the Windows `.exe` |
 | `assets/` | Brand icon and bundled UI fonts (Inter, JetBrains Mono) |
+| `tests/docker/` | Test servers: SSH container and an xrdp 0.10 RDP container for verifying RDP hand-off (`refresh-rdp.sh`) |
 | `.github/workflows/release.yml` | Build + release pipeline for `main` |
 
 ## License
