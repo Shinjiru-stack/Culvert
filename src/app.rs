@@ -58,6 +58,8 @@ pub struct TunnelApp {
     /// The one docked browser (sidebar Files tool), tied to the focused
     /// connected session: (session id, browser).
     docked: Option<(String, crate::filebrowser::FileBrowser)>,
+    /// One-shot CLI startup action: (session name, open file browser).
+    startup: Option<(String, bool)>,
 }
 
 enum Tab {
@@ -340,11 +342,12 @@ impl TunnelApp {
         _cc: &eframe::CreationContext<'_>,
         rt: tokio::runtime::Handle,
         logs: SharedLogs,
+        startup: Option<(String, bool)>,
     ) -> Self {
-        Self::new_inner(rt, logs)
+        Self::new_inner(rt, logs, startup)
     }
 
-    fn new_inner(rt: tokio::runtime::Handle, logs: SharedLogs) -> Self {
+    fn new_inner(rt: tokio::runtime::Handle, logs: SharedLogs, startup: Option<(String, bool)>) -> Self {
         let sessions = load_sessions();
         let groups = load_groups();
         let standalone_tunnels = load_tunnels();
@@ -373,6 +376,7 @@ impl TunnelApp {
             side_mode: SideMode::Sessions,
             sidebar_collapsed: false,
             docked: None,
+            startup,
         }
     }
 
@@ -968,6 +972,26 @@ impl eframe::App for TunnelApp {
 
 impl TunnelApp {
     pub fn ui(&mut self, ctx: &egui::Context) {
+        // One-shot CLI autostart (`--open <session>` + `--files`): open the
+        // named saved session and optionally flip the sidebar to its file
+        // browser. Runs on the first frame once sessions are loaded.
+        if let Some((name, files)) = self.startup.take() {
+            let found = self.sessions.iter().find(|s| {
+                s.name.eq_ignore_ascii_case(&name) || s.name.to_lowercase().contains(&name.to_lowercase())
+            });
+            if let Some(s) = found.cloned() {
+                self.open_session(ctx, &s.id);
+                if files {
+                    self.side_mode = SideMode::Files;
+                }
+            } else {
+                self.toast(
+                    ToastKind::Error,
+                    format!("No saved session matches \"{}\"", name),
+                );
+            }
+        }
+
         // Drain async terminal events first so this frame renders reality.
         let mut any_connecting = false;
         for tab in self.tabs.iter_mut() {
@@ -3801,7 +3825,7 @@ mod tests {
     fn demo_app() -> (TunnelApp, tokio::runtime::Runtime) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let logs: SharedLogs = Arc::new(Mutex::new(Vec::new()));
-        let mut app = TunnelApp::new_inner(rt.handle().clone(), logs);
+        let mut app = TunnelApp::new_inner(rt.handle().clone(), logs, None);
         app.sessions.push(demo_session());
         app.selected = Some(app.sessions[0].id.clone());
         (app, rt)

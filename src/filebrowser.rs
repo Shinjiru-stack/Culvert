@@ -442,9 +442,14 @@ impl FileBrowser {
                 theme::TEXT_FAINT(),
             );
         };
+        // Narrow container (docked sidebar): size/modified don't fit — show
+        // a single NAME column instead of clipped text at the panel edge.
+        let narrow = hdr.width() < 280.0;
         label(hdr.left() + 20.0, "NAME");
-        label(size_x, "SIZE");
-        label(size_x + 90.0, "MODIFIED");
+        if !narrow {
+            label(size_x, "SIZE");
+            label(size_x + 90.0, "MODIFIED");
+        }
         ui.add_space(1.0);
 
         // --- Rows ------------------------------------------------------------
@@ -844,7 +849,8 @@ enum RowAction {
     Edit(usize),
 }
 
-/// One file/dir line: icon + name (elided), size and mtime at fixed columns.
+/// One file/dir line: icon + name (elided); size and mtime appended at fixed
+/// columns when the container is wide enough (they'd clip in the sidebar).
 fn file_row(
     ui: &mut Ui,
     entry: &FbEntry,
@@ -852,6 +858,8 @@ fn file_row(
     editors: &[EditorCfg],
 ) -> Option<RowAction> {
     let mut action: Option<RowAction> = None;
+    let row_w = ui.available_width();
+    let show_cols = row_w >= 280.0;
     let fr = Frame::NONE
         .fill(if selected {
             theme::BG_CARD_SEL()
@@ -878,6 +886,9 @@ fn file_row(
     let size_x = rr.left() + rr.width() * 0.58;
     let y = rr.center().y;
     let p = ui.painter();
+    if !show_cols {
+        return action;
+    }
     if !entry.is_dir {
         p.text(
             egui::pos2(size_x, y),

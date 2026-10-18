@@ -14,6 +14,22 @@ use app::TunnelApp;
 use log::{LogEntry, LogLevel, SharedLogs};
 use std::sync::{Arc, Mutex};
 
+/// CLI: `--open <session>` opens a saved session on launch (substring match),
+/// `--files` additionally flips the sidebar to its docked file browser.
+fn parse_startup() -> Option<(String, bool)> {
+    let mut args = std::env::args().skip(1);
+    let mut open: Option<String> = None;
+    let mut files = false;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--open" => open = args.next().filter(|v| !v.starts_with("--")),
+            "--files" => files = true,
+            _ => {}
+        }
+    }
+    open.map(|name| (name, files))
+}
+
 fn main() -> eframe::Result<()> {
     // Tokio runtime lives for the whole GUI lifetime so tunnels keep forwarding
     // while the window is open.
@@ -49,7 +65,12 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(TunnelApp::new(cc, rt_handle.clone(), logs2.clone())))
+            Ok(Box::new(TunnelApp::new(
+                cc,
+                rt_handle.clone(),
+                logs2.clone(),
+                parse_startup(),
+            )))
         }),
     )
 }

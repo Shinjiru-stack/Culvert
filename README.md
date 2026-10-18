@@ -54,11 +54,26 @@ small, self-contained tool, out of sight and out of the way.
 
 ## Screenshots
 
-**Dark theme** — tunnel manager with the grouped sessions sidebar:
+**One double-click, one shell** — grouped sessions sidebar opens straight
+into a tabbed terminal (real PTY, full colour, scrollback):
+
+![Connected shell](docs/screenshots/session-shell.png)
+
+**File browser docked in the sidebar** — SFTP listing with upload, folder
+create, rename and delete; browsing follows whichever connected tab is
+focused:
+
+![File browser](docs/screenshots/filebrowser.png)
+
+**Tunnel manager** — Local, Remote and Dynamic forwards as rows with
+per-tunnel Start/Stop, auto-reconnect and port-collision guard:
+
+![Tunnel manager](docs/screenshots/tunnels-dark.png)
+
+**Light and dark themes** — one click on the *Theme* tile flips the whole
+palette (chrome, cards and terminal canvas); the choice persists:
 
 ![Dark theme](docs/screenshots/tunnels-dark.png)
-
-**Light theme** — same view, GitHub-light palette:
 
 ![Light theme](docs/screenshots/tunnels-light.png)
 
