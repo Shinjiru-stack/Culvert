@@ -12,6 +12,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const SCROLLBACK_LINES: usize = 4000;
 /// Terminal canvas: follows the light/dark palette switch.
+// Mirror the theme::ACCENT() const-style naming deliberately.
+#[allow(non_snake_case)]
 fn TERM_BG() -> Color32 {
     if theme::is_dark() {
         Color32::from_rgb(13, 17, 23) // #0D1117
@@ -19,6 +21,8 @@ fn TERM_BG() -> Color32 {
         Color32::from_rgb(255, 255, 255)
     }
 }
+/// Terminal foreground: follows the light/dark palette switch.
+#[allow(non_snake_case)]
 fn TERM_FG() -> Color32 {
     if theme::is_dark() {
         Color32::from_rgb(230, 237, 243) // #E6EDF3

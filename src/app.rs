@@ -2895,7 +2895,8 @@ impl TunnelApp {
                     RichText::new(version::tag())
                         .size(10.0)
                         .color(theme::SB_TEXT_FAINT()),
-                );
+                )
+                .on_hover_text(version::display());
                 ui.add_space(8.0);
                 if ui
                     .add(

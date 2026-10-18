@@ -1,10 +1,10 @@
 //! Build-stamped version identity, shared by the window title, sidebar brand
 //! row and status bar so every display shows the same version string.
-
-/// Semantic version from Cargo.toml (`0.3.0`).
-pub fn semver() -> &'static str {
-    env!("CARGO_PKG_VERSION")
-}
+//!
+//! The displayed version advances on every build: the patch number is the
+//! monotonic build counter (git commit count), so `v0.3.17` for commit 17,
+//! `v0.3.18` after the next commit, and so on. The static `0.3.0` in
+//! Cargo.toml is never shown verbatim again.
 
 /// Monotonic build number — increments with every new build of changed code.
 pub fn build_num() -> &'static str {
@@ -21,21 +21,24 @@ pub fn build_time() -> &'static str {
     env!("CULVERT_BUILD_TIME")
 }
 
+/// Display version string, e.g. `0.3.17` — major/minor come from Cargo.toml,
+/// patch is the per-build counter so the number never repeats a stalled
+/// `0.3.0`.
+pub fn version() -> String {
+    let sem = env!("CARGO_PKG_VERSION");
+    let mut sem = sem.split('.');
+    let major = sem.next().unwrap_or("0");
+    let minor = sem.next().unwrap_or("3");
+    format!("{}.{}.{}", major, minor, build_num())
+}
+
 /// Compact tag used in the title bar, sidebar and status bar.
-/// Changes on every build, e.g. `v0.3.0-b142`.
 pub fn tag() -> String {
-    format!("v{}-b{}", semver(), build_num())
+    format!("v{}", version())
 }
 
 /// Full identity for the About/profile dialog, e.g.
-/// `v0.3.0 (build 142 · 9d27564 · 2026-10-18 09:12 UTC)`.
+/// `v0.3.17 (9d27564 · 2026-10-18 13:05 UTC)`.
 pub fn display() -> String {
-    format!(
-        "v{} (build {} · {} · {} UTC)",
-        semver(),
-        build_num(),
-        build_commit(),
-        build_time()
-    )
+    format!("v{} ({} · {} UTC)", version(), build_commit(), build_time())
 }
-

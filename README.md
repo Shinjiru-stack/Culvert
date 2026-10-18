@@ -48,6 +48,19 @@ small, self-contained tool, out of sight and out of the way.
 - **Modern light theme** — macOS-like white chrome with an indigo accent that
   matches the app icon, a GitHub-style light terminal palette, and bundled
   Inter + JetBrains Mono type system.
+- **Light and dark themes** — one click on the *Theme* tile flips the whole
+  palette (chrome, cards, terminal canvas included); the choice persists
+  across launches.
+
+## Screenshots
+
+**Dark theme** — tunnel manager with the grouped sessions sidebar:
+
+![Dark theme](docs/screenshots/tunnels-dark.png)
+
+**Light theme** — same view, GitHub-light palette:
+
+![Light theme](docs/screenshots/tunnels-light.png)
 
 ## Download
 
