@@ -539,11 +539,12 @@ impl FileBrowser {
                 let submitted =
                     resp.lost_focus() && m.input(|i| i.key_pressed(egui::Key::Enter));
                 m.add_space(8.0);
+                let esc = m.input(|i| i.key_pressed(egui::Key::Escape));
                 m.horizontal(|ui| {
                     if ui.button("Create").clicked() || submitted {
                         clicked = Some(self.folder_name.trim().to_string());
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button("Cancel").clicked() || esc {
                         clicked = Some(String::new());
                     }
                 });
@@ -568,11 +569,12 @@ impl FileBrowser {
                 let submitted =
                     resp.lost_focus() && m.input(|i| i.key_pressed(egui::Key::Enter));
                 m.add_space(8.0);
+                let esc = m.input(|i| i.key_pressed(egui::Key::Escape));
                 m.horizontal(|ui| {
                     if ui.button("Rename").clicked() || submitted {
                         clicked = Some(self.rename_value.trim().to_string());
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button("Cancel").clicked() || esc {
                         clicked = Some(String::new());
                     }
                 });
@@ -658,18 +660,28 @@ impl FileBrowser {
                         picked = rfd::FileDialog::new().pick_file();
                     }
                 });
-                if ui
-                    .button("Add")
-                    .clicked()
-                    && !self.ed_name.trim().is_empty()
-                    && !self.ed_path.trim().is_empty()
-                {
-                    added = Some((self.ed_name.trim().to_string(), self.ed_path.trim().to_string()));
-                }
-                m.add_space(8.0);
-                if ui.button("Done").clicked() {
-                    closed = true;
-                }
+                let esc = m.input(|i| i.key_pressed(egui::Key::Escape));
+                m.horizontal(|ui| {
+                    if ui
+                        .button("Add")
+                        .clicked()
+                        && !self.ed_name.trim().is_empty()
+                        && !self.ed_path.trim().is_empty()
+                    {
+                        added = Some((self.ed_name.trim().to_string(), self.ed_path.trim().to_string()));
+                    }
+                    if ui.button("Done").clicked() {
+                        closed = true;
+                    }
+                    if ui
+                        .button("✕")
+                        .on_hover_text("Close without saving")
+                        .clicked()
+                        || esc
+                    {
+                        closed = true;
+                    }
+                });
             });
             if let Some(p) = picked {
                 self.ed_path = p.display().to_string();
@@ -886,25 +898,24 @@ fn file_row(
     let size_x = rr.left() + rr.width() * 0.58;
     let y = rr.center().y;
     let p = ui.painter();
-    if !show_cols {
-        return action;
-    }
-    if !entry.is_dir {
+    if show_cols {
+        if !entry.is_dir {
+            p.text(
+                egui::pos2(size_x, y),
+                Align2::LEFT_CENTER,
+                human_size(entry.size),
+                FontId::proportional(10.5),
+                theme::TEXT_DIM(),
+            );
+        }
         p.text(
-            egui::pos2(size_x, y),
+            egui::pos2(size_x + 90.0, y),
             Align2::LEFT_CENTER,
-            human_size(entry.size),
+            mtime_label(entry.mtime),
             FontId::proportional(10.5),
-            theme::TEXT_DIM(),
+            theme::TEXT_FAINT(),
         );
     }
-    p.text(
-        egui::pos2(size_x + 90.0, y),
-        Align2::LEFT_CENTER,
-        mtime_label(entry.mtime),
-        FontId::proportional(10.5),
-        theme::TEXT_FAINT(),
-    );
 
     let resp = fr.response.interact(Sense::click());
     if resp.clicked() {
