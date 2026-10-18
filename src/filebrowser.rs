@@ -333,13 +333,17 @@ impl FileBrowser {
 
         // --- Toolbar -------------------------------------------------------
         Frame::NONE
-            .fill(theme::BG_CARD)
+            .fill(theme::BG_CARD())
             .corner_radius(CornerRadius::same(10))
-            .stroke(Stroke::new(1.0_f32, theme::BORDER))
+            .stroke(Stroke::new(1.0_f32, theme::BORDER()))
             .inner_margin(Margin::symmetric(8, 5))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
+                // horizontal_wrapped: in the narrow sidebar the trailing
+                // buttons wrap to a second row instead of inflating the
+                // panel's min-rect (which used to smear the layout).
+                ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spacing_mut().item_spacing.y = 4.0;
                     if ui
                         .button(RichText::new("↑").size(12.0))
                         .on_hover_text("Parent folder")
@@ -356,7 +360,7 @@ impl FileBrowser {
                     }
                     let path_resp = ui.add(
                         egui::TextEdit::singleline(&mut self.path_edit)
-                            .desired_width(ui.available_width() - 260.0)
+                            .desired_width(96.0f32.max(ui.available_width() - 250.0))
                             .font(FontId::monospace(11.5))
                             .margin(egui::vec2(6.0, 4.0)),
                     );
@@ -400,7 +404,7 @@ impl FileBrowser {
                     }
                     if self.selected.is_some() {
                         if ui
-                            .button(RichText::new("Delete").size(10.5).color(theme::DANGER))
+                            .button(RichText::new("Delete").size(10.5).color(theme::DANGER()))
                             .on_hover_text("Delete the selected entry")
                             .clicked()
                         {
@@ -435,7 +439,7 @@ impl FileBrowser {
                 Align2::LEFT_CENTER,
                 text,
                 FontId::proportional(9.5),
-                theme::TEXT_FAINT,
+                theme::TEXT_FAINT(),
             );
         };
         label(hdr.left() + 20.0, "NAME");
@@ -489,15 +493,15 @@ impl FileBrowser {
 
         // --- Status strip ------------------------------------------------------
         let (icon, color, text) = if self.busy.is_some() {
-            ("○", theme::TEXT_DIM, self.busy.clone().unwrap_or_default())
+            ("○", theme::TEXT_DIM(), self.busy.clone().unwrap_or_default())
         } else {
             match &self.last_status {
                 Some((ok, m)) => (
                     if *ok { "✓" } else { "!" },
-                    if *ok { theme::SUCCESS } else { theme::DANGER },
+                    if *ok { theme::SUCCESS() } else { theme::DANGER() },
                     m.clone(),
                 ),
-                None => ("", theme::TEXT_FAINT, String::new()),
+                None => ("", theme::TEXT_FAINT(), String::new()),
             }
         };
         if !text.is_empty() {
@@ -512,7 +516,7 @@ impl FileBrowser {
                     "Double-click a folder to open it, a file to download; right-click for more.",
                 )
                 .size(10.0)
-                .color(theme::TEXT_FAINT),
+                .color(theme::TEXT_FAINT()),
             );
         }
 
@@ -601,14 +605,14 @@ impl FileBrowser {
                          re-uploaded automatically when the editor exits.",
                     )
                     .size(10.0)
-                    .color(theme::TEXT_FAINT),
+                    .color(theme::TEXT_FAINT()),
                 );
                 m.add_space(6.0);
                 if editors.is_empty() {
                     m.label(
                         RichText::new("No editors configured yet — add one below.")
                             .size(11.0)
-                            .color(theme::TEXT_DIM),
+                            .color(theme::TEXT_DIM()),
                     );
                 }
                 for (i, e) in editors.iter().enumerate() {
@@ -616,7 +620,7 @@ impl FileBrowser {
                         ui.label(RichText::new(&e.name).size(12.0));
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&e.path).size(9.0).color(theme::TEXT_FAINT),
+                                RichText::new(&e.path).size(9.0).color(theme::TEXT_FAINT()),
                             )
                             .truncate(),
                         );
@@ -629,7 +633,7 @@ impl FileBrowser {
                 }
                 m.add_space(6.0);
                 m.separator();
-                m.label(RichText::new("Add editor").size(11.0).color(theme::TEXT_FAINT));
+                m.label(RichText::new("Add editor").size(11.0).color(theme::TEXT_FAINT()));
                 m.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.ed_name)
@@ -775,17 +779,17 @@ impl FileBrowser {
                 Align2::CENTER_CENTER,
                 format!("Opening SFTP on {} …", self.session.connection_label()),
                 FontId::proportional(11.5),
-                theme::TEXT_DIM,
+                theme::TEXT_DIM(),
             );
         } else if let FbStatus::Failed(reason) = self.status.clone() {
             ui.painter()
                 .rect_filled(rect.shrink(1.0), 0.0, Color32::from_black_alpha(120));
             let card = egui::Rect::from_center_size(rect.center(), egui::vec2(430.0, 150.0));
-            ui.painter().rect_filled(card, 12.0, theme::BG_CARD);
+            ui.painter().rect_filled(card, 12.0, theme::BG_CARD());
             ui.painter().rect_stroke(
                 card,
                 12.0,
-                Stroke::new(1.0_f32, theme::BORDER_STRONG),
+                Stroke::new(1.0_f32, theme::BORDER_STRONG()),
                 egui::StrokeKind::Inside,
             );
             ui.painter().text(
@@ -793,7 +797,7 @@ impl FileBrowser {
                 Align2::CENTER_CENTER,
                 "File browser failed",
                 FontId::proportional(14.0),
-                theme::TEXT,
+                theme::TEXT(),
             );
             let reason_rect = egui::Rect::from_min_size(
                 card.min + egui::vec2(28.0, card.height() * 0.34),
@@ -803,7 +807,7 @@ impl FileBrowser {
             child.vertical_centered(|ui| {
                 ui.add(
                     egui::Label::new(
-                        RichText::new(reason.clone()).size(11.5).color(theme::TEXT_DIM),
+                        RichText::new(reason.clone()).size(11.5).color(theme::TEXT_DIM()),
                     )
                     .wrap(),
                 );
@@ -850,7 +854,7 @@ fn file_row(
     let mut action: Option<RowAction> = None;
     let fr = Frame::NONE
         .fill(if selected {
-            theme::BG_CARD_SEL
+            theme::BG_CARD_SEL()
         } else {
             Color32::TRANSPARENT
         })
@@ -865,7 +869,7 @@ fn file_row(
                     Align2::CENTER_CENTER,
                     if entry.is_dir { "▸" } else { "·" },
                     FontId::proportional(11.0),
-                    if entry.is_dir { theme::INFO } else { theme::TEXT_FAINT },
+                    if entry.is_dir { theme::INFO() } else { theme::TEXT_FAINT() },
                 );
                 ui.add(egui::Label::new(RichText::new(&entry.name).size(12.0)).truncate());
             });
@@ -880,7 +884,7 @@ fn file_row(
             Align2::LEFT_CENTER,
             human_size(entry.size),
             FontId::proportional(10.5),
-            theme::TEXT_DIM,
+            theme::TEXT_DIM(),
         );
     }
     p.text(
@@ -888,7 +892,7 @@ fn file_row(
         Align2::LEFT_CENTER,
         mtime_label(entry.mtime),
         FontId::proportional(10.5),
-        theme::TEXT_FAINT,
+        theme::TEXT_FAINT(),
     );
 
     let resp = fr.response.interact(Sense::click());

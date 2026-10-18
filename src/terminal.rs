@@ -11,9 +11,21 @@ use russh::ChannelMsg;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const SCROLLBACK_LINES: usize = 4000;
-/// Light terminal canvas (GitHub-style light): white paper, dark text.
-const TERM_BG: Color32 = Color32::from_rgb(255, 255, 255);
-const TERM_FG: Color32 = Color32::from_rgb(31, 35, 40);
+/// Terminal canvas: follows the light/dark palette switch.
+fn TERM_BG() -> Color32 {
+    if theme::is_dark() {
+        Color32::from_rgb(13, 17, 23) // #0D1117
+    } else {
+        Color32::from_rgb(255, 255, 255)
+    }
+}
+fn TERM_FG() -> Color32 {
+    if theme::is_dark() {
+        Color32::from_rgb(230, 237, 243) // #E6EDF3
+    } else {
+        Color32::from_rgb(31, 35, 40)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Messages between UI thread and the async shell task
@@ -172,14 +184,14 @@ impl TerminalSession {
     /// Session-window header strip with connection state.
     fn session_strip(&mut self, ui: &mut egui::Ui, strip: Rect) {
         let painter = ui.painter_at(strip);
-        painter.rect_filled(strip, 0.0, theme::BG_PANEL);
+        painter.rect_filled(strip, 0.0, theme::BG_PANEL());
         // Hairline under the strip.
         painter.line_segment(
             [
                 egui::pos2(strip.left(), strip.bottom() - 0.5),
                 egui::pos2(strip.right(), strip.bottom() - 0.5),
             ],
-            Stroke::new(0.5_f32, theme::BORDER),
+            Stroke::new(0.5_f32, theme::BORDER()),
         );
 
         let cy = strip.center().y;
@@ -188,13 +200,13 @@ impl TerminalSession {
             egui::pos2(strip.left() + 10.0, cy - 7.0),
             egui::vec2(3.0, 14.0),
         );
-        painter.rect_filled(bar, 1.5, theme::ACCENT);
+        painter.rect_filled(bar, 1.5, theme::ACCENT());
         painter.text(
             egui::pos2(bar.right() + 8.0, cy),
             Align2::LEFT_CENTER,
             &self.title,
             FontId::proportional(12.0),
-            theme::TEXT,
+            theme::TEXT(),
         );
         // Right side: connection label, quiet.
         painter.text(
@@ -202,13 +214,13 @@ impl TerminalSession {
             Align2::RIGHT_CENTER,
             self.connection_label(),
             FontId::proportional(10.0),
-            theme::TEXT_FAINT,
+            theme::TEXT_FAINT(),
         );
     }
 
     fn shell_body(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, TERM_BG);
+        painter.rect_filled(rect, 0.0, TERM_BG());
 
         let font_id = FontId::new(12.0, FontFamily::Monospace);
         let (cell_w, cell_h) = ui.fonts(|f| {
@@ -303,17 +315,17 @@ impl TerminalSession {
                     egui::Align2::CENTER_CENTER,
                     format!("Connecting to {} …", self.connection_label()),
                     FontId::proportional(11.5),
-                    theme::TEXT_DIM,
+                    theme::TEXT_DIM(),
                 );
             }
             TermStatus::Closed(reason) => {
                 painter.rect_filled(rect.shrink(1.0), 0.0, Color32::from_black_alpha(120));
                 let card = Rect::from_center_size(rect.center(), egui::vec2(430.0, 150.0));
-                painter.rect_filled(card, 12.0, theme::BG_CARD);
+                painter.rect_filled(card, 12.0, theme::BG_CARD());
                 painter.rect_stroke(
                     card,
                     12.0,
-                    Stroke::new(1.0_f32, theme::BORDER_STRONG),
+                    Stroke::new(1.0_f32, theme::BORDER_STRONG()),
                     StrokeKind::Inside,
                 );
                 painter.text(
@@ -321,7 +333,7 @@ impl TerminalSession {
                     egui::Align2::CENTER_CENTER,
                     "Disconnected",
                     FontId::proportional(14.0),
-                    theme::TEXT,
+                    theme::TEXT(),
                 );
                 // Reason: real wrapped label so long OS errors stay inside
                 // the card instead of spilling over its edges.
@@ -335,7 +347,7 @@ impl TerminalSession {
                         egui::Label::new(
                             RichText::new(reason.clone())
                                 .size(11.5)
-                                .color(theme::TEXT_DIM),
+                                .color(theme::TEXT_DIM()),
                         )
                         .wrap(),
                     );
@@ -381,7 +393,7 @@ impl TerminalSession {
             job.wrap.max_width = f32::INFINITY;
             // current run
             let mut run = String::new();
-            let mut run_fg = TERM_FG;
+            let mut run_fg = TERM_FG();
             let mut run_underline = false;
 
             let flush = |job: &mut egui::text::LayoutJob,
@@ -413,8 +425,8 @@ impl TerminalSession {
                         }
                         let t = c.contents();
                         let t = if t.is_empty() { " " } else { t };
-                        let mut fg = map_color(c.fgcolor(), TERM_FG, c.bold());
-                        let mut bg = map_color(c.bgcolor(), TERM_BG, false);
+                        let mut fg = map_color(c.fgcolor(), TERM_FG(), c.bold());
+                        let mut bg = map_color(c.bgcolor(), TERM_BG(), false);
                         if c.dim() {
                             fg = fg.gamma_multiply(0.72);
                         }
@@ -423,9 +435,9 @@ impl TerminalSession {
                         }
                         (t, fg, bg, c.underline())
                     }
-                    None => (" ", TERM_FG, TERM_BG, false),
+                    None => (" ", TERM_FG(), TERM_BG(), false),
                 };
-                if bg != TERM_BG {
+                if bg != TERM_BG() {
                     painter.rect_filled(
                         Rect::from_min_size(egui::pos2(x, y), egui::vec2(cell_w, cell_h)),
                         0.0,
@@ -443,7 +455,7 @@ impl TerminalSession {
 
             if !job.sections.is_empty() {
                 let galley = ui.fonts(|f| f.layout_job(job));
-                painter.galley(egui::pos2(inner.left(), y), galley, TERM_FG);
+                painter.galley(egui::pos2(inner.left(), y), galley, TERM_FG());
             }
         }
 
@@ -467,7 +479,7 @@ impl TerminalSession {
                 painter.rect_stroke(
                     crect,
                     1.0,
-                    Stroke::new(1.0_f32, theme::TEXT_FAINT),
+                    Stroke::new(1.0_f32, theme::TEXT_FAINT()),
                     StrokeKind::Inside,
                 );
             }
@@ -480,7 +492,7 @@ impl TerminalSession {
                 egui::Align2::RIGHT_TOP,
                 format!("↑ {scrollback} lines — press any key to return"),
                 FontId::proportional(10.0),
-                theme::TEXT_FAINT,
+                theme::TEXT_FAINT(),
             );
         }
     }
@@ -735,7 +747,7 @@ fn key_char(key: &egui::Key) -> Option<char> {
 fn map_color(c: vt100::Color, default: Color32, bold: bool) -> Color32 {
     match c {
         vt100::Color::Default => {
-            if bold && default == TERM_FG {
+            if bold && default == TERM_FG() {
                 Color32::from_rgb(10, 13, 17)
             } else {
                 default

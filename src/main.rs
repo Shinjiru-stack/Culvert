@@ -8,6 +8,7 @@ mod ssh;
 mod terminal;
 mod theme;
 mod tunnel;
+mod version;
 
 use app::TunnelApp;
 use log::{LogEntry, LogLevel, SharedLogs};
@@ -36,7 +37,7 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1300.0, 840.0])
             .with_min_inner_size([1020.0, 660.0])
-            .with_title("Culvert")
+            .with_title(format!("Culvert {}", version::tag()))
             .with_app_id("culvert")
             .with_icon(Arc::new(theme::app_icon(256))),
         ..Default::default()
