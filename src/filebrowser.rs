@@ -12,7 +12,10 @@ use eframe::egui::{
 };
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
 
 // ---------------------------------------------------------------------------
 // Model
@@ -54,11 +57,101 @@ enum FbEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Local editors (like WinSCP's editor menu): download → open → re-upload
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EditorCfg {
+    pub name: String,
+    pub path: String,
+}
+
+pub type SharedEditors = Arc<RwLock<Vec<EditorCfg>>>;
+
+fn editors_json_path() -> std::path::PathBuf {
+    let mut p = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    p = p.join("culvert");
+    p.join("editors.json")
+}
+
+fn save_editors(list: &[EditorCfg]) {
+    let path = editors_json_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(list) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// Detect a handful of well-known editors for the first-run default list.
+/// Everything else is user-added with an arbitrary executable path.
+fn default_editors() -> Vec<EditorCfg> {
+    let mut out = Vec::new();
+    let notepad = std::path::PathBuf::from(r"C:\Windows\notepad.exe");
+    if notepad.exists() {
+        out.push(EditorCfg {
+            name: "Notepad".into(),
+            path: notepad.display().to_string(),
+        });
+    }
+    // First VS Code found wins: system install, then per-user install.
+    let code_paths = [
+        r"C:\Program Files\Microsoft VS Code\Code.exe",
+        &format!(
+            "{}\\Programs\\Microsoft VS Code\\Code.exe",
+            std::env::var_os("LOCALAPPDATA")
+                .map(|s| s.display().to_string())
+                .unwrap_or_default()
+        ),
+    ];
+    for path in code_paths {
+        if std::path::Path::new(path).exists() {
+            out.push(EditorCfg {
+                name: "VS Code".into(),
+                path: path.to_string(),
+            });
+            break;
+        }
+    }
+    let npp = r"C:\Program Files\Notepad++\notepad++.exe";
+    if std::path::Path::new(npp).exists() {
+        out.push(EditorCfg {
+            name: "Notepad++".into(),
+            path: npp.to_string(),
+        });
+    }
+    out
+}
+
+/// Load the user's editor list once at startup.
+pub fn load_editors() -> SharedEditors {
+    let path = editors_json_path();
+    let list = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<EditorCfg>>(&raw).ok())
+        .unwrap_or_else(default_editors);
+    Arc::new(RwLock::new(list))
+}
+
+/// An in-flight "download, open in editor, re-upload on close" job.
+struct EditJob {
+    /// Base file name, for the status note.
+    file: String,
+    editor: String,
+    /// Remote absolute path to re-upload to.
+    remote: String,
+    local: std::path::PathBuf,
+    child: std::process::Child,
+}
+
+// ---------------------------------------------------------------------------
 // Tab session
 // ---------------------------------------------------------------------------
 
 pub struct FileBrowser {
-    pub session_id: String,
     pub title: String,
     pub status: FbStatus,
     entries: Vec<FbEntry>,
@@ -76,6 +169,16 @@ pub struct FileBrowser {
     rename_value: String,
     /// Set by the error overlay; app.rs closes the tab after drawing.
     pub want_close: bool,
+    /// User-configured local editors (shared across all browsers/tabs).
+    editors: SharedEditors,
+    /// "Local editors" settings modal + its input fields / active slot.
+    editors_modal: bool,
+    ed_name: String,
+    ed_path: String,
+    /// Download that precedes an editor launch: (remote, local, editor name/path).
+    pending_edit: Option<(String, std::path::PathBuf, String, String)>,
+    /// Editor is open on a local copy; re-uploaded when the process exits.
+    edit_job: Option<EditJob>,
     cmd_tx: UnboundedSender<FbCmd>,
     evt_rx: UnboundedReceiver<FbEvent>,
     rt: tokio::runtime::Handle,
@@ -89,12 +192,12 @@ impl FileBrowser {
         ctx: &egui::Context,
         rt: tokio::runtime::Handle,
         logs: SharedLogs,
+        editors: SharedEditors,
         session: SshSession,
     ) -> Self {
         let (cmd_tx, _) = unbounded_channel::<FbCmd>();
         let (_, evt_rx) = unbounded_channel::<FbEvent>();
         let mut me = Self {
-            session_id: session.id.clone(),
             title: session.name.clone(),
             status: FbStatus::Connecting,
             entries: Vec::new(),
@@ -108,6 +211,12 @@ impl FileBrowser {
             rename_modal: None,
             rename_value: String::new(),
             want_close: false,
+            editors,
+            editors_modal: false,
+            ed_name: String::new(),
+            ed_path: String::new(),
+            pending_edit: None,
+            edit_job: None,
             cmd_tx,
             evt_rx,
             rt,
@@ -117,6 +226,11 @@ impl FileBrowser {
         };
         me.start_task();
         me
+    }
+
+    /// Current SFTP connection state, for the session-tab switcher dot.
+    pub fn status(&self) -> &FbStatus {
+        &self.status
     }
 
     fn start_task(&mut self) {
@@ -172,6 +286,13 @@ impl FileBrowser {
                 }
                 FbEvent::Done(msg) => {
                     self.busy = None;
+                    // An edit-download finished: open the local copy in the
+                    // chosen editor and start watching its process.
+                    if let Some((remote, local, ed_name, ed_path)) = self.pending_edit.take() {
+                        if msg.contains(local.display().to_string().as_str()) {
+                            self.launch_editor(remote, local, ed_name, ed_path);
+                        }
+                    }
                     self.last_status = Some((true, msg));
                     changed = true;
                 }
@@ -184,6 +305,22 @@ impl FileBrowser {
                     self.status = FbStatus::Failed(msg);
                     changed = true;
                 }
+            }
+        }
+        // Editor process ended → push the local copy back to the server
+        // (WinSCP-style "edit and upload on close").
+        if let Some(job) = &mut self.edit_job {
+            if let Ok(Some(_)) = job.child.try_wait() {
+                let (file, editor, remote, local) = (
+                    job.file.clone(),
+                    job.editor.clone(),
+                    job.remote.clone(),
+                    job.local.display().to_string(),
+                );
+                self.edit_job = None;
+                self.send(FbCmd::Upload { remote, local });
+                self.busy = Some(format!("Editing of {file} closed ({editor}) — re-uploading…"));
+                changed = true;
             }
         }
         changed
@@ -241,6 +378,13 @@ impl FileBrowser {
                     {
                         self.folder_modal = true;
                         self.folder_name.clear();
+                    }
+                    if ui
+                        .button(RichText::new("✎").size(12.0))
+                        .on_hover_text("Local editors…")
+                        .clicked()
+                    {
+                        self.editors_modal = true;
                     }
                     if ui
                         .button(RichText::new("Upload").size(10.5))
@@ -308,9 +452,14 @@ impl FileBrowser {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let entries = self.entries.clone();
             let cwd = self.cwd.clone();
+            let editors = self
+                .editors
+                .read()
+                .map(|v| v.clone())
+                .unwrap_or_default();
             for entry in entries {
                 let sel = self.selected.as_deref() == Some(entry.name.as_str());
-                let action = file_row(ui, &entry, sel);
+                let action = file_row(ui, &entry, sel, &editors);
                 match action {
                     Some(RowAction::Select) => self.selected = Some(entry.name.clone()),
                     Some(RowAction::Open) if entry.is_dir => {
@@ -333,6 +482,9 @@ impl FileBrowser {
                             is_dir: entry.is_dir,
                         });
                         self.busy = Some("Deleting…".to_string());
+                    }
+                    Some(RowAction::Edit(i)) if !entry.is_dir => {
+                        self.start_edit(&cwd, &entry.name, i);
                     }
                     _ => {}
                 }
@@ -433,6 +585,107 @@ impl FileBrowser {
                 }
             }
         }
+
+        // --- Local editors modal -----------------------------------------------
+        if self.editors_modal {
+            let mut editors = self
+                .editors
+                .read()
+                .map(|v| v.clone())
+                .unwrap_or_default();
+            let mut closed = false;
+            let mut removed: Option<usize> = None;
+            let mut added: Option<(String, String)> = None;
+            let mut picked: Option<std::path::PathBuf> = None;
+            egui::Modal::new(egui::Id::new("fb_editors")).show(&self.ctx, |m| {
+                m.label(RichText::new("Local editors").size(14.0).strong());
+                m.label(
+                    RichText::new(
+                        "Used by the right-click “Open with” menu. A remote file is\n\
+                         downloaded to a temp copy, opened in the editor, and\n\
+                         re-uploaded automatically when the editor exits.",
+                    )
+                    .size(10.0)
+                    .color(theme::TEXT_FAINT),
+                );
+                m.add_space(6.0);
+                if editors.is_empty() {
+                    m.label(
+                        RichText::new("No editors configured yet — add one below.")
+                            .size(11.0)
+                            .color(theme::TEXT_DIM),
+                    );
+                }
+                for (i, e) in editors.iter().enumerate() {
+                    m.horizontal(|ui| {
+                        ui.label(RichText::new(&e.name).size(12.0));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&e.path).size(9.0).color(theme::TEXT_FAINT),
+                            )
+                            .truncate(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Remove").clicked() {
+                                removed = Some(i);
+                            }
+                        });
+                    });
+                }
+                m.add_space(6.0);
+                m.separator();
+                m.label(RichText::new("Add editor").size(11.0).color(theme::TEXT_FAINT));
+                m.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ed_name)
+                            .desired_width(90.0)
+                            .hint_text("name"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ed_path)
+                            .desired_width(230.0)
+                            .hint_text(r"C:\path\to\editor.exe"),
+                    );
+                    if ui
+                        .small_button("…")
+                        .on_hover_text("Browse for the executable")
+                        .clicked()
+                    {
+                        picked = rfd::FileDialog::new().pick_file();
+                    }
+                });
+                if ui
+                    .button("Add")
+                    .clicked()
+                    && !self.ed_name.trim().is_empty()
+                    && !self.ed_path.trim().is_empty()
+                {
+                    added = Some((self.ed_name.trim().to_string(), self.ed_path.trim().to_string()));
+                }
+                m.add_space(8.0);
+                if ui.button("Done").clicked() {
+                    closed = true;
+                }
+            });
+            if let Some(p) = picked {
+                self.ed_path = p.display().to_string();
+            }
+            if let Some(i) = removed {
+                editors.remove(i);
+            }
+            if let Some((name, path)) = added {
+                editors.push(EditorCfg { name, path });
+                self.ed_name.clear();
+                self.ed_path.clear();
+            }
+            if closed {
+                self.editors_modal = false;
+                if let Ok(mut w) = self.editors.write() {
+                    *w = editors.clone();
+                }
+                save_editors(&editors);
+            }
+        }
     }
 
     fn start_download(&mut self, cwd: &str, name: &str, note: &str) {
@@ -442,6 +695,77 @@ impl FileBrowser {
                 local: local.display().to_string(),
             });
             self.busy = Some(note.to_string());
+        }
+    }
+
+    /// WinSCP-style local edit: download to a temp copy, open it in the
+    /// selected local editor, and re-upload automatically when that
+    /// editor process exits.
+    fn start_edit(&mut self, cwd: &str, file_name: &str, editor_idx: usize) {
+        let editors = self
+            .editors
+            .read()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        let Some(e) = editors.get(editor_idx) else {
+            return;
+        };
+        let (ed_name, ed_path) = (e.name.clone(), e.path.clone());
+        let remote = path_join(cwd, file_name);
+        let mut local = std::env::temp_dir();
+        local.push(format!(
+            "culvert-edit-{}-{}",
+            std::process::id(),
+            base_name(&remote)
+        ));
+        self.send(FbCmd::Download {
+            remote: remote.clone(),
+            local: local.display().to_string(),
+        });
+        self.pending_edit = Some((remote, local, ed_name, ed_path));
+        self.busy = Some("Downloading for edit…".to_string());
+    }
+
+    fn launch_editor(
+        &mut self,
+        remote: String,
+        local: std::path::PathBuf,
+        ed_name: String,
+        ed_path: String,
+    ) {
+        let mut cmd = if ed_path.to_ascii_lowercase().ends_with(".cmd")
+            || ed_path.to_ascii_lowercase().ends_with(".bat")
+        {
+            // .cmd/.bat wrappers (VS Code installer alias, …) need cmd.exe.
+            let mut c = std::process::Command::new("cmd");
+            c.arg("/C").arg(&ed_path);
+            c
+        } else {
+            std::process::Command::new(&ed_path)
+        };
+        cmd.arg(&local);
+        match cmd.spawn() {
+            Ok(child) => {
+                let file = base_name(&remote);
+                self.edit_job = Some(EditJob {
+                    file: file.clone(),
+                    editor: ed_name.clone(),
+                    remote,
+                    local,
+                    child,
+                });
+                push_log(
+                    &self.logs,
+                    LogEntry::new(
+                        LogLevel::Info,
+                        &self.title,
+                        &format!("Opened {file} in {ed_name}"),
+                    ),
+                );
+            }
+            Err(e) => {
+                self.last_status = Some((false, format!("Cannot start {ed_name}: {e}")));
+            }
         }
     }
 
@@ -518,10 +842,16 @@ enum RowAction {
     Download,
     Rename,
     Delete,
+    Edit(usize),
 }
 
 /// One file/dir line: icon + name (elided), size and mtime at fixed columns.
-fn file_row(ui: &mut Ui, entry: &FbEntry, selected: bool) -> Option<RowAction> {
+fn file_row(
+    ui: &mut Ui,
+    entry: &FbEntry,
+    selected: bool,
+    editors: &[EditorCfg],
+) -> Option<RowAction> {
     let mut action: Option<RowAction> = None;
     let fr = Frame::NONE
         .fill(if selected {
@@ -578,9 +908,22 @@ fn file_row(ui: &mut Ui, entry: &FbEntry, selected: bool) -> Option<RowAction> {
             action = Some(RowAction::Open);
             ui.close();
         }
-        if !entry.is_dir && ui.button("Download…").clicked() {
-            action = Some(RowAction::Download);
-            ui.close();
+        if !entry.is_dir {
+            for (i, e) in editors.iter().enumerate() {
+                let label = if e.name.is_empty() {
+                    format!("Open with editor {}", i + 1)
+                } else {
+                    format!("Open with {}", e.name)
+                };
+                if ui.button(label).clicked() {
+                    action = Some(RowAction::Edit(i));
+                    ui.close();
+                }
+            }
+            if ui.button("Download…").clicked() {
+                action = Some(RowAction::Download);
+                ui.close();
+            }
         }
         if ui.button("Rename…").clicked() {
             action = Some(RowAction::Rename);
@@ -900,5 +1243,49 @@ mod tests {
         assert_eq!(human_size(1023), "1023 B");
         assert_eq!(human_size(1024 * 3), "3.0 KB");
         assert_eq!(human_size(1024 * 1024 * 5), "5.0 MB");
+    }
+
+    // Temporary live probe against the docker test server. Ignored by
+    // default: run with `cargo test -- --ignored --nocapture sftp_probe`.
+    #[test]
+    #[ignore = "needs the local docker ssh test server on 127.0.0.1:2222"]
+    fn sftp_probe() {
+        use crate::session::{AuthType, SshSession};
+        use crate::ssh;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let session = SshSession {
+                name: "probe".into(),
+                host: "127.0.0.1".into(),
+                port: 2222,
+                username: "linuxio".into(),
+                auth_type: AuthType::Password,
+                password: "test123".into(),
+                ..SshSession::default()
+            };
+            let logs: SharedLogs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (ftx, _frx) = tokio::sync::mpsc::unbounded_channel();
+            println!("stage 1: ssh::connect");
+            let handle = ssh::connect(&session, logs, ftx)
+                .await
+                .expect("connect failed");
+            println!("stage 2: channel_open_session");
+            let ch = handle.channel_open_session().await.expect("no channel");
+            println!("stage 3: request_subsystem sftp");
+            ch.request_subsystem(true, "sftp").await.expect("no sftp");
+            println!("stage 4: SftpSession::new");
+            let sftp = SftpSession::new(ch.into_stream()).await.expect("sftp init");
+            println!("stage 5: canonicalize");
+            let cwd = sftp.canonicalize(".").await.expect("canonicalize");
+            println!("home = {cwd:?}");
+            println!("stage 6: read_dir");
+            let mut entries = sftp.read_dir(&cwd).await.expect("read_dir");
+            for _ in 0..10 {
+                let Some(e) = entries.next() else { break };
+                println!("- {:?} {:?}", e.file_name(), e.file_type());
+            }
+            println!("ALL_STAGES_OK");
+        });
     }
 }

@@ -9,7 +9,7 @@ use crate::session::{
     load_groups, load_sessions, load_tunnels, save_groups, save_sessions, save_tunnels, AuthType,
     ForwardType, PortForward, Protocol, SessionGroup, SshSession, StandaloneTunnel,
 };
-use crate::terminal::{TermStatus, TerminalSession};
+use crate::terminal::{SessionView, TermStatus, TerminalSession};
 use crate::theme;
 use crate::tunnel::{forward_key, TunnelManager};
 use eframe::egui::{
@@ -48,12 +48,19 @@ pub struct TunnelApp {
     split_view: bool,
     now: f64,
     mark_texture: Option<egui::TextureHandle>,
+    /// User-configured local editors shared by every files pane.
+    editors: crate::filebrowser::SharedEditors,
+    /// Sidebar tool: saved-session list or docked server file browser.
+    side_mode: SideMode,
+    /// The one docked browser (sidebar Files tool), tied to the focused
+    /// connected session: (session id, browser).
+    docked: Option<(String, crate::filebrowser::FileBrowser)>,
 }
 
 enum Tab {
     Tunnels,
+    /// Session window: shell + SFTP files pane behind a Shell | Files switcher.
     Terminal(Box<TerminalSession>),
-    Files(Box<crate::filebrowser::FileBrowser>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -266,8 +273,11 @@ enum Confirm {
 #[derive(Clone, PartialEq)]
 enum CardAction {
     Select,
+    /// Default connect: session window landing on the files browser.
     Connect,
-    /// WinSCP-style SFTP file browser over the session (SSH only).
+    /// Explicit shell request from the context menu.
+    OpenShell,
+    /// SFTP files pane of the session window (SSH only).
     BrowseFiles,
     Edit,
     Duplicate,
@@ -309,6 +319,15 @@ enum TabMenu {
     CloseAll,
 }
 
+/// Left-sidebar tools, MobaXterm-style: the compact bar shows saved sessions
+/// by default and can flip to a docked file browser for the focused server
+/// (clicking a session card focuses it; an open session tab wins).
+#[derive(Clone, Copy, PartialEq)]
+enum SideMode {
+    Sessions,
+    Files,
+}
+
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
@@ -347,6 +366,9 @@ impl TunnelApp {
             group_editor: None,
             now: 0.0,
             mark_texture: None,
+            editors: crate::filebrowser::load_editors(),
+            side_mode: SideMode::Sessions,
+            docked: None,
         }
     }
 
@@ -361,50 +383,74 @@ impl TunnelApp {
     fn find_tab_for_session(&self, session_id: &str) -> Option<usize> {
         self.tabs.iter().position(|t| match t {
             Tab::Terminal(term) => term.session_id == session_id,
-            Tab::Files(files) => files.session_id == session_id,
             Tab::Tunnels => false,
         })
     }
 
-    /// WinSCP-style SFTP browser tab over the session's SSH credentials.
-    /// One browser per session; double-clicking the card again focuses it.
-    fn open_file_browser(&mut self, _ctx: &egui::Context, session_id: &str) {
-        if let Some(i) = self.find_tab_for_session(session_id) {
-            self.active = i;
-            return;
+    /// Which session the docked sidebar browser should show: ONLY a session
+    /// the user actually connected (an open session tab, focused one wins) —
+    /// sidebar selection alone never spawns a browser.
+    fn focused_file_session_id(&self) -> Option<String> {
+        match self.tabs.get(self.active) {
+            Some(Tab::Terminal(t)) => Some(t.session_id.clone()),
+            _ => None,
         }
-        let Some(session) = self
-            .sessions
-            .iter()
-            .find(|s| s.id == session_id)
-            .cloned()
-        else {
-            return;
-        };
-        if session.protocol == Protocol::Rdp {
-            self.toast(
-                ToastKind::Info,
-                "SFTP runs over SSH — RDP sessions have no file browser",
-            );
-            return;
-        }
-        if session.host.trim().is_empty() {
-            self.toast(ToastKind::Info, "Save this session with a host first");
-            return;
-        }
-        let fb = crate::filebrowser::FileBrowser::spawn(
-            _ctx,
-            self.rt.clone(),
-            self.logs.clone(),
-            session,
-        );
-        self.tabs.push(Tab::Files(Box::new(fb)));
-        self.active = self.tabs.len() - 1;
     }
 
-    fn open_terminal(&mut self, ctx: &egui::Context, session_id: &str) {
+    /// Default session-window view depends on the sidebar tool: with the
+    /// docked Files browser active the window lands on the shell (the files
+    /// are already pinned on the left), otherwise it opens the browser.
+    fn default_session_view(&self) -> SessionView {
+        if self.side_mode == SideMode::Files {
+            SessionView::Shell
+        } else {
+            SessionView::Files
+        }
+    }
+
+    /// Close the docked browser, if one is pinned to the sidebar.
+    fn close_all_docked(&mut self) {
+        if let Some((_, fb)) = self.docked.take() {
+            fb.close();
+        }
+    }
+
+    /// Swap the docked browser when the focused (connected) session changes:
+    /// one live SFTP connection, tied to whoever owns the foreground tab.
+    fn sync_dock_focus(&mut self, ctx: &egui::Context, focused: &str) {
+        let mismatch = match &self.docked {
+            Some((id, _)) => id != focused,
+            None => true,
+        };
+        if mismatch {
+            self.close_all_docked();
+            if let Some(session) = self
+                .sessions
+                .iter()
+                .find(|s| s.id == focused)
+                .cloned()
+            {
+                let fb = crate::filebrowser::FileBrowser::spawn(
+                    ctx,
+                    self.rt.clone(),
+                    self.logs.clone(),
+                    self.editors.clone(),
+                    session,
+                );
+                self.docked = Some((focused.to_string(), fb));
+            }
+        }
+    }
+
+    /// One session window per server: a shell pane and a WinSCP-style SFTP
+    /// files pane behind a Shell | Files switcher (MobaXterm-style; the
+    /// browser always shows the focused session's server).
+    fn open_session(&mut self, ctx: &egui::Context, session_id: &str, view: SessionView) {
         if let Some(i) = self.find_tab_for_session(session_id) {
-            self.active = i;
+            if let Tab::Terminal(t) = &mut self.tabs[i] {
+                t.set_view(view);
+                self.active = i;
+            }
             return;
         }
         let Some(session) = self
@@ -438,11 +484,22 @@ impl TunnelApp {
             }
             return;
         }
-        if let Err(e) = session.validate() {
-            self.toast(ToastKind::Error, format!("Cannot open shell: {e}"));
+        if session.host.trim().is_empty() {
+            self.toast(ToastKind::Info, "Save this session with a host first");
             return;
         }
-        let term = TerminalSession::spawn(ctx, self.rt.clone(), self.logs.clone(), session);
+        if let Err(e) = session.validate() {
+            self.toast(ToastKind::Error, format!("Cannot open session: {e}"));
+            return;
+        }
+        let mut term = TerminalSession::spawn(
+            ctx,
+            self.rt.clone(),
+            self.logs.clone(),
+            self.editors.clone(),
+            session,
+        );
+        term.set_view(view);
         self.tabs.push(Tab::Terminal(Box::new(term)));
         self.active = self.tabs.len() - 1;
     }
@@ -453,9 +510,6 @@ impl TunnelApp {
         }
         if let Tab::Terminal(t) = &self.tabs[index] {
             t.close();
-        }
-        if let Tab::Files(f) = &self.tabs[index] {
-            f.close();
         }
         self.tabs.remove(index);
         if self.active == index {
@@ -914,7 +968,7 @@ impl TunnelApp {
     fn terminal_focused(&self, ctx: &egui::Context) -> bool {
         self.tabs.iter().any(|t| match t {
             Tab::Terminal(term) => term.is_focused(ctx),
-            Tab::Files(_) | Tab::Tunnels => false,
+            Tab::Tunnels => false,
         })
     }
 }
@@ -943,7 +997,8 @@ impl TunnelApp {
             }
         }
 
-        // Terminal overlay buttons + file-browser lifecycle.
+        // Terminal overlay buttons + files-pane lifecycle (session tabs now
+        // carry both the shell and the file browser).
         let mut close_idx: Option<usize> = None;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             if let Tab::Terminal(t) = tab {
@@ -954,15 +1009,23 @@ impl TunnelApp {
                 if t.want_close {
                     close_idx = Some(i);
                 }
-            }
-            if let Tab::Files(f) = tab {
-                if f.poll() {
-                    ctx.request_repaint();
-                }
-                if f.want_close {
+                if t.take_fb_close() {
                     close_idx = Some(i);
                 }
             }
+        }
+
+        // Docked file browser (sidebar "Files" tool): drain its events and
+        // honor the Close (✕) press from the browser overlay.
+        let mut dock_close = false;
+        if let Some((_, fb)) = self.docked.as_mut() {
+            if fb.poll() {
+                ctx.request_repaint();
+            }
+            dock_close = fb.want_close;
+        }
+        if dock_close {
+            self.close_all_docked();
         }
         if let Some(i) = close_idx {
             self.close_tab(i);
@@ -1053,8 +1116,45 @@ impl TunnelApp {
             });
         });
         ui.add_space(4.0);
+
+        // --- Sidebar tool switcher (MobaXterm-style left toolbar) ------------
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            for (mode, label, hover, dot) in [
+                (
+                    SideMode::Sessions,
+                    "Sessions",
+                    "Saved SSH sessions — double-click connects",
+                    None,
+                ),
+                (
+                    SideMode::Files,
+                    "Files",
+                    "File browser for the focused session's server",
+                    Some(theme::INFO),
+                ),
+            ] {
+                let active = self.side_mode == mode;
+                let pill = styled_ghost_chip(ui, label, active, dot);
+                if pill.clicked() {
+                    if mode == SideMode::Sessions && self.side_mode != SideMode::Sessions {
+                        // Leaving Files mode: no lingering idle SFTP links.
+                        self.close_all_docked();
+                    }
+                    self.side_mode = mode;
+                }
+                pill.on_hover_text(hover);
+            }
+        });
+        ui.add_space(10.0);
+
+        if self.side_mode == SideMode::Files {
+            self.sidebar_files(ui, ctx);
+            return;
+        }
+
         ui.label(
-            RichText::new("Double-click a session to open a shell")
+            RichText::new("Double-click a session to open a session window")
                 .size(10.0)
                 .color(theme::TEXT_FAINT),
         );
@@ -1236,8 +1336,10 @@ impl TunnelApp {
         for (id, action) in card_actions {
             match action {
                 CardAction::Select => self.selected = Some(id.clone()),
-                CardAction::Connect => self.open_terminal(ctx, &id),
-                CardAction::BrowseFiles => self.open_file_browser(ctx, &id),
+                CardAction::Connect | CardAction::BrowseFiles => {
+                    self.open_session(ctx, &id, self.default_session_view())
+                }
+                CardAction::OpenShell => self.open_session(ctx, &id, SessionView::Shell),
                 CardAction::Edit => {
                     if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
                         self.session_editor = Some(SessionEditor::from(s));
@@ -1263,6 +1365,66 @@ impl TunnelApp {
                     self.group_editor = Some(GroupEditor::for_session(&sid));
                 }
             }
+        }
+    }
+
+    /// Sidebar "Files" tool: a docked WinSCP-style browser that follows the
+    /// focused connected session (an open session tab; the foreground tab
+    /// wins), like MobaXterm's scp browser pane.
+    fn sidebar_files(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let Some(focused) = self.focused_file_session_id() else {
+            // Nothing connected: the docked browser must not linger with an
+            // idle SFTP link.
+            if self.docked.is_some() {
+                self.close_all_docked();
+            }
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "No open SSH session — double-click a saved session to\n\
+                     connect; the file browser then follows that server.",
+                )
+                .size(10.0)
+                .color(theme::TEXT_FAINT),
+            );
+            return;
+        };
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|s| s.id == focused)
+            .cloned()
+        else {
+            // Session deleted while docked — drop its browser too.
+            self.close_all_docked();
+            return;
+        };
+        if session.protocol == Protocol::Rdp {
+            // No SFTP over RDP; release any stray dock (defensive).
+            self.close_all_docked();
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "RDP sessions have no file browser — SFTP runs over SSH.",
+                )
+                .size(10.5)
+                .color(theme::TEXT_FAINT),
+            );
+            return;
+        }
+        // Header: whose files are on display (follows focus each frame).
+        ui.horizontal(|ui| {
+            let (bar, _) = ui.allocate_exact_size(egui::vec2(4.0, 16.0), Sense::hover());
+            ui.painter().rect_filled(bar, 2.0, theme::INFO);
+            ui.label(RichText::new("Files").text_style(theme::h2()).strong());
+            ui.label(
+                RichText::new(&session.name).size(10.0).color(theme::TEXT_FAINT)
+            );
+        });
+        ui.add_space(6.0);
+        self.sync_dock_focus(ctx, &focused);
+        if let Some((_, fb)) = self.docked.as_mut() {
+            fb.ui(ui);
         }
     }
 
@@ -1392,25 +1554,11 @@ impl TunnelApp {
                             TermStatus::Connecting => Some(theme::WARNING),
                             TermStatus::Closed(_) => Some(theme::DANGER),
                         };
-                        let (clicked, closed, menu) =
-                            tab_chip(ui, &t.title, dot, self.active == i, true);
-                        if clicked {
-                            activate = Some(i);
-                        }
-                        if closed {
-                            close = Some(i);
-                        }
-                        if let Some(m) = menu {
-                            menu_cmd = Some((i, m));
-                        }
-                    }
-                    Tab::Files(f) => {
-                        let dot = match &f.status {
-                            crate::filebrowser::FbStatus::Connected => Some(theme::INFO),
-                            crate::filebrowser::FbStatus::Connecting => Some(theme::WARNING),
-                            crate::filebrowser::FbStatus::Failed(_) => Some(theme::DANGER),
+                        let title = if t.view() == SessionView::Files {
+                            format!("{} · files", t.title)
+                        } else {
+                            t.title.clone()
                         };
-                        let title = format!("{} · files", f.title);
                         let (clicked, closed, menu) =
                             tab_chip(ui, &title, dot, self.active == i, true);
                         if clicked {
@@ -1453,16 +1601,16 @@ impl TunnelApp {
                     .clone()
                     .filter(|id| self.sessions.iter().any(|s| &s.id == id))
                 {
-                    Some(id) => self.open_terminal(ctx, &id),
+                    Some(id) => self.open_session(ctx, &id, self.default_session_view()),
                     None => match self.sessions.first().map(|s| s.id.clone()) {
-                        Some(id) => self.open_terminal(ctx, &id),
+                        Some(id) => self.open_session(ctx, &id, self.default_session_view()),
                         None => {
-                            self.toast(ToastKind::Info, "Add a session first — the + opens a shell.");
+                            self.toast(ToastKind::Info, "Add a session first — the + opens a session.");
                         }
                     },
                 }
             }
-            plus_resp.on_hover_text("Open a shell for the selected session");
+            plus_resp.on_hover_text("Open the session for the selected server");
         });
     }
 
@@ -1480,11 +1628,6 @@ impl TunnelApp {
         match self.tabs.get_mut(active) {
             Some(Tab::Terminal(term)) => {
                 term.ui(ui);
-                return;
-            }
-            Some(Tab::Files(fb)) => {
-                fb.poll();
-                fb.ui(ui);
                 return;
             }
             _ => {}
@@ -2853,12 +2996,14 @@ fn session_card(
         action = Some(CardAction::Select);
     }
     if resp.double_clicked() {
+        // Session window: lands on the server's file browser (WinSCP-style),
+        // switch to Shell from the in-window toolbar.
         action = Some(CardAction::Connect);
     }
-    let resp = resp.on_hover_text("Double-click to open a shell · right-click for more");
+    let resp = resp.on_hover_text("Double-click to open the session · right-click for more");
     resp.context_menu(|ui| {
         if ui.button("Open shell").clicked() {
-            action = Some(CardAction::Connect);
+            action = Some(CardAction::OpenShell);
             ui.close();
         }
         if auth_label != "RDP" && ui.button("Browse files (SFTP)").clicked() {
@@ -3419,6 +3564,39 @@ fn ghost_button(ui: &mut Ui, text: RichText, danger: bool) -> egui::Response {
     .inner
 }
 
+/// Sidebar tool chip: compact painter-drawn pill with an active state and
+/// an optional status dot (MobaXterm's left-tool tabs).
+fn styled_ghost_chip(
+    ui: &mut Ui,
+    label: &str,
+    active: bool,
+    dot: Option<Color32>,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(78.0, 23.0), Sense::click());
+    let painter = ui.painter_at(rect);
+    if active {
+        painter.rect_filled(rect, 6.0, theme::BG_CARD_SEL);
+        painter.rect_stroke(
+            rect,
+            6.0,
+            Stroke::new(1.0_f32, theme::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let center = egui::pos2(if dot.is_some() { rect.center().x + 4.0 } else { rect.center().x }, rect.center().y);
+    painter.text(
+        center,
+        Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(10.5),
+        if active { theme::TEXT } else { theme::TEXT_DIM },
+    );
+    if let Some(d) = dot {
+        painter.circle_filled(egui::pos2(rect.left() + 9.0, rect.center().y), 2.5, d);
+    }
+    resp
+}
+
 fn empty_hint(ui: &mut Ui, title: &str, body: &str) {
     Frame::NONE
         .fill(theme::BG_PANEL_ALT)
@@ -3584,13 +3762,22 @@ mod tests {
         app.toast(ToastKind::Success, "Tunnel started");
         assert!(run_frames(&mut app, &ctx, egui::vec2(1024.0, 700.0), 2) > 40);
 
-        // Terminal tab: spawns against a closed port, fails fast, renders
+        // Session tab: spawns against a closed port, fails fast, renders
         // both the connecting and disconnected overlays.
-        app.open_terminal(&ctx, "demo-session");
+        app.open_session(&ctx, "demo-session", crate::terminal::SessionView::Shell);
         assert!(matches!(app.tabs.last(), Some(Tab::Terminal(_))));
         let _ = run_frames(&mut app, &ctx, egui::vec2(1024.0, 700.0), 6) > 50;
         let _ = rt;
         assert!(app.tabs.len() >= 2);
+        // A second open on the same session switches its view instead of
+        // spawning a duplicate tab (MobaXterm-style one window per server).
+        app.open_session(&ctx, "demo-session", crate::terminal::SessionView::Files);
+        assert_eq!(app.tabs.len(), 2);
+        if let Some(Tab::Terminal(t)) = app.tabs.last() {
+            assert_eq!(t.view(), crate::terminal::SessionView::Files);
+        } else {
+            panic!("expected the session tab to still be the terminal");
+        }
     }
 
     #[test]

@@ -2,11 +2,12 @@
 //! rendered locally through a vt100 terminal emulator (colors, cursor,
 //! scrollback, alternate screen), drawn with egui.
 
+use crate::filebrowser::{FileBrowser, FbStatus, SharedEditors};
 use crate::log::SharedLogs;
 use crate::session::SshSession;
 use crate::ssh;
 use crate::theme;
-use eframe::egui::{self, Color32, FontFamily, FontId, Rect, RichText, Stroke, StrokeKind};
+use eframe::egui::{self, Align2, Color32, FontFamily, FontId, Rect, RichText, Sense, Stroke, StrokeKind};
 use russh::ChannelMsg;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -42,6 +43,16 @@ pub enum TermStatus {
 // Terminal session (one tab)
 // ---------------------------------------------------------------------------
 
+/// Which pane of the session window is frontmost — MobaXterm-style session
+/// toolbar with a shell view and a files (SFTP/SCP) view, where the file
+/// browser always belongs to the focused session.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SessionView {
+    #[default]
+    Shell,
+    Files,
+}
+
 pub struct TerminalSession {
     pub session_id: String,
     pub title: String,
@@ -49,6 +60,11 @@ pub struct TerminalSession {
     /// Set by the overlay buttons; the app acts on them after drawing.
     pub want_reconnect: bool,
     pub want_close: bool,
+    /// Shell vs files browser pane.
+    pub view: SessionView,
+    /// SFTP browser for this session, spawned lazily on first use.
+    fb: Option<FileBrowser>,
+    editors: SharedEditors,
     parser: vt100::Parser,
     cmd_tx: UnboundedSender<TermCmd>,
     evt_rx: UnboundedReceiver<TermEvent>,
@@ -66,6 +82,7 @@ impl TerminalSession {
         ctx: &egui::Context,
         rt: tokio::runtime::Handle,
         logs: SharedLogs,
+        editors: SharedEditors,
         session: SshSession,
     ) -> Self {
         let (cmd_tx, _) = tokio::sync::mpsc::unbounded_channel::<TermCmd>();
@@ -76,6 +93,9 @@ impl TerminalSession {
             status: TermStatus::Connecting,
             want_reconnect: false,
             want_close: false,
+            view: SessionView::default(),
+            fb: None,
+            editors,
             parser: vt100::Parser::new(30, 100, SCROLLBACK_LINES),
             cmd_tx,
             evt_rx,
@@ -89,6 +109,48 @@ impl TerminalSession {
         };
         me.start_task();
         me
+    }
+
+    /// Spawn the SFTP browser on first use (reuses the session's creds).
+    pub fn ensure_files(&mut self) {
+        if self.fb.is_none() {
+            self.fb = Some(FileBrowser::spawn(
+                &self.ctx,
+                self.rt.clone(),
+                self.logs.clone(),
+                self.editors.clone(),
+                self.session.clone(),
+            ));
+        }
+    }
+
+    pub fn set_view(&mut self, view: SessionView) {
+        self.view = view;
+        if view == SessionView::Files {
+            self.ensure_files();
+        }
+    }
+
+    pub fn view(&self) -> SessionView {
+        self.view
+    }
+
+    pub fn files_status(&self) -> Option<&FbStatus> {
+        self.fb.as_ref().map(|f| f.status())
+    }
+
+    /// Files-view "Close tab" press; consumed once. Closing the tab from the
+    /// files overlay closes the whole session window (shell included).
+    pub fn take_fb_close(&mut self) -> bool {
+        let wants = self
+            .fb
+            .as_ref()
+            .map(|f| f.want_close)
+            .unwrap_or(false);
+        if let Some(f) = self.fb.as_mut() {
+            f.want_close = false;
+        }
+        wants
     }
 
     fn start_task(&mut self) {
@@ -115,10 +177,14 @@ impl TerminalSession {
 
     pub fn close(&self) {
         let _ = self.cmd_tx.send(TermCmd::Close);
+        if let Some(f) = self.fb.as_ref() {
+            // The SFTP task holds its own SSH connection; shut it down too.
+            f.close();
+        }
     }
 
-    /// Drain async events into the parser. Returns true when repainting is
-    /// needed for a reason other than cursor blink.
+    /// Drain async events (shell + files) into the parsers. Returns true
+    /// when repainting is needed for a reason other than cursor blink.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
         while let Ok(ev) = self.evt_rx.try_recv() {
@@ -135,6 +201,11 @@ impl TerminalSession {
                     self.status = TermStatus::Closed(reason);
                     changed = true;
                 }
+            }
+        }
+        if let Some(fb) = self.fb.as_mut() {
+            if fb.poll() {
+                changed = true;
             }
         }
         changed
@@ -158,6 +229,101 @@ impl TerminalSession {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
+        // Session tool strip: Shell | Files switcher (MobaXterm-style — the
+        // file browser always belongs to this focused session).
+        let strip = Rect::from_min_size(rect.min, egui::vec2(rect.width(), 28.0));
+        let body = Rect::from_min_max(
+            egui::pos2(rect.left(), strip.bottom()),
+            egui::pos2(rect.right(), rect.bottom()),
+        );
+        self.session_strip(ui, strip);
+
+        if self.view == SessionView::Files {
+            if self.fb.is_none() {
+                self.ensure_files();
+            }
+            if let Some(fb) = self.fb.as_mut() {
+                let mut body_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(body)
+                        .id_salt(("fb_body", self.focus_id.value())),
+                );
+                fb.ui(&mut body_ui);
+                return;
+            }
+        }
+        self.shell_body(ui, body);
+    }
+
+    /// Shell | Files segmented switcher for the session window.
+    fn session_strip(&mut self, ui: &mut egui::Ui, strip: Rect) {
+        let painter = ui.painter_at(strip);
+        painter.rect_filled(strip, 0.0, theme::BG_PANEL);
+        // Hairline under the strip.
+        painter.line_segment(
+            [
+                egui::pos2(strip.left(), strip.bottom() - 0.5),
+                egui::pos2(strip.right(), strip.bottom() - 0.5),
+            ],
+            Stroke::new(0.5_f32, theme::BORDER),
+        );
+
+        let cy = strip.center().y;
+        let mut x = strip.left() + 10.0;
+        for (label, active) in [
+            ("Shell", self.view == SessionView::Shell),
+            ("Files", self.view == SessionView::Files),
+        ] {
+            let pill = Rect::from_min_size(egui::pos2(x, cy - 10.0), egui::vec2(46.0, 20.0));
+            if active {
+                painter.rect_filled(pill, 6.0, theme::BG_CARD_SEL);
+                painter.rect_stroke(
+                    pill,
+                    6.0,
+                    Stroke::new(1.0_f32, theme::ACCENT),
+                    StrokeKind::Inside,
+                );
+            }
+            painter.text(
+                pill.center() + egui::vec2(if label == "Files" { 4.0 } else { 0.0 }, 0.0),
+                Align2::CENTER_CENTER,
+                label,
+                FontId::proportional(11.0),
+                if active { theme::TEXT } else { theme::TEXT_DIM },
+            );
+            // Files pill carries the browser state dot at its left edge.
+            if label == "Files" {
+                let dot = match self.files_status() {
+                    None => theme::TEXT_FAINT,
+                    Some(FbStatus::Connected) => theme::INFO,
+                    Some(FbStatus::Connecting) => theme::WARNING,
+                    Some(FbStatus::Failed(_)) => theme::DANGER,
+                };
+                painter.circle_filled(egui::pos2(pill.left() + 7.0, cy), 3.0, dot);
+                x += 8.0;
+            }
+            let resp =
+                ui.interact(pill, egui::Id::new(("view_pill", self.focus_id, label)), Sense::click());
+            if resp.clicked() {
+                self.set_view(if label == "Shell" {
+                    SessionView::Shell
+                } else {
+                    SessionView::Files
+                });
+            }
+            x += 46.0 + 6.0;
+        }
+        // Right side: connection label, quiet.
+        painter.text(
+            egui::pos2(strip.right() - 10.0, cy),
+            Align2::RIGHT_CENTER,
+            self.connection_label(),
+            FontId::proportional(10.0),
+            theme::TEXT_FAINT,
+        );
+    }
+
+    fn shell_body(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, TERM_BG);
 
