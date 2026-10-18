@@ -6,7 +6,7 @@ use crate::log::SharedLogs;
 use crate::session::SshSession;
 use crate::ssh;
 use crate::theme;
-use eframe::egui::{self, Color32, FontFamily, FontId, Rect, Stroke, StrokeKind};
+use eframe::egui::{self, Color32, FontFamily, FontId, Rect, RichText, Stroke, StrokeKind};
 use russh::ChannelMsg;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -259,7 +259,7 @@ impl TerminalSession {
             }
             TermStatus::Closed(reason) => {
                 painter.rect_filled(rect.shrink(1.0), 0.0, Color32::from_black_alpha(120));
-                let card = Rect::from_center_size(rect.center(), egui::vec2(430.0, 132.0));
+                let card = Rect::from_center_size(rect.center(), egui::vec2(430.0, 150.0));
                 painter.rect_filled(card, 12.0, theme::BG_CARD);
                 painter.rect_stroke(
                     card,
@@ -268,22 +268,32 @@ impl TerminalSession {
                     StrokeKind::Inside,
                 );
                 painter.text(
-                    card.center() + egui::vec2(0.0, -34.0),
+                    card.center() + egui::vec2(0.0, -48.0),
                     egui::Align2::CENTER_CENTER,
                     "Disconnected",
                     FontId::proportional(14.0),
                     theme::TEXT,
                 );
-                painter.text(
-                    card.center() + egui::vec2(0.0, -10.0),
-                    egui::Align2::CENTER_CENTER,
-                    reason.clone(),
-                    FontId::proportional(11.5),
-                    theme::TEXT_DIM,
+                // Reason: real wrapped label so long OS errors stay inside
+                // the card instead of spilling over its edges.
+                let reason_rect = Rect::from_min_size(
+                    card.min + egui::vec2(28.0, card.height() * 0.34),
+                    egui::vec2(card.width() - 56.0, 48.0),
                 );
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(reason_rect));
+                child.vertical_centered(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(reason.clone())
+                                .size(11.5)
+                                .color(theme::TEXT_DIM),
+                        )
+                        .wrap(),
+                    );
+                });
                 let mut child = ui.new_child(
                     egui::UiBuilder::new().max_rect(
-                        Rect::from_center_size(card.center() + egui::vec2(0.0, 34.0), egui::vec2(280.0, 30.0)),
+                        Rect::from_center_size(card.center() + egui::vec2(0.0, 44.0), egui::vec2(280.0, 30.0)),
                     ),
                 );
                 child.horizontal_centered(|ui| {

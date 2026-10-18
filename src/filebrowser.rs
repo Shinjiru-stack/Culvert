@@ -461,7 +461,7 @@ impl FileBrowser {
         } else if let FbStatus::Failed(reason) = self.status.clone() {
             ui.painter()
                 .rect_filled(rect.shrink(1.0), 0.0, Color32::from_black_alpha(120));
-            let card = egui::Rect::from_center_size(rect.center(), egui::vec2(430.0, 132.0));
+            let card = egui::Rect::from_center_size(rect.center(), egui::vec2(430.0, 150.0));
             ui.painter().rect_filled(card, 12.0, theme::BG_CARD);
             ui.painter().rect_stroke(
                 card,
@@ -470,22 +470,28 @@ impl FileBrowser {
                 egui::StrokeKind::Inside,
             );
             ui.painter().text(
-                card.center() + egui::vec2(0.0, -34.0),
+                card.center() + egui::vec2(0.0, -48.0),
                 Align2::CENTER_CENTER,
                 "File browser failed",
                 FontId::proportional(14.0),
                 theme::TEXT,
             );
-            ui.painter().text(
-                card.center() + egui::vec2(0.0, -10.0),
-                Align2::CENTER_CENTER,
-                reason,
-                FontId::proportional(11.5),
-                theme::TEXT_DIM,
+            let reason_rect = egui::Rect::from_min_size(
+                card.min + egui::vec2(28.0, card.height() * 0.34),
+                egui::vec2(card.width() - 56.0, 48.0),
             );
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(reason_rect));
+            child.vertical_centered(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(reason.clone()).size(11.5).color(theme::TEXT_DIM),
+                    )
+                    .wrap(),
+                );
+            });
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(
                 egui::Rect::from_center_size(
-                    card.center() + egui::vec2(0.0, 34.0),
+                    card.center() + egui::vec2(0.0, 44.0),
                     egui::vec2(280.0, 30.0),
                 ),
             ));
