@@ -1118,6 +1118,64 @@ impl TunnelApp {
     // Menu bar (MobaXterm-style top menu strip)
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Custom title bar (the OS window is undecorated — see main.rs)
+    // -----------------------------------------------------------------------
+
+    /// Top window chrome: brand mark + title on the left, window controls on
+    /// the right. The space between them is the drag handle; double-clicking
+    /// it toggles maximize, matching native window behavior. This replaces the
+    /// Win11 caption, whose invisible resize/shadow border showed as dark bars
+    /// at the window edges (issue #1).
+    fn titlebar(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+
+        // Drag handle over the whole strip; the control buttons are added
+        // afterwards so they take interaction priority over it.
+        let drag = ui.interact(
+            ui.max_rect(),
+            ui.id().with("titlebar-drag"),
+            Sense::click_and_drag(),
+        );
+        if drag.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if drag.double_clicked() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        }
+
+        let mark_texture = self
+            .mark_texture
+            .get_or_insert_with(|| theme::brand_texture(ctx, 128))
+            .clone();
+
+        ui.horizontal_centered(|ui| {
+            ui.add_space(10.0);
+            paint_mark(ui, &mark_texture, 14.0);
+            ui.add_space(5.0);
+            ui.label(RichText::new("Culvert").size(12.5).strong());
+            ui.add_space(5.0);
+            ui.label(
+                RichText::new(version::tag())
+                    .size(10.5)
+                    .color(theme::TEXT_FAINT()),
+            );
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if window_button(ui, WinBtn::Close).clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                let max_btn = if maximized { WinBtn::Restore } else { WinBtn::Max };
+                if window_button(ui, max_btn).clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
+                if window_button(ui, WinBtn::Min).clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+            });
+        });
+    }
+
     fn menu_bar(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
@@ -1410,8 +1468,16 @@ impl TunnelApp {
             }
         }
 
+        // Custom title bar (the window is undecorated — see main.rs). Drawn
+        // first so it sits above the menu strip; owns window drag + the
+        // minimize / maximize / close controls.
+        egui::TopBottomPanel::top("titlebar")
+            .exact_height(28.0)
+            .frame(Frame::NONE.fill(theme::BG_PANEL()))
+            .show(ctx, |ui| self.titlebar(ui, ctx));
+
         egui::TopBottomPanel::top("menubar")
-            .exact_height(24.0)
+            .exact_height(22.0)
             .frame(
                 Frame::NONE
                     .fill(theme::BG_PANEL())
@@ -1419,8 +1485,20 @@ impl TunnelApp {
             )
             .show(ctx, |ui| self.menu_bar(ui, ctx));
 
+        // Full-width icon toolbar, exactly like MobaXterm's: it sits above the
+        // sidebar and the work area rather than inside the content pane.
+        egui::TopBottomPanel::top("toolbar")
+            .exact_height(58.0)
+            .frame(
+                Frame::NONE
+                    .fill(theme::BG_PANEL())
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER()))
+                    .inner_margin(Margin::symmetric(6, 2)),
+            )
+            .show(ctx, |ui| self.toolbar(ui));
+
         egui::TopBottomPanel::bottom("statusbar")
-            .exact_height(26.0)
+            .exact_height(22.0)
             .frame(
                 Frame::NONE
                     .fill(theme::SB_BG())
@@ -1442,8 +1520,8 @@ impl TunnelApp {
         } else {
             egui::SidePanel::left("sessions")
                 .resizable(true)
-                .default_width(238.0)
-                .width_range(210.0..=380.0)
+                .default_width(220.0)
+                .width_range(200.0..=380.0)
                 .frame(
                     Frame::NONE
                         .fill(theme::BG_PANEL())
@@ -1457,11 +1535,21 @@ impl TunnelApp {
                 .show(ctx, |ui| self.sidebar(ui, ctx));
         }
 
+            // Far-right icon rail (MobaXterm's narrow tool strip).
+            egui::SidePanel::right("right_rail")
+                .exact_width(30.0)
+                .resizable(false)
+                .frame(
+                    Frame::NONE
+                        .fill(theme::BG_PANEL())
+                        .stroke(Stroke::new(1.0_f32, theme::BORDER()))
+                        .inner_margin(Margin::symmetric(2, 6)),
+                )
+                .show(ctx, |ui| self.right_rail(ui, ctx));
+
             egui::CentralPanel::default()
                 .frame(Frame::NONE.fill(theme::BG_WINDOW()).inner_margin(Margin::symmetric(12, 8)))
                 .show(ctx, |ui| {
-                    self.toolbar(ui);
-                    ui.add_space(6.0);
                     // While split view is showing a grid of shells, the tab
                     // strip hides — terminals fill the workspace (panes have
                     // their own title bars with close buttons).
@@ -1521,75 +1609,9 @@ impl TunnelApp {
     }
 
     fn sidebar(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        let mark_texture = self
-            .mark_texture
-            .get_or_insert_with(|| theme::brand_texture(ctx, 128))
-            .clone();
-        ui.horizontal(|ui| {
-            paint_mark(ui, &mark_texture, 22.0);
-            ui.add_space(2.0);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(RichText::new("Culvert").size(13.5).strong());
-                ui.label(
-                    RichText::new(format!("{} · open source", version::tag()))
-                        .size(9.5)
-                        .color(theme::TEXT_FAINT()),
-                );
-            });
-        });
-        ui.add_space(4.0);
-
-        // --- Sidebar tool switcher (MobaXterm-style left toolbar) ------------
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 5.0;
-            for (mode, label, hover, dot) in [
-                (
-                    SideMode::Sessions,
-                    "Sessions",
-                    "Saved SSH sessions — double-click connects",
-                    None,
-                ),
-                (
-                    SideMode::Files,
-                    "Files",
-                    "File browser for the focused session's server",
-                    Some(theme::INFO()),
-                ),
-            ] {
-                let active = self.side_mode == mode;
-                let pill = styled_ghost_chip(ui, label, active, dot);
-                if pill.clicked() {
-                    if mode == SideMode::Sessions && self.side_mode != SideMode::Sessions {
-                        // Leaving Files mode: no lingering idle SFTP links.
-                        self.close_all_docked();
-                    }
-                    self.side_mode = mode;
-                }
-                pill.on_hover_text(hover);
-            }
-            // Collapse to the compact icon rail.
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let col = ui.style().visuals.widgets.inactive.fg_stroke.color;
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(tglyph::CHEVRON_LEFT)
-                                .size(13.0)
-                                .color(col)
-                                .font(theme::icon(12.0)),
-                        )
-                        .fill(Color32::TRANSPARENT)
-                        .corner_radius(6),
-                    )
-                    .on_hover_text("Collapse sidebar to icons")
-                    .clicked()
-                {
-                    self.sidebar_collapsed = true;
-                }
-            });
-        });
-        ui.add_space(10.0);
+        // The brand and the Sessions/Files switcher now live in the title bar and
+        // the full-width toolbar, so the sidebar starts at the session list.
+        ui.add_space(2.0);
 
         if self.side_mode == SideMode::Files {
             self.sidebar_files(ui, ctx);
@@ -1955,8 +1977,8 @@ impl TunnelApp {
 
     /// Icon toolbar across the top of the workspace (Tabler glyph tiles).
     fn toolbar(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
             if tool_button(ui, tglyph::SESSION, theme::SUCCESS(), "Session", false, "New session")
                 .clicked()
             {
@@ -1974,17 +1996,53 @@ impl TunnelApp {
             {
                 self.tunnel_editor = Some(TunnelEditor::new_standalone());
             }
+            if tool_button(
+                ui,
+                tglyph::RAIL_SESSIONS,
+                theme::VIOLET(),
+                "Sessions",
+                !self.sidebar_collapsed && self.side_mode == SideMode::Sessions,
+                "Saved sessions",
+            )
+            .clicked()
+            {
+                self.sidebar_collapsed = false;
+                self.side_mode = SideMode::Sessions;
+            }
+            if tool_button(
+                ui,
+                tglyph::RAIL_FILES,
+                Color32::from_rgb(18, 134, 127),
+                "Files",
+                !self.sidebar_collapsed && self.side_mode == SideMode::Files,
+                "Browse the connected server",
+            )
+            .clicked()
+            {
+                self.sidebar_collapsed = false;
+                self.side_mode = SideMode::Files;
+            }
             // Slim vertical separator between the action and view groups.
             {
-                let (r, _) = ui.allocate_exact_size(egui::vec2(2.0, 26.0), Sense::hover());
+                let (r, _) = ui.allocate_exact_size(egui::vec2(9.0, 34.0), Sense::hover());
                 ui.painter().line_segment(
-                    [egui::pos2(r.center().x, r.top() + 4.0), egui::pos2(r.center().x, r.bottom() - 4.0)],
-                    Stroke::new(1.0_f32, theme::BORDER()),
+                    [
+                        egui::pos2(r.center().x, r.top() + 4.0),
+                        egui::pos2(r.center().x, r.bottom() - 4.0),
+                    ],
+                    Stroke::new(1.0_f32, theme::BORDER_STRONG()),
                 );
             }
             let split_active = self.split_view && self.terminal_tab_count() >= 2;
-            if tool_button(ui, tglyph::SPLIT, theme::ACCENT(), "Split", split_active, "Toggle split view")
-                .clicked()
+            if tool_button(
+                ui,
+                tglyph::SPLIT,
+                theme::ACCENT(),
+                "Split",
+                split_active,
+                "Toggle split view",
+            )
+            .clicked()
             {
                 self.split_view = !self.split_view;
             }
@@ -2000,29 +2058,41 @@ impl TunnelApp {
             {
                 self.show_logs = !self.show_logs;
             }
-            // Right edge: light/dark palette switch. The glyph shows the
-            // theme you'll get.
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                let (glyph, tint) = if theme::is_dark() {
-                    (tglyph::SUN, theme::WARNING())
+        });
+    }
+
+    /// Far-right icon rail, like MobaXterm's narrow tool strip: palette
+    /// switch at the top, sidebar toggle below it.
+    fn right_rail(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        ui.with_layout(Layout::top_down(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            let (glyph, tint, tip) = if theme::is_dark() {
+                (tglyph::SUN, theme::WARNING(), "Switch to the light theme")
+            } else {
+                (tglyph::MOON, theme::INFO(), "Switch to the dark theme")
+            };
+            if rail_button(ui, glyph, tint, tip).clicked() {
+                theme::set_dark(!theme::is_dark());
+                theme::apply(ctx);
+            }
+            if rail_button(
+                ui,
+                if self.sidebar_collapsed {
+                    tglyph::CHEVRON_RIGHT
                 } else {
-                    (tglyph::MOON, theme::INFO())
-                };
-                let tip = if theme::is_dark() {
-                    "Switch to the light theme"
+                    tglyph::CHEVRON_LEFT
+                },
+                theme::TEXT_DIM(),
+                if self.sidebar_collapsed {
+                    "Show the session sidebar"
                 } else {
-                    "Switch to the dark theme"
-                };
-                if tool_button(ui, glyph, tint, "Theme", false, tip)
-                    .clicked()
-                {
-                    theme::set_dark(!theme::is_dark());
-                    // Re-apply the whole design system (style + fonts) so the
-                    // switch is instant and every painter-drawn surface picks
-                    // up the new palette on the next repaint.
-                    theme::apply(ui.ctx());
-                }
-            });
+                    "Hide the session sidebar"
+                },
+            )
+            .clicked()
+            {
+                self.sidebar_collapsed = !self.sidebar_collapsed;
+            }
         });
     }
 
@@ -2537,192 +2607,207 @@ impl TunnelApp {
         let mut save = false;
         let is_new = ed.id.is_none();
         let resp = egui::Modal::new(egui::Id::new("session_editor")).show(ctx, |ui| {
-            ui.set_width(430.0);
-            ui.label(
-                RichText::new(if is_new { "New session" } else { "Edit session" })
-                    .size(16.0)
-                    .strong(),
-            );
-            ui.label(
-                RichText::new("Saved locally. Used for shells and tunnels alike.")
-                    .size(10.5)
-                    .color(theme::TEXT_FAINT()),
-            );
-            ui.add_space(12.0);
-
-            // Protocol: SSH shell (also tunnels + SFTP) or an RDP desktop.
+            ui.set_width(580.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Protocol").size(11.0).color(theme::TEXT_DIM()));
-                ui.add_space(2.0);
-                if choice_pill(ui, "SSH", ed.protocol == Protocol::Ssh).clicked() {
+                ui.label(RichText::new("Session settings").size(13.0).strong());
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(if is_new { "new" } else { "edit" })
+                        .size(10.0)
+                        .color(theme::TEXT_FAINT()),
+                );
+            });
+            ui.add_space(8.0);
+
+            // Protocol picker: square tiles, like MobaXterm's session dialog.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if proto_tile(
+                    ui,
+                    tglyph::SESSION,
+                    theme::SUCCESS(),
+                    "SSH",
+                    ed.protocol == Protocol::Ssh,
+                    false,
+                )
+                .clicked()
+                {
                     ed.protocol = Protocol::Ssh;
                     if ed.port.trim() == "3389" {
                         ed.port = "22".to_string();
                     }
                     ed.error = None;
                 }
-                if choice_pill(ui, "RDP", ed.protocol == Protocol::Rdp).clicked() {
+                if proto_tile(
+                    ui,
+                    tglyph::RAIL_FILES,
+                    theme::INFO(),
+                    "RDP",
+                    ed.protocol == Protocol::Rdp,
+                    true,
+                )
+                .clicked()
+                {
                     ed.protocol = Protocol::Rdp;
                     if ed.port.trim() == "22" {
                         ed.port = "3389".to_string();
                     }
                     ed.error = None;
                 }
-                if ed.protocol == Protocol::Rdp {
-                    ui.label(
-                        RichText::new("opens mstsc — Windows asks for login")
-                            .size(10.0)
-                            .color(theme::TEXT_FAINT()),
-                    );
-                }
             });
-            ui.add_space(8.0);
+            ui.add_space(12.0);
 
-            field(ui, "Name", |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut ed.name)
-                        .hint_text("prod web server")
-                        .desired_width(ui.available_width())
-                        .margin(egui::vec2(8.0, 6.0)),
-                );
-            });
-            ui.horizontal(|ui| {
-                let w = (ui.available_width() - 74.0).max(120.0);
-                ui.vertical(|ui| {
-                    field(ui, "Host", |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut ed.host)
-                                .hint_text("10.0.0.5 or server.example.com")
-                                .desired_width(w)
-                                .margin(egui::vec2(8.0, 6.0)),
-                        );
-                    });
+            group_box(ui, "Basic SSH settings", |ui| {
+                form_row(ui, "Remote host *", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut ed.host)
+                            .hint_text("10.0.0.5 or server.example.com")
+                            .desired_width(260.0)
+                            .margin(egui::vec2(6.0, 3.0)),
+                    );
                 });
-                field(ui, "Port", |ui| {
+                ui.add_space(3.0);
+                form_row(ui, "Username", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut ed.username)
+                            .hint_text("root")
+                            .desired_width(200.0)
+                            .margin(egui::vec2(6.0, 3.0)),
+                    );
+                });
+                ui.add_space(3.0);
+                form_row(ui, "Port", |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut ed.port)
-                            .desired_width(62.0)
-                            .margin(egui::vec2(8.0, 6.0)),
+                            .desired_width(56.0)
+                            .margin(egui::vec2(6.0, 3.0)),
                     );
                 });
-            });
-            field(ui, "Username", |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut ed.username)
-                        .hint_text("root")
-                        .desired_width(ui.available_width())
-                        .margin(egui::vec2(8.0, 6.0)),
-                );
-            });
-
-            field(ui, "Group (optional)", |ui| {
-                let mut options: Vec<(String, String)> = self
-                    .groups
-                    .iter()
-                    .map(|g| (g.id.clone(), g.name.clone()))
-                    .collect();
-                options.retain(|(id, _)| Some(id) != ed.group.as_ref());
-                let selected_text = ed
-                    .group
-                    .as_deref()
-                    .and_then(|gid| {
-                        self.groups.iter().find(|g| g.id == gid).map(|g| g.name.clone())
-                    })
-                    .unwrap_or_else(|| "No group".to_string());
-                egui::ComboBox::from_id_salt("session_group")
-                    .selected_text(
-                        RichText::new(selected_text).size(12.0).color(theme::TEXT()),
-                    )
-                    .width(ui.available_width() - 2.0)
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(ed.group.is_none(), "No group")
-                            .clicked()
-                        {
-                            ed.group = None;
-                        }
-                        for (id, name) in options {
+                ui.add_space(3.0);
+                form_row(ui, "Session name", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut ed.name)
+                            .hint_text("prod web server")
+                            .desired_width(260.0)
+                            .margin(egui::vec2(6.0, 3.0)),
+                    );
+                });
+                ui.add_space(3.0);
+                form_row(ui, "Group", |ui| {
+                    let mut options: Vec<(String, String)> = self
+                        .groups
+                        .iter()
+                        .map(|g| (g.id.clone(), g.name.clone()))
+                        .collect();
+                    options.retain(|(id, _)| Some(id) != ed.group.as_ref());
+                    let selected_text = ed
+                        .group
+                        .as_deref()
+                        .and_then(|gid| {
+                            self.groups.iter().find(|g| g.id == gid).map(|g| g.name.clone())
+                        })
+                        .unwrap_or_else(|| "No group".to_string());
+                    egui::ComboBox::from_id_salt("session_group")
+                        .selected_text(
+                            RichText::new(selected_text).size(12.0).color(theme::TEXT()),
+                        )
+                        .width(240.0)
+                        .show_ui(ui, |ui| {
                             if ui
-                                .selectable_label(ed.group.as_deref() == Some(id.as_str()), name)
+                                .selectable_label(ed.group.is_none(), "No group")
                                 .clicked()
                             {
-                                ed.group = Some(id.clone());
+                                ed.group = None;
                             }
-                        }
-                    });
+                            for (id, name) in options {
+                                if ui
+                                    .selectable_label(
+                                        ed.group.as_deref() == Some(id.as_str()),
+                                        name,
+                                    )
+                                    .clicked()
+                                {
+                                    ed.group = Some(id.clone());
+                                }
+                            }
+                        });
+                });
             });
 
-            if ed.protocol == Protocol::Rdp {
-                // mstsc collects its own credentials; no auth block.
-                ui.label(
-                    RichText::new(
-                        "RDP launches the Windows remote-desktop client, which opens its own login window. Port defaults to 3389.",
-                    )
-                    .size(10.5)
-                    .color(theme::TEXT_FAINT()),
-                );
-            } else {
-                ui.label(
-                    RichText::new("Authentication")
-                        .size(11.0)
-                        .color(theme::TEXT_DIM()),
-                );
-                ui.horizontal(|ui| {
-                    if choice_pill(ui, "Password", ed.auth_type == AuthType::Password).clicked() {
-                        ed.auth_type = AuthType::Password;
-                        ed.error = None;
-                    }
-                    if choice_pill(ui, "Private key", ed.auth_type == AuthType::Key).clicked() {
-                        ed.auth_type = AuthType::Key;
-                        ed.error = None;
-                    }
-                });
-                ui.add_space(8.0);
-            }
-
-            if ed.protocol == Protocol::Ssh {
-                match ed.auth_type {
-                AuthType::Password => {
-                    field(ui, "Password", |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut ed.password)
-                                .password(true)
-                                .desired_width(ui.available_width())
-                                .margin(egui::vec2(8.0, 6.0)),
+            ui.add_space(10.0);
+            group_box(
+                ui,
+                if ed.protocol == Protocol::Rdp {
+                    "RDP"
+                } else {
+                    "Authentication"
+                },
+                |ui| {
+                    if ed.protocol == Protocol::Rdp {
+                        ui.label(
+                            RichText::new(
+                                "RDP launches the Windows remote-desktop client, which opens its own login window. Port defaults to 3389.",
+                            )
+                            .size(10.5)
+                            .color(theme::TEXT_FAINT()),
                         );
-                    });
-                }
-                AuthType::Key => {
-                    ui.horizontal(|ui| {
-                        let w = (ui.available_width() - 92.0).max(140.0);
-                        ui.vertical(|ui| {
-                            field(ui, "Private key file", |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut ed.key_path)
-                                        .hint_text("C:\\Users\\me\\.ssh\\id_ed25519")
-                                        .desired_width(w)
-                                        .margin(egui::vec2(8.0, 6.0)),
-                                );
-                            });
+                    } else {
+                        ui.horizontal(|ui| {
+                            if choice_pill(ui, "Password", ed.auth_type == AuthType::Password)
+                                .clicked()
+                            {
+                                ed.auth_type = AuthType::Password;
+                                ed.error = None;
+                            }
+                            if choice_pill(ui, "Private key", ed.auth_type == AuthType::Key)
+                                .clicked()
+                            {
+                                ed.auth_type = AuthType::Key;
+                                ed.error = None;
+                            }
                         });
-                        ui.add_space(4.0);
-                        if ui.button("Browse…").clicked() {
-                            if let Some(p) = rfd::FileDialog::new().pick_file() {
-                                ed.key_path = p.display().to_string();
+                        ui.add_space(6.0);
+
+            match ed.auth_type {
+                            AuthType::Password => {
+                                form_row(ui, "Password", |ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut ed.password)
+                                            .password(true)
+                                            .desired_width(260.0)
+                                            .margin(egui::vec2(6.0, 3.0)),
+                                    );
+                                });
+                            }
+                            AuthType::Key => {
+                                form_row(ui, "Private key", |ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut ed.key_path)
+                                        .hint_text("C:\\Users\\me\\.ssh\\id_ed25519")
+                                        .desired_width(200.0)
+                                        .margin(egui::vec2(6.0, 3.0)),
+                                    );
+                                    ui.add_space(4.0);
+                                    if ui.button("Browse...").clicked() {
+                                        if let Some(p) = rfd::FileDialog::new().pick_file() {
+                                            ed.key_path = p.display().to_string();
+                                        }
+                                    }
+                                });
+                                ui.add_space(3.0);
+                                form_row(ui, "Passphrase", |ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut ed.key_passphrase)
+                                            .password(true)
+                                            .desired_width(260.0)
+                                            .margin(egui::vec2(6.0, 3.0)),
+                                    );
+                                });
                             }
                         }
-                    });
-                    field(ui, "Key passphrase (optional)", |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut ed.key_passphrase)
-                                .password(true)
-                                .desired_width(ui.available_width())
-                                .margin(egui::vec2(8.0, 6.0)),
-                        );
-                    });
-                }
-            }
-            } // end SSH-only auth section
+                    }
+                },
+            );
 
             if let Some(err) = &ed.error {
                 ui.add_space(4.0);
@@ -2731,22 +2816,15 @@ impl TunnelApp {
 
             ui.add_space(14.0);
             ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
+                let total = 198.0;
+                ui.add_space(((ui.available_width() - total) * 0.5).max(0.0));
+                if dialog_button(ui, '\u{2713}', theme::SUCCESS(), "OK", true).clicked() {
+                    save = true;
+                }
+                ui.add_space(6.0);
+                if dialog_button(ui, '\u{00d7}', theme::DANGER(), "Cancel", false).clicked() {
                     keep = false;
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if styled_button(
-                        ui,
-                        RichText::new("Save").size(12.5).strong(),
-                        true,
-                        false,
-                        None,
-                    )
-                    .clicked()
-                    {
-                        save = true;
-                    }
-                });
             });
         });
         if resp.should_close() {
@@ -3532,7 +3610,7 @@ impl TunnelApp {
             .show(ctx, |ui| {
                 Frame::NONE
                     .fill(with_alpha(theme::BG_CARD(), fade))
-                    .corner_radius(CornerRadius::same(10))
+                    .corner_radius(CornerRadius::same(2))
                     .stroke(Stroke::new(1.0_f32, with_alpha(stroke_c, fade)))
                     .inner_margin(Margin::symmetric(10, 6))
                     .show(ui, |ui| {
@@ -3569,55 +3647,48 @@ fn session_card(
 ) -> Option<CardAction> {
     let mut action = None;
     let (a_fg, a_bg) = auth_palette(auth_label);
-    // Tile color doubles as the row's left status bar color (group color
-    // when grouped, brand accent otherwise).
-    let bar_color = group_dot.unwrap_or(theme::ACCENT());
+    // Flat tree row, MobaXterm's session list: no card, no shadow, just a
+    // classic full-width selection highlight.
     let frame = Frame::NONE
         .fill(if selected {
             theme::BG_CARD_SEL()
         } else {
-            theme::BG_CARD()
+            Color32::TRANSPARENT
         })
-        .corner_radius(CornerRadius::same(12))
-        .shadow(
-            egui::Shadow {
-                offset: [0, 1],
-                blur: 9,
-                spread: 0,
-                color: Color32::from_rgba_unmultiplied(15, 23, 42, 22),
-            },
-        )
-        .stroke(Stroke::new(
-            1.0_f32,
-            if selected {
-                theme::ACCENT()
-            } else {
-                theme::BORDER()
-            },
-        ))
-        .inner_margin(Margin::symmetric(8, 3))
+        .corner_radius(CornerRadius::same(2))
+        .inner_margin(Margin::symmetric(4, 2))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 // Colorful per-session tile like a host-list icon: group
                 // color when grouped, brand accent otherwise, letter inside.
                 let tile_color = group_dot.unwrap_or(theme::ACCENT());
-                let letter: String = name
-                    .chars()
-                    .next()
-                    .map(|c| c.to_string().to_uppercase())
-                    .unwrap_or_else(|| "?".to_string());
-                // Single-line MobaXterm-dense tree row: icon tile, name,
-                // tiny auth chip, live dot. Host lives in the tooltip.
+                // Mini terminal icon: dark screen, group-coloured border and a
+                // green prompt. Original artwork drawn with the painter (no
+                // MobaXterm assets copied).
                 let (tile, _) =
                     ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
-                ui.painter().rect_filled(tile, 4.0, tile_color);
-                ui.painter().text(
-                    tile.center(),
-                    egui::Align2::CENTER_CENTER,
-                    &letter,
-                    egui::FontId::proportional(8.5),
-                    Color32::WHITE,
+                let p = ui.painter();
+                p.rect_filled(tile, 2.5, Color32::from_rgb(30, 30, 30));
+                p.rect_stroke(
+                    tile,
+                    2.5,
+                    Stroke::new(1.0_f32, tile_color),
+                    egui::StrokeKind::Inside,
+                );
+                let c = tile.center();
+                let prompt = Stroke::new(1.1_f32, Color32::from_rgb(126, 217, 87));
+                p.line_segment(
+                    [c + egui::vec2(-3.5, -3.0), c + egui::vec2(-1.0, -0.5)],
+                    prompt,
+                );
+                p.line_segment(
+                    [c + egui::vec2(-1.0, -0.5), c + egui::vec2(-3.5, 2.0)],
+                    prompt,
+                );
+                p.line_segment(
+                    [c + egui::vec2(0.0, 2.0), c + egui::vec2(3.5, 2.0)],
+                    prompt,
                 );
                 let shown: String = if name.chars().count() > 16 {
                     name.chars().take(15).collect::<String>() + "…"
@@ -3637,15 +3708,7 @@ fn session_card(
                     }
                 });
             });
-        })
-        ;
-    // Thin colored bar hugging the card's left edge — real group color.
-    let rr = frame.response.rect;
-    let bar = egui::Rect::from_min_size(
-        egui::pos2(rr.left() + 2.0, rr.top() + 3.0),
-        egui::vec2(3.0, rr.height() - 6.0),
-    );
-    ui.painter().rect_filled(bar, 1.6, bar_color);
+        });
     let resp = frame.response.interact(Sense::click());
 
     if resp.clicked() {
@@ -3708,7 +3771,7 @@ fn session_card(
             ui.close();
         }
     });
-    ui.add_space(6.0);
+    ui.add_space(2.0);
     action
 }
 
@@ -3724,8 +3787,19 @@ fn group_header_row(
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         if let Some(c) = color {
-            let (r, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), Sense::hover());
-            ui.painter().rect_filled(r, 3.0, c);
+            // Tiny folder glyph, like MobaXterm's session tree.
+            let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(
+                egui::Rect::from_min_max(r.min + egui::vec2(0.0, 4.0), r.max),
+                1.5,
+                c,
+            );
+            p.rect_filled(
+                egui::Rect::from_min_size(r.min + egui::vec2(1.0, 2.0), egui::vec2(6.0, 4.0)),
+                1.0,
+                c,
+            );
         }
         let caret = if expanded { "▾" } else { "▸" };
         if ghost_button(
@@ -3799,15 +3873,7 @@ fn tunnel_row(
 
     let frame = Frame::NONE
         .fill(theme::BG_CARD())
-        .corner_radius(CornerRadius::same(12))
-        .shadow(
-            egui::Shadow {
-                offset: [0, 1],
-                blur: 9,
-                spread: 0,
-                color: Color32::from_rgba_unmultiplied(15, 23, 42, 22),
-            },
-        )
+        .corner_radius(CornerRadius::same(2))
         .stroke(Stroke::new(1.0_f32, theme::BORDER()))
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
@@ -4040,35 +4106,66 @@ fn tool_button(
     active: bool,
     tip: &str,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(46.0, 38.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(54.0, 52.0), Sense::click());
     let p = ui.painter();
-    let (fill, stroke) = if active {
-        (
-            theme::ACCENT_SOFT(),
+    // MobaXterm toolbar tiles are borderless until hovered; the active tool
+    // gets a light-blue wash and a saturated strip on its bottom edge.
+    if active || resp.hovered() {
+        p.rect_filled(rect, 0.0, theme::ACCENT_SOFT());
+        p.rect_stroke(
+            rect,
+            0.0,
             Stroke::new(1.0_f32, theme::ACCENT()),
-        )
-    } else if resp.hovered() {
-        (theme::BG_BTN_HOVER(), Stroke::NONE)
-    } else {
-        (Color32::TRANSPARENT, Stroke::NONE)
-    };
-    if fill != Color32::TRANSPARENT {
-        p.rect_filled(rect, 8.0, fill);
+            egui::StrokeKind::Inside,
+        );
     }
-    p.rect_stroke(rect, 8.0, stroke, egui::StrokeKind::Inside);
+    if active {
+        p.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.bottom() - 3.0),
+                rect.max,
+            ),
+            0.0,
+            theme::ACCENT(),
+        );
+    }
     p.text(
-        egui::pos2(rect.center().x, rect.top() + 12.0),
+        egui::pos2(rect.center().x, rect.top() + 20.0),
         egui::Align2::CENTER_CENTER,
         glyph,
-        theme::icon(16.0),
+        theme::icon(24.0),
         tint,
     );
     p.text(
-        egui::pos2(rect.center().x, rect.bottom() - 6.0),
+        egui::pos2(rect.center().x, rect.bottom() - 10.0),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::proportional(9.0),
-        if active { theme::ACCENT() } else { theme::TEXT_DIM() },
+        egui::FontId::proportional(11.0),
+        if active { theme::ACCENT_TEXT() } else { theme::TEXT() },
+    );
+    resp.on_hover_text(tip)
+}
+
+/// Narrow far-right rail tile (26x26): flat until hovered, like the crop of
+/// icons down MobaXterm's right edge.
+fn rail_button(ui: &mut Ui, glyph: char, tint: Color32, tip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), Sense::click());
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(rect, 0.0, theme::ACCENT_SOFT());
+        p.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(1.0_f32, theme::ACCENT()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    p.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        theme::icon(15.0),
+        tint,
     );
     resp.on_hover_text(tip)
 }
@@ -4215,8 +4312,8 @@ fn theme_card(ui: &mut Ui, name: &str, dark: bool, active: bool) -> egui::Respon
     } else {
         Stroke::new(1.0_f32, theme::BORDER())
     };
-    p.rect_filled(rect, 10.0, bg);
-    p.rect_stroke(rect, 10.0, stroke, egui::StrokeKind::Inside);
+    p.rect_filled(rect, 2.0, bg);
+    p.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
     // Sidebar hint
     p.rect_filled(
         egui::Rect::from_min_size(rect.min, egui::vec2(46.0, rect.height())),
@@ -4268,14 +4365,17 @@ fn tab_chip(
     let mut clicked = false;
     let mut closed = false;
     let mut menu = None;
-    Frame::NONE
-        .fill(if active { theme::ACCENT() } else { Color32::TRANSPARENT })
-        .corner_radius(CornerRadius::same(8))
-        .stroke(if active {
-            Stroke::NONE
+    // MobaXterm-style tab: a rectangular page tab on the strip. The active
+    // tab uses the work-area surface with a saturated strip along its top
+    // edge; inactive tabs sit on the chrome colour.
+    let tab = Frame::NONE
+        .fill(if active {
+            theme::BG_WINDOW()
         } else {
-            Stroke::NONE
+            theme::BG_PANEL()
         })
+        .corner_radius(CornerRadius::same(2))
+        .stroke(Stroke::new(1.0_f32, theme::BORDER()))
         .inner_margin(Margin::symmetric(10, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -4285,7 +4385,9 @@ fn tab_chip(
                 }
                 let mut label = RichText::new(title).size(12.0);
                 if active {
-                    label = label.strong().color(Color32::WHITE);
+                    label = label.strong().color(theme::TEXT());
+                } else {
+                    label = label.color(theme::TEXT_DIM());
                 }
                 let label = ui
                     .add(egui::Label::new(label).sense(Sense::click()))
@@ -4316,14 +4418,14 @@ fn tab_chip(
                         .add(
                             egui::Button::new(
                                 RichText::new("×").size(9.5).color(if active {
-                                    Color32::from_rgba_unmultiplied(255, 255, 255, 200)
+                                    theme::TEXT_DIM()
                                 } else {
                                     theme::TEXT_FAINT()
                                 }),
                             )
                             .fill(Color32::TRANSPARENT)
                             .stroke(Stroke::NONE)
-                            .corner_radius(CornerRadius::same(4)),
+                            .corner_radius(CornerRadius::same(2)),
                         )
                         .on_hover_text("Close tab");
                     if x.clicked() {
@@ -4332,13 +4434,24 @@ fn tab_chip(
                 }
             });
         });
+
+    if active {
+        // Saturated top edge marks the active page, MobaXterm style.
+        let r = tab.response.rect;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 2.0)),
+            0.0,
+            theme::ACCENT(),
+        );
+    }
+
     (clicked, closed, menu)
 }
 
 fn chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) -> egui::Response {
     Frame::NONE
         .fill(bg)
-        .corner_radius(CornerRadius::same(5))
+        .corner_radius(CornerRadius::same(2))
         .inner_margin(Margin::symmetric(6, 1))
         .show(ui, |ui| {
             ui.label(RichText::new(text).size(9.5).color(fg).strong());
@@ -4362,8 +4475,196 @@ fn choice_pill(ui: &mut Ui, label: &str, active: bool) -> egui::Response {
                     theme::BORDER()
                 },
             ))
-            .corner_radius(CornerRadius::same(7)),
+            .corner_radius(CornerRadius::same(2)),
     )
+}
+
+/// Protocol tile in the session dialog: square, icon over label, with the
+/// active entry washed light blue and underlined in the accent color.
+fn proto_tile(
+    ui: &mut Ui,
+    glyph: char,
+    tint: Color32,
+    label: &str,
+    active: bool,
+    monitor: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(64.0, 58.0), Sense::click());
+    let p = ui.painter();
+    p.rect_filled(
+        rect,
+        0.0,
+        if active {
+            theme::ACCENT_SOFT()
+        } else {
+            theme::BG_PANEL()
+        },
+    );
+    p.rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(
+            1.0_f32,
+            if active || resp.hovered() {
+                theme::ACCENT()
+            } else {
+                theme::BORDER_STRONG()
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    if active {
+        p.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.bottom() - 3.0),
+                rect.max,
+            ),
+            0.0,
+            theme::ACCENT(),
+        );
+    }
+    if monitor {
+        // Original little monitor glyph for RDP.
+        let m = egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.top() + 20.0),
+            egui::vec2(26.0, 18.0),
+        );
+        p.rect_filled(m, 1.0, theme::BG_INPUT());
+        p.rect_stroke(
+            m,
+            1.0,
+            Stroke::new(1.5_f32, tint),
+            egui::StrokeKind::Inside,
+        );
+        p.line_segment(
+            [
+                egui::pos2(m.center().x, m.bottom()),
+                egui::pos2(m.center().x, m.bottom() + 3.0),
+            ],
+            Stroke::new(1.5_f32, tint),
+        );
+        p.line_segment(
+            [
+                egui::pos2(m.center().x - 5.0, m.bottom() + 3.0),
+                egui::pos2(m.center().x + 5.0, m.bottom() + 3.0),
+            ],
+            Stroke::new(1.5_f32, tint),
+        );
+    } else {
+        p.text(
+            egui::pos2(rect.center().x, rect.top() + 22.0),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            theme::icon(24.0),
+            tint,
+        );
+    }
+    p.text(
+        egui::pos2(rect.center().x, rect.bottom() - 11.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(11.0),
+        theme::TEXT(),
+    );
+    resp
+}
+
+/// Classic Win32 group box: a 1px rectangle with the caption sitting on the
+/// top border.
+fn group_box(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
+    let bg = theme::BG_PANEL();
+    let resp = Frame::NONE
+        .stroke(Stroke::new(1.0_f32, theme::BORDER_STRONG()))
+        .inner_margin(Margin {
+            left: 10,
+            right: 10,
+            top: 14,
+            bottom: 10,
+        })
+        .show(ui, add);
+    let rect = resp.response.rect;
+    let galley = ui.painter().layout_no_wrap(
+        title.to_owned(),
+        egui::FontId::proportional(11.0),
+        theme::TEXT_DIM(),
+    );
+    let pos = egui::pos2(rect.left() + 9.0, rect.top() - galley.size().y * 0.5);
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(
+            pos - egui::vec2(3.0, 1.0),
+            galley.size() + egui::vec2(6.0, 2.0),
+        ),
+        0.0,
+        bg,
+    );
+    ui.painter().galley(pos, galley, theme::TEXT_DIM());
+    ui.add_space(8.0);
+}
+
+/// Form row: right-aligned label column, then the control(s).
+fn form_row(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(92.0, 20.0),
+            Layout::right_to_left(Align::Center),
+            |ui| {
+                ui.label(RichText::new(label).size(11.0).color(theme::TEXT_DIM()));
+            },
+        );
+        ui.add_space(6.0);
+        add(ui);
+    });
+}
+
+/// Centered classic dialog button: colored glyph + black label on a gray face
+/// with a 1px edge.
+fn dialog_button(
+    ui: &mut Ui,
+    glyph: char,
+    tint: Color32,
+    label: &str,
+    primary: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(96.0, 26.0), Sense::click());
+    let p = ui.painter();
+    let hovered = resp.hovered();
+    p.rect_filled(
+        rect,
+        0.0,
+        if hovered {
+            theme::ACCENT_SOFT()
+        } else {
+            theme::BG_BTN()
+        },
+    );
+    p.rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(
+            1.0_f32,
+            if hovered || primary {
+                theme::ACCENT()
+            } else {
+                theme::BORDER_STRONG()
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    p.text(
+        egui::pos2(rect.left() + 22.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(15.0),
+        tint,
+    );
+    p.text(
+        egui::pos2(rect.center().x + 10.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(12.0),
+        theme::TEXT(),
+    );
+    resp
 }
 
 fn field(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
@@ -4406,7 +4707,7 @@ fn styled_button(
         }
         v.widgets.hovered.weak_bg_fill = hover;
         v.widgets.hovered.bg_fill = hover;
-        let button = egui::Button::new(text).corner_radius(CornerRadius::same(8));
+        let button = egui::Button::new(text).corner_radius(CornerRadius::same(2));
         ui.add_enabled_ui(enabled, |ui| match size {
             Some(s) => ui.add_sized(s, button),
             None => ui.add(button),
@@ -4434,7 +4735,7 @@ fn soft_pill(ui: &mut Ui, label: &str, fg: Color32, bg: Color32, hover_bg: Color
         ui.spacing_mut().button_padding = egui::vec2(9.0, 3.0);
         ui.add(
             egui::Button::new(RichText::new(label).size(10.5).strong().color(fg))
-                .corner_radius(CornerRadius::same(7)),
+                .corner_radius(CornerRadius::same(2)),
         )
     })
     .inner
@@ -4468,7 +4769,7 @@ fn ghost_button(ui: &mut Ui, text: RichText, danger: bool) -> egui::Response {
         ui.add(
             egui::Button::new(text)
                 .fill(Color32::TRANSPARENT)
-                .corner_radius(CornerRadius::same(6)),
+                .corner_radius(CornerRadius::same(2)),
         )
     })
     .inner
@@ -4494,8 +4795,8 @@ fn rail_tile(ui: &mut Ui, glyph: char, active: bool) -> egui::Response {
     } else {
         (Color32::TRANSPARENT, Stroke::NONE)
     };
-    p.rect_filled(rect, 10.0, fill);
-    p.rect_stroke(rect, 10.0, stroke, egui::StrokeKind::Inside);
+    p.rect_filled(rect, 2.0, fill);
+    p.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
     let ic = if active { theme::ACCENT() } else { theme::TEXT_DIM() };
     p.text(
         rect.center(),
@@ -4507,41 +4808,10 @@ fn rail_tile(ui: &mut Ui, glyph: char, active: bool) -> egui::Response {
     resp
 }
 
-fn styled_ghost_chip(
-    ui: &mut Ui,
-    label: &str,
-    active: bool,
-    dot: Option<Color32>,
-) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(78.0, 23.0), Sense::click());
-    let painter = ui.painter_at(rect);
-    if active {
-        painter.rect_filled(rect, 6.0, theme::BG_CARD_SEL());
-        painter.rect_stroke(
-            rect,
-            6.0,
-            Stroke::new(1.0_f32, theme::ACCENT()),
-            egui::StrokeKind::Inside,
-        );
-    }
-    let center = egui::pos2(if dot.is_some() { rect.center().x + 4.0 } else { rect.center().x }, rect.center().y);
-    painter.text(
-        center,
-        Align2::CENTER_CENTER,
-        label,
-        egui::FontId::proportional(10.5),
-        if active { theme::TEXT() } else { theme::TEXT_DIM() },
-    );
-    if let Some(d) = dot {
-        painter.circle_filled(egui::pos2(rect.left() + 9.0, rect.center().y), 2.5, d);
-    }
-    resp
-}
-
 fn empty_hint(ui: &mut Ui, title: &str, body: &str) {
     Frame::NONE
         .fill(theme::BG_PANEL_ALT())
-        .corner_radius(CornerRadius::same(12))
+        .corner_radius(CornerRadius::same(2))
         .stroke(Stroke::new(1.0_f32, theme::BORDER()))
         .inner_margin(Margin::same(18))
         .show(ui, |ui| {
@@ -4556,6 +4826,86 @@ fn empty_hint(ui: &mut Ui, title: &str, body: &str) {
                 );
             });
         });
+}
+
+/// Window controls for the custom title bar.
+#[derive(Clone, Copy)]
+enum WinBtn {
+    Min,
+    Max,
+    Restore,
+    Close,
+}
+
+/// Paints one title-bar window control (minimize / maximize / restore / close)
+/// and returns its click response. Everything is drawn with the painter, so no
+/// icon-font codepoints are needed for the window chrome.
+fn window_button(ui: &mut Ui, btn: WinBtn) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(42.0, 28.0), Sense::click());
+    let hovered = resp.hovered();
+    let is_close = matches!(btn, WinBtn::Close);
+    if hovered {
+        // Close gets the conventional red wash; the rest a neutral one.
+        let fill = if is_close {
+            theme::DANGER()
+        } else {
+            theme::BG_BTN_HOVER()
+        };
+        ui.painter().rect_filled(rect, 0.0, fill);
+    }
+    let col = if hovered && is_close {
+        Color32::WHITE
+    } else {
+        theme::TEXT_DIM()
+    };
+    let stroke = Stroke::new(1.0_f32, col);
+    let c = rect.center();
+    let p = ui.painter();
+    match btn {
+        WinBtn::Min => {
+            p.line_segment(
+                [egui::pos2(c.x - 5.0, c.y), egui::pos2(c.x + 5.0, c.y)],
+                stroke,
+            );
+        }
+        WinBtn::Max => {
+            p.rect_stroke(
+                egui::Rect::from_center_size(c, egui::vec2(10.0, 10.0)),
+                0.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        WinBtn::Restore => {
+            let back = egui::Rect::from_center_size(
+                egui::pos2(c.x - 1.5, c.y - 1.5),
+                egui::vec2(9.0, 9.0),
+            );
+            let front = egui::Rect::from_center_size(
+                egui::pos2(c.x + 1.5, c.y + 1.5),
+                egui::vec2(9.0, 9.0),
+            );
+            p.rect_stroke(back, 0.0, stroke, egui::StrokeKind::Inside);
+            p.rect_stroke(front, 0.0, stroke, egui::StrokeKind::Inside);
+        }
+        WinBtn::Close => {
+            p.line_segment(
+                [
+                    egui::pos2(c.x - 5.0, c.y - 5.0),
+                    egui::pos2(c.x + 5.0, c.y + 5.0),
+                ],
+                stroke,
+            );
+            p.line_segment(
+                [
+                    egui::pos2(c.x + 5.0, c.y - 5.0),
+                    egui::pos2(c.x - 5.0, c.y + 5.0),
+                ],
+                stroke,
+            );
+        }
+    }
+    resp
 }
 
 fn paint_mark(ui: &mut Ui, texture: &egui::TextureHandle, size: f32) {

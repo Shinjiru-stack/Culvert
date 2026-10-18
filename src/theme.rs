@@ -59,39 +59,39 @@ pub struct Palette {
 
 #[rustfmt::skip]
 pub const LIGHT: Palette = Palette {
-    bg_window:          Color32::from_rgb(250, 250, 251), // #FAFAFB
-    bg_panel:           Color32::from_rgb(243, 244, 246), // #F3F4F6
-    bg_panel_alt:       Color32::from_rgb(238, 240, 244), // #EEF0F4
+    bg_window:          Color32::from_rgb(255, 255, 255), // #FFFFFF content
+    bg_panel:           Color32::from_rgb(240, 240, 240), // #F0F0F0 chrome
+    bg_panel_alt:       Color32::from_rgb(233, 233, 233), // #E9E9E9
     bg_card:            Color32::from_rgb(255, 255, 255),
-    bg_card_sel:        Color32::from_rgb(237, 240, 253),
+    bg_card_sel:        Color32::from_rgb(204, 232, 255), // #CCE8FF
     bg_input:           Color32::from_rgb(255, 255, 255),
-    bg_btn:             Color32::from_rgb(255, 255, 255),
-    bg_btn_hover:       Color32::from_rgb(241, 243, 247),
-    border:             Color32::from_rgb(226, 229, 236),
-    border_strong:      Color32::from_rgb(206, 210, 221),
-    accent:             Color32::from_rgb(76, 94, 214),   // #4C5ED6
-    accent_hover:       Color32::from_rgb(61, 76, 189),
-    accent_soft:        Color32::from_rgb(233, 238, 254),
-    accent_soft_hover:  Color32::from_rgb(219, 227, 252),
-    accent_text:        Color32::from_rgb(58, 72, 180),
-    text:               Color32::from_rgb(30, 33, 40),    // #1E2128
-    text_dim:           Color32::from_rgb(98, 105, 118),
-    text_faint:         Color32::from_rgb(148, 155, 168),
-    success:            Color32::from_rgb(7, 133, 83),    // #078553
-    success_bg:         Color32::from_rgb(230, 246, 238),
-    warning:            Color32::from_rgb(184, 110, 8),   // #B86E08
-    warning_bg:         Color32::from_rgb(253, 244, 223),
-    danger:             Color32::from_rgb(211, 47, 47),   // #D32F2F
-    danger_btn:         Color32::from_rgb(211, 47, 47),
-    danger_btn_hover:   Color32::from_rgb(178, 34, 34),
-    danger_bg:          Color32::from_rgb(252, 233, 234),
-    info:               Color32::from_rgb(31, 103, 214),  // #1F67D6
-    info_bg:            Color32::from_rgb(232, 240, 253),
-    violet:             Color32::from_rgb(110, 58, 205),  // #6E3ACD
-    violet_bg:          Color32::from_rgb(242, 236, 253),
-    sb_bg:              Color32::from_rgb(27, 30, 38),    // #1B1E26
-    sb_text:            Color32::from_rgb(168, 176, 192),
-    sb_text_faint:      Color32::from_rgb(112, 120, 136),
+    bg_btn:             Color32::from_rgb(240, 240, 240),
+    bg_btn_hover:       Color32::from_rgb(229, 241, 251), // #E5F1FB
+    border:             Color32::from_rgb(217, 217, 217), // #D9D9D9
+    border_strong:      Color32::from_rgb(173, 173, 173), // #ADADAD
+    accent:             Color32::from_rgb(0, 120, 215),   // #0078D7
+    accent_hover:       Color32::from_rgb(0, 99, 177),
+    accent_soft:        Color32::from_rgb(229, 241, 251),
+    accent_soft_hover:  Color32::from_rgb(204, 232, 255),
+    accent_text:        Color32::from_rgb(0, 90, 158),
+    text:               Color32::from_rgb(26, 26, 26),    // #1A1A1A
+    text_dim:           Color32::from_rgb(90, 90, 90),
+    text_faint:         Color32::from_rgb(138, 138, 138),
+    success:            Color32::from_rgb(16, 124, 16),   // #107C10
+    success_bg:         Color32::from_rgb(223, 246, 221),
+    warning:            Color32::from_rgb(157, 93, 0),    // #9D5D00
+    warning_bg:         Color32::from_rgb(255, 244, 206),
+    danger:             Color32::from_rgb(196, 43, 28),   // #C42B1C
+    danger_btn:         Color32::from_rgb(196, 43, 28),
+    danger_btn_hover:   Color32::from_rgb(164, 38, 25),
+    danger_bg:          Color32::from_rgb(253, 231, 233),
+    info:               Color32::from_rgb(0, 120, 215),   // #0078D7
+    info_bg:            Color32::from_rgb(229, 241, 251),
+    violet:             Color32::from_rgb(136, 23, 152),  // #881798
+    violet_bg:          Color32::from_rgb(245, 233, 247),
+    sb_bg:              Color32::from_rgb(240, 240, 240), // #F0F0F0
+    sb_text:            Color32::from_rgb(60, 60, 60),
+    sb_text_faint:      Color32::from_rgb(118, 118, 118),
 };
 
 #[rustfmt::skip]
@@ -235,21 +235,37 @@ pub fn apply(ctx: &egui::Context) {
         egui::ThemePreference::Light
     });
 
+    // Keep the OS window dressing (win11 frame/shadow, dark-mode title bar)
+    // in step with our palette. Without this a dark app keeps the light
+    // system title bar — and the window border/shadow stays light too.
+    sync_os_window_theme(ctx);
+
     let mut style = (*ctx.style()).clone();
     style.visuals = visuals();
     style.text_styles = text_styles();
     {
         let s = &mut style.spacing;
-        s.item_spacing = egui::vec2(7.0, 4.0);
-        s.button_padding = egui::vec2(8.0, 3.0);
-        s.window_margin = Margin::same(10);
-        s.menu_margin = Margin::same(4);
-        s.indent = 14.0;
-        s.interact_size = egui::vec2(30.0, 22.0);
+        s.item_spacing = egui::vec2(6.0, 3.0);
+        s.button_padding = egui::vec2(7.0, 2.0);
+        s.window_margin = Margin::same(8);
+        s.menu_margin = Margin::same(3);
+        s.indent = 12.0;
+        s.interact_size = egui::vec2(28.0, 20.0);
         s.combo_width = 120.0;
         s.tooltip_width = 420.0;
     }
     ctx.set_style(style);
+}
+
+/// Ask the OS window manager to match our palette (dark/light title bar and
+/// frame). egui maps this to winit's `set_theme`, which on Windows toggles
+/// `DWMWA_USE_IMMERSIVE_DARK_MODE`. Safe to call on every theme change.
+pub fn sync_os_window_theme(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(if is_dark() {
+        egui::SystemTheme::Dark
+    } else {
+        egui::SystemTheme::Light
+    }));
 }
 
 fn install_fonts(ctx: &egui::Context) {
@@ -292,24 +308,34 @@ fn install_fonts(ctx: &egui::Context) {
     // System fonts as last-resort fallbacks: Segoe UI Symbol covers glyphs
     // missing from the bundled fonts (●, ×, triangles, arrows…) so they
     // render instead of tofu boxes on Windows.
+    // MobaXterm's own type stack: Segoe UI for the chrome, Consolas for the
+    // shell. These are Windows system fonts referenced in place — nothing is
+    // redistributed. Segoe UI Symbol stays as a glyph fallback so symbols
+    // (●, ×, triangles, arrows...) render instead of tofu boxes.
     for (name, path) in [
         ("SegoeUISymbol", "C:\\Windows\\Fonts\\seguisym.ttf"),
         ("SegoeUI", "C:\\Windows\\Fonts\\segoeui.ttf"),
+        ("Consolas", "C:\\Windows\\Fonts\\consola.ttf"),
     ] {
         if let Ok(bytes) = std::fs::read(path) {
             fonts
                 .font_data
                 .insert(name.to_owned(), Arc::new(FontData::from_owned(bytes)));
-            fonts
-                .families
-                .entry(FontFamily::Proportional)
-                .or_default()
-                .push(name.to_owned());
-            fonts
-                .families
-                .entry(FontFamily::Monospace)
-                .or_default()
-                .push(name.to_owned());
+        }
+    }
+    for (name, family, front) in [
+        ("SegoeUI", FontFamily::Proportional, true),
+        ("Consolas", FontFamily::Monospace, true),
+        ("SegoeUISymbol", FontFamily::Proportional, false),
+        ("SegoeUISymbol", FontFamily::Monospace, false),
+    ] {
+        if fonts.font_data.contains_key(name) {
+            let list = fonts.families.entry(family).or_default();
+            if front {
+                list.insert(0, name.to_owned());
+            } else {
+                list.push(name.to_owned());
+            }
         }
     }
     ctx.set_fonts(fonts);
@@ -318,13 +344,14 @@ fn install_fonts(ctx: &egui::Context) {
 fn text_styles() -> std::collections::BTreeMap<TextStyle, FontId> {
     use FontFamily::{Monospace, Proportional};
     [
-        (TextStyle::Heading, FontId::new(17.0, Proportional)),
-        (h1(), FontId::new(18.0, Proportional)),
-        (h2(), FontId::new(13.5, Proportional)),
-        (TextStyle::Body, FontId::new(12.5, Proportional)),
-        (TextStyle::Button, FontId::new(12.5, Proportional)),
-        (TextStyle::Small, FontId::new(10.5, Proportional)),
-        (TextStyle::Monospace, FontId::new(11.0, Monospace)),
+        (TextStyle::Heading, FontId::new(15.0, Proportional)),
+        (h1(), FontId::new(15.0, Proportional)),
+        (h2(), FontId::new(12.0, Proportional)),
+        (TextStyle::Body, FontId::new(12.0, Proportional)),
+        (TextStyle::Button, FontId::new(12.0, Proportional)),
+        (TextStyle::Small, FontId::new(10.0, Proportional)),
+        // Consolas at ~10pt, matching MobaXterm's default shell font.
+        (TextStyle::Monospace, FontId::new(13.0, Monospace)),
     ]
     .into()
 }
@@ -334,10 +361,10 @@ fn visuals() -> Visuals {
     let mut v = if dark { Visuals::dark() } else { Visuals::light() };
     v.dark_mode = dark;
     v.panel_fill = BG_PANEL();
-    v.window_fill = BG_CARD();
+    v.window_fill = BG_PANEL();
     v.window_stroke = Stroke::new(1.0_f32, BORDER_STRONG());
-    v.window_corner_radius = CornerRadius::same(14);
-    v.menu_corner_radius = CornerRadius::same(10);
+    v.window_corner_radius = CornerRadius::same(3);
+    v.menu_corner_radius = CornerRadius::same(2);
     v.window_shadow = Shadow {
         offset: [0, 12],
         blur: 34,
@@ -364,15 +391,19 @@ fn visuals() -> Visuals {
     v.faint_bg_color = BG_PANEL_ALT();
     v.striped = false;
     v.hyperlink_color = ACCENT();
-    v.selection.bg_fill = Color32::from_rgba_unmultiplied(88, 112, 250, 64);
+    v.selection.bg_fill = if dark {
+        Color32::from_rgba_unmultiplied(88, 112, 250, 64)
+    } else {
+        Color32::from_rgba_unmultiplied(0, 120, 215, 64)
+    };
     v.selection.stroke = Stroke::new(1.0_f32, ACCENT());
 
-    let r = CornerRadius::same(8);
+    let r = CornerRadius::same(2);
     v.widgets.noninteractive = WidgetVisuals {
         bg_fill: BG_PANEL_ALT(),
         weak_bg_fill: BG_PANEL_ALT(),
         bg_stroke: Stroke::new(1.0_f32, BORDER()),
-        corner_radius: CornerRadius::same(10),
+        corner_radius: CornerRadius::same(2),
         // Default label color: plain labels without an explicit color land here.
         fg_stroke: Stroke::new(1.0_f32, TEXT()),
         expansion: 0.0,
@@ -380,7 +411,8 @@ fn visuals() -> Visuals {
     v.widgets.inactive = WidgetVisuals {
         bg_fill: BG_BTN(),
         weak_bg_fill: BG_BTN(),
-        bg_stroke: Stroke::new(1.0_f32, BORDER()),
+        // Classic Win32 controls always carry a visible 1px edge.
+        bg_stroke: Stroke::new(1.0_f32, BORDER_STRONG()),
         corner_radius: r,
         fg_stroke: Stroke::new(1.0_f32, TEXT()),
         expansion: 0.0,
@@ -388,15 +420,15 @@ fn visuals() -> Visuals {
     v.widgets.hovered = WidgetVisuals {
         bg_fill: BG_BTN_HOVER(),
         weak_bg_fill: BG_BTN_HOVER(),
-        bg_stroke: Stroke::new(1.0_f32, BORDER_STRONG()),
+        bg_stroke: Stroke::new(1.0_f32, ACCENT()),
         corner_radius: r,
         fg_stroke: Stroke::new(1.0_f32, TEXT()),
         expansion: 0.0,
     };
     v.widgets.active = WidgetVisuals {
-        bg_fill: ACCENT_SOFT(),
-        weak_bg_fill: ACCENT_SOFT(),
-        bg_stroke: Stroke::new(1.0_f32, ACCENT()),
+        bg_fill: ACCENT_SOFT_HOVER(),
+        weak_bg_fill: ACCENT_SOFT_HOVER(),
+        bg_stroke: Stroke::new(1.0_f32, ACCENT_HOVER()),
         corner_radius: r,
         fg_stroke: Stroke::new(1.0_f32, TEXT()),
         expansion: 0.0,

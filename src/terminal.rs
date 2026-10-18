@@ -11,24 +11,16 @@ use russh::ChannelMsg;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const SCROLLBACK_LINES: usize = 4000;
-/// Terminal canvas: follows the light/dark palette switch.
-// Mirror the theme::ACCENT() const-style naming deliberately.
+/// Terminal canvas. MobaXterm keeps its shell black regardless of the app
+/// chrome, so the canvas no longer follows the light/dark palette switch.
 #[allow(non_snake_case)]
 fn TERM_BG() -> Color32 {
-    if theme::is_dark() {
-        Color32::from_rgb(13, 17, 23) // #0D1117
-    } else {
-        Color32::from_rgb(255, 255, 255)
-    }
+    Color32::from_rgb(0, 0, 0)
 }
-/// Terminal foreground: follows the light/dark palette switch.
+/// Terminal foreground: the classic xterm light grey used by MobaXterm.
 #[allow(non_snake_case)]
 fn TERM_FG() -> Color32 {
-    if theme::is_dark() {
-        Color32::from_rgb(230, 237, 243) // #E6EDF3
-    } else {
-        Color32::from_rgb(31, 35, 40)
-    }
+    Color32::from_rgb(229, 229, 229) // #E5E5E5
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +250,7 @@ impl TerminalSession {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, TERM_BG());
 
-        let font_id = FontId::new(12.0, FontFamily::Monospace);
+        let font_id = FontId::new(13.0, FontFamily::Monospace);
         let (cell_w, cell_h) = ui.fonts(|f| {
             (
                 f.glyph_width(&font_id, 'M').max(1.0),
@@ -351,7 +343,7 @@ impl TerminalSession {
                     egui::Align2::CENTER_CENTER,
                     format!("Connecting to {} …", self.connection_label()),
                     FontId::proportional(11.5),
-                    theme::TEXT_DIM(),
+                    Color32::from_gray(180),
                 );
             }
             TermStatus::Closed(reason) => {
@@ -508,14 +500,26 @@ impl TerminalSession {
             );
             if focused {
                 if blink_on {
-                    painter.rect_filled(crect, 1.0, Color32::from_rgba_unmultiplied(76, 94, 214, 48));
+                    // Solid block cursor, like MobaXterm/xterm. A light wash
+                    // keeps the glyph underneath readable.
+                    painter.rect_filled(
+                        crect,
+                        0.0,
+                        Color32::from_rgba_unmultiplied(229, 229, 229, 110),
+                    );
+                    painter.rect_stroke(
+                        crect,
+                        0.0,
+                        Stroke::new(1.0_f32, Color32::from_gray(229)),
+                        StrokeKind::Inside,
+                    );
                 }
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
             } else {
                 painter.rect_stroke(
                     crect,
-                    1.0,
-                    Stroke::new(1.0_f32, theme::TEXT_FAINT()),
+                    0.0,
+                    Stroke::new(1.0_f32, Color32::from_gray(140)),
                     StrokeKind::Inside,
                 );
             }
@@ -528,7 +532,7 @@ impl TerminalSession {
                 egui::Align2::RIGHT_TOP,
                 format!("↑ {scrollback} lines — press any key to return"),
                 FontId::proportional(10.0),
-                theme::TEXT_FAINT(),
+                Color32::from_gray(160),
             );
         }
     }
@@ -784,7 +788,7 @@ fn map_color(c: vt100::Color, default: Color32, bold: bool) -> Color32 {
     match c {
         vt100::Color::Default => {
             if bold && default == TERM_FG() {
-                Color32::from_rgb(10, 13, 17)
+                Color32::WHITE
             } else {
                 default
             }
@@ -795,24 +799,26 @@ fn map_color(c: vt100::Color, default: Color32, bold: bool) -> Color32 {
 }
 
 fn idx_color(i: u8, bold: bool) -> Color32 {
-    // 16 base colors tuned for the light terminal (GitHub Light family).
+    // The classic xterm 16-colour palette MobaXterm ships as its default
+    // ("MobaXterm") colour scheme: pure black canvas, saturated ANSI hues and
+    // an #E5E5E5 foreground.
     const BASE: [(u8, u8, u8); 16] = [
-        (37, 41, 48),   // 0 black — #252930
-        (207, 34, 46),  // 1 red — #CF222E
-        (18, 99, 43),   // 2 green — #12632B
-        (154, 103, 0),  // 3 yellow — #9A6700
-        (9, 80, 174),   // 4 blue — #0950AE
-        (130, 80, 223), // 5 magenta — #8250DF
-        (27, 124, 131), // 6 cyan — #1B7C83
-        (110, 119, 129), // 7 white — #6E7781
-        (87, 96, 106),  // 8 bright black — #57606A
-        (164, 14, 38),  // 9 bright red — #A40E26
-        (26, 127, 55),  // 10 bright green — #1A7F37
-        (191, 135, 0),  // 11 bright yellow — #BF8700
-        (33, 139, 255), // 12 bright blue — #218BFF
-        (164, 117, 249), // 13 bright magenta — #A475F9
-        (49, 146, 170), // 14 bright cyan — #3192AA
-        (134, 143, 155), // 15 bright white — #868F9B
+        (0, 0, 0),       // 0 black — #000000
+        (205, 0, 0),     // 1 red — #CD0000
+        (0, 205, 0),     // 2 green — #00CD00
+        (205, 205, 0),   // 3 yellow — #CDCD00
+        (0, 0, 238),     // 4 blue — #0000EE
+        (205, 0, 205),   // 5 magenta — #CD00CD
+        (0, 205, 205),   // 6 cyan — #00CDCD
+        (229, 229, 229), // 7 white — #E5E5E5
+        (127, 127, 127), // 8 bright black — #7F7F7F
+        (255, 0, 0),     // 9 bright red — #FF0000
+        (0, 255, 0),     // 10 bright green — #00FF00
+        (255, 255, 0),   // 11 bright yellow — #FFFF00
+        (92, 92, 255),   // 12 bright blue — #5C5CFF
+        (255, 0, 255),   // 13 bright magenta — #FF00FF
+        (0, 255, 255),   // 14 bright cyan — #00FFFF
+        (255, 255, 255), // 15 bright white — #FFFFFF
     ];
     let i = if bold && i < 8 { i + 8 } else { i };
     if i < 16 {
@@ -901,8 +907,8 @@ mod tests {
 
     #[test]
     fn ansi_palette_bounds() {
-        assert_eq!(idx_color(1, false), Color32::from_rgb(207, 34, 46));
-        assert_eq!(idx_color(9, false), Color32::from_rgb(164, 14, 38));
+        assert_eq!(idx_color(1, false), Color32::from_rgb(205, 0, 0));
+        assert_eq!(idx_color(9, false), Color32::from_rgb(255, 0, 0));
         assert_eq!(idx_color(16, false), Color32::from_rgb(0, 0, 0));
         assert_eq!(idx_color(231, false), Color32::from_rgb(255, 255, 255));
         assert_eq!(idx_color(255, false), Color32::from_rgb(238, 238, 238));

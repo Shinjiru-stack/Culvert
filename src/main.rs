@@ -56,6 +56,11 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([1020.0, 660.0])
             .with_title(format!("Culvert {}", version::tag()))
             .with_app_id("culvert")
+            // Client-side decorations: we draw our own title bar. A decorated
+            // Win11 window reserves an invisible ~8px resize/shadow border
+            // inside its outer rect, which shows as dark bars at the window
+            // edges (issue #1). An undecorated window has zero margin there.
+            .with_decorations(false)
             .with_icon(Arc::new(theme::app_icon(256))),
         ..Default::default()
     };
