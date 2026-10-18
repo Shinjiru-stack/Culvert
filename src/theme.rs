@@ -207,6 +207,11 @@ pub fn set_dark(dark: bool) {
     }
 }
 
+/// Glyph font id for Tabler icon codepoints (`\u{ebef}` terminals etc.).
+pub fn icon(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("tabler-icons".into()))
+}
+
 /// Named text style for the big page title.
 pub fn h1() -> TextStyle {
     TextStyle::Name("app.h1".into())
@@ -259,6 +264,20 @@ fn install_fonts(ctx: &egui::Context) {
             "../assets/fonts/JetBrainsMono-Regular.ttf"
         ))),
     );
+    // Tabler Icons webfont (MIT): professional line icons drawn as glyphs.
+    // Lives in its own family (never in the text fallback chain so its PUA
+    // codepoints stay out of normal text shaping).
+    fonts.font_data.insert(
+        "TablerIcons".to_owned(),
+        Arc::new(FontData::from_static(include_bytes!(
+            "../assets/fonts/tabler-icons.ttf"
+        ))),
+    );
+    fonts
+        .families
+        .entry(FontFamily::Name("tabler-icons".into()))
+        .or_default()
+        .insert(0, "TablerIcons".to_owned());
     // Prepend our fonts, keeping the bundled fallbacks (emoji etc.) behind them.
     fonts
         .families

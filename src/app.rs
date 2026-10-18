@@ -1120,8 +1120,8 @@ impl TunnelApp {
         ui.with_layout(Layout::top_down(Align::Min), |ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
             for (mode, glyph, hover) in [
-                (SideMode::Sessions, "☰", "Sessions — saved SSH sessions"),
-                (SideMode::Files, "▦", "Files — browse the connected server"),
+                (SideMode::Sessions, tglyph::RAIL_SESSIONS, "Sessions — saved SSH sessions"),
+                (SideMode::Files, tglyph::RAIL_FILES, "Files — browse the connected server"),
             ] {
                 let active = self.side_mode == mode;
                 let resp = rail_tile(ui, glyph, active);
@@ -1136,7 +1136,7 @@ impl TunnelApp {
                 resp.on_hover_text(hover);
             }
             ui.add_space(14.0);
-            let resp = rail_tile(ui, "»", false);
+            let resp = rail_tile(ui, tglyph::CHEVRON_RIGHT, false);
             if resp.clicked() {
                 self.sidebar_collapsed = false;
             }
@@ -1197,9 +1197,14 @@ impl TunnelApp {
                 let col = ui.style().visuals.widgets.inactive.fg_stroke.color;
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("«").size(12.0).color(col))
-                            .fill(Color32::TRANSPARENT)
-                            .corner_radius(6),
+                        egui::Button::new(
+                            RichText::new(tglyph::CHEVRON_LEFT)
+                                .size(13.0)
+                                .color(col)
+                                .font(theme::icon(12.0)),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .corner_radius(6),
                     )
                     .on_hover_text("Collapse sidebar to icons")
                     .clicked()
@@ -1551,24 +1556,24 @@ impl TunnelApp {
     // Tab strip
     // -----------------------------------------------------------------------
 
-    /// Icon toolbar across the top of the workspace (original painted icons).
+    /// Icon toolbar across the top of the workspace (Tabler glyph tiles).
     fn toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            if tool_button(ui, RailIcon::Session, theme::SUCCESS(), "Session", false, "New session")
+            ui.spacing_mut().item_spacing.x = 5.0;
+            if tool_button(ui, tglyph::SESSION, "Session", false, "New session")
                 .clicked()
             {
                 self.session_editor = Some(SessionEditor::new());
             }
-            let tun = tool_button(
+            if tool_button(
                 ui,
-                RailIcon::Tunnel,
-                theme::INFO(),
+                tglyph::TUNNEL,
                 "Tunnel",
                 false,
                 "New tunnel — any SSH host; a saved session is optional",
-            );
-            if tun.clicked() {
+            )
+            .clicked()
+            {
                 self.tunnel_editor = Some(TunnelEditor::new_standalone());
             }
             // Slim vertical separator between the action and view groups.
@@ -1580,30 +1585,26 @@ impl TunnelApp {
                 );
             }
             let split_active = self.split_view && self.terminal_tab_count() >= 2;
-            if tool_button(ui, RailIcon::Split, theme::VIOLET(), "Split", split_active, "Toggle split view")
+            if tool_button(ui, tglyph::SPLIT, "Split", split_active, "Toggle split view")
                 .clicked()
             {
                 self.split_view = !self.split_view;
             }
-            if tool_button(ui, RailIcon::Activity, theme::WARNING(), "Activity", self.show_logs, "Activity log")
+            if tool_button(ui, tglyph::ACTIVITY, "Activity", self.show_logs, "Activity log")
                 .clicked()
             {
                 self.show_logs = !self.show_logs;
             }
             // Right edge: light/dark palette switch. The glyph shows the
-            // theme you get, matching the MobaXterm-style tool tiles.
+            // theme you'll get.
             ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                let tint = if theme::is_dark() {
-                    Color32::from_rgb(229, 200, 86) // warm sun-tone in dark chrome
-                } else {
-                    Color32::from_rgb(148, 155, 168) // quiet slate in light chrome
-                };
+                let glyph = if theme::is_dark() { tglyph::SUN } else { tglyph::MOON };
                 let tip = if theme::is_dark() {
                     "Switch to the light theme"
                 } else {
                     "Switch to the dark theme"
                 };
-                if tool_button(ui, RailIcon::Theme, tint, "Theme", false, tip)
+                if tool_button(ui, glyph, "Theme", false, tip)
                     .clicked()
                 {
                     theme::set_dark(!theme::is_dark());
@@ -3318,136 +3319,74 @@ fn tunnel_row(
 
 /// Terminal-style tab chip; right-click opens the Chrome-style tab menu.
 /// Returns (clicked-activate, clicked-close, context-menu command).
-/// Left-rail/toolbar icon button glyph (original vector art — no font-symbol
-/// availability worries).
-#[derive(Clone, Copy)]
-enum RailIcon {
-    Session,
-    Tunnel,
-    Split,
-    Activity,
-    /// Theme switch — drawn as the ☀/☾ glyph of the *target* theme.
-    Theme,
+
+/// Tabler Icons glyphs (MIT, bundled webfont) — professional line icons for
+/// the toolbar and rail.
+mod tglyph {
+    /// terminal-2 (session / shell)
+    pub const SESSION: char = '\u{ebef}';
+    /// arrows-exchange (tunnel)
+    pub const TUNNEL: char = '\u{f1f4}';
+    /// columns-2 (split view)
+    pub const SPLIT: char = '\u{f6d5}';
+    /// activity (pulse)
+    pub const ACTIVITY: char = '\u{ed23}';
+    /// sun / moon (theme switch — pick the theme you'll get)
+    pub const SUN: char = '\u{eb30}';
+    pub const MOON: char = '\u{eaf8}';
+    /// server-2 / folder (collapsed rail tiles)
+    pub const RAIL_SESSIONS: char = '\u{f07c}';
+    pub const RAIL_FILES: char = '\u{eaad}';
+    /// chevron-right / left (rail expand, sidebar collapse)
+    pub const CHEVRON_RIGHT: char = '\u{ea61}';
+    pub const CHEVRON_LEFT: char = '\u{ea60}';
 }
 
-fn paint_rail_icon(p: &egui::Painter, rect: egui::Rect, icon: RailIcon, color: Color32) {
-    let c = rect.center();
-    // All glyphs are drawn inside a 16×16 box centered on `rect` so they can
-    // never spill over a button tile or misalign with its edges.
-    let line = |a: egui::Pos2, b: egui::Pos2, w: f32| p.line_segment([a, b], Stroke::new(w, color));
-    let w = 2.0_f32;
-    match icon {
-        RailIcon::Session => {
-            // A small terminal window with a ">_" prompt inside.
-            let r = egui::Rect::from_center_size(c, egui::vec2(15.0, 12.5));
-            p.rect_stroke(r, 3.0, Stroke::new(w, color), egui::StrokeKind::Inside);
-            line(
-                egui::pos2(c.x - 3.5, c.y - 1.0),
-                egui::pos2(c.x - 1.0, c.y + 1.0),
-                w,
-            );
-            line(
-                egui::pos2(c.x - 1.0, c.y + 1.0),
-                egui::pos2(c.x - 3.5, c.y + 3.0),
-                w,
-            );
-            line(
-                egui::pos2(c.x + 1.0, c.y + 3.0),
-                egui::pos2(c.x + 3.5, c.y + 3.0),
-                w,
-            );
-        }
-        RailIcon::Tunnel => {
-            // Two opposing arrows: traffic flowing through a tunnel.
-            line(egui::pos2(c.x - 7.0, c.y - 3.0), egui::pos2(c.x + 7.0, c.y - 3.0), w);
-            line(egui::pos2(c.x + 4.8, c.y - 5.2), egui::pos2(c.x + 7.0, c.y - 3.0), w);
-            line(egui::pos2(c.x + 4.8, c.y - 0.8), egui::pos2(c.x + 7.0, c.y - 3.0), w);
-            line(egui::pos2(c.x + 7.0, c.y + 3.0), egui::pos2(c.x - 7.0, c.y + 3.0), w);
-            line(egui::pos2(c.x - 4.8, c.y + 0.8), egui::pos2(c.x - 7.0, c.y + 3.0), w);
-            line(egui::pos2(c.x - 4.8, c.y + 5.2), egui::pos2(c.x - 7.0, c.y + 3.0), w);
-        }
-        RailIcon::Split => {
-            for (dx, dy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                let quad = egui::Rect::from_center_size(
-                    egui::pos2(c.x + dx * 4.0, c.y + dy * 4.0),
-                    egui::vec2(6.0, 6.0),
-                );
-                p.rect_filled(quad, 1.6, color);
-            }
-        }
-        RailIcon::Activity => {
-            p.circle_stroke(c, 6.5, Stroke::new(w, color));
-            line(c, egui::pos2(c.x, c.y - 3.8), w);
-            line(c, egui::pos2(c.x + 3.0, c.y + 1.3), w);
-        }
-        // Not used with stroke geometry: tool_button renders the theme
-        // switch as a text glyph so it stays crisp and theme-aware.
-        RailIcon::Theme => {}
-    }
-}
-
-/// Small labeled icon button for the top toolbar.
+/// Neutral icon tile for the main toolbar: Tabler glyph over a small label.
+/// Flat professional chip — card fill, hairline border, accent when active
+/// or hovered; no solid color blocks.
 fn tool_button(
     ui: &mut Ui,
-    icon: RailIcon,
-    tint: Color32,
+    glyph: char,
     label: &str,
     active: bool,
     tip: &str,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(50.0, 40.0), Sense::click());
     let p = ui.painter();
-    // Mac-style soft lift under each tile.
-    p.rect_filled(
-        rect.translate(egui::vec2(0.0, 1.5)),
-        10.0,
-        Color32::from_rgba_unmultiplied(15, 23, 42, 26),
-    );
-    let (tile_fill, icon_c, label_c) = if active {
-        (theme::ACCENT(), Color32::WHITE, Color32::WHITE)
+    let (fill, stroke) = if active {
+        (
+            theme::ACCENT_SOFT(),
+            Stroke::new(1.0_f32, theme::ACCENT()),
+        )
     } else if resp.hovered() {
         (
-            Color32::from_rgb(tint.r() * 220 / 255, tint.g() * 220 / 255, tint.b() * 220 / 255),
-            Color32::WHITE,
-            Color32::WHITE,
+            theme::BG_BTN_HOVER(),
+            Stroke::new(1.0_f32, theme::BORDER_STRONG()),
         )
     } else {
-        (
-            tint,
-            Color32::WHITE,
-            Color32::from_rgba_unmultiplied(255, 255, 255, 225),
-        )
+        (theme::BG_CARD(), Stroke::new(1.0_f32, theme::BORDER()))
     };
-    p.rect_filled(rect, 10.0, tile_fill);
-    if matches!(icon, RailIcon::Theme) {
-        // Theme switch: show the glyph of the theme you'll get. Drawn as a
-        // font glyph (Segoe UI Symbol fallback covers ☀/☾) so it follows the
-        // active palette like all text in the app.
-        let glyph = if theme::is_dark() { "☀" } else { "☾" };
-        p.text(
-            egui::pos2(rect.center().x, rect.top() + 13.0),
-            Align2::CENTER_CENTER,
-            glyph,
-            egui::FontId::proportional(14.0),
-            icon_c,
-        );
+    p.rect_filled(rect, 8.0, fill);
+    p.rect_stroke(rect, 8.0, stroke, egui::StrokeKind::Inside);
+    let ic = if active || resp.hovered() {
+        theme::ACCENT()
     } else {
-        paint_rail_icon(
-            p,
-            egui::Rect::from_center_size(
-                egui::pos2(rect.center().x, rect.top() + 13.0),
-                egui::vec2(16.0, 16.0),
-            ),
-            icon,
-            icon_c,
-        );
-    }
+        theme::TEXT_DIM()
+    };
+    p.text(
+        egui::pos2(rect.center().x, rect.top() + 13.0),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        theme::icon(15.0),
+        ic,
+    );
     p.text(
         egui::pos2(rect.center().x, rect.bottom() - 6.5),
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(9.0),
-        label_c,
+        if active { theme::TEXT() } else { theme::TEXT_DIM() },
     );
     resp.on_hover_text(tip)
 }
@@ -3670,9 +3609,9 @@ fn ghost_button(ui: &mut Ui, text: RichText, danger: bool) -> egui::Response {
 
 /// Sidebar tool chip: compact painter-drawn pill with an active state and
 /// an optional status dot (MobaXterm's left-tool tabs).
-/// Square icon tile for the collapsed sidebar rail; palette-aware so tiles
-/// stay legible in both themes.
-fn rail_tile(ui: &mut Ui, glyph: &str, active: bool) -> egui::Response {
+/// Square icon tile for the collapsed sidebar rail; Tabler glyphs, palette-
+/// aware so tiles stay legible in both themes.
+fn rail_tile(ui: &mut Ui, glyph: char, active: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), Sense::click());
     let p = ui.painter();
     let (fill, stroke) = if active {
@@ -3695,7 +3634,7 @@ fn rail_tile(ui: &mut Ui, glyph: &str, active: bool) -> egui::Response {
         rect.center(),
         Align2::CENTER_CENTER,
         glyph,
-        egui::FontId::proportional(16.0),
+        theme::icon(17.0),
         ic,
     );
     resp
