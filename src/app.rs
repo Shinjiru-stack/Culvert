@@ -456,6 +456,33 @@ impl TunnelApp {
         }
     }
 
+    /// mstsc refuses to dial loopback targets altogether and fails with the
+    /// misleading error "you already have a console session in progress" —
+    /// even when a WSL/docker relay is listening on 127.0.0.1. When the
+    /// session host is loopback, dial the WSL VM address instead
+    /// (`wsl hostname -I`); the relay serves that address too.
+    fn rdp_target_host(host: &str) -> String {
+        let trimmed = host.trim().to_string();
+        let loopback = trimmed.eq_ignore_ascii_case("localhost")
+            || trimmed == "127.0.0.1"
+            || trimmed == "[::1]"
+            || trimmed == "::1";
+        if !loopback {
+            return trimmed;
+        }
+        let Ok(out) = std::process::Command::new("wsl")
+            .args(["hostname", "-I"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .output()
+        else {
+            return trimmed;
+        };
+        match String::from_utf8_lossy(&out.stdout).split_whitespace().next() {
+            Some(ip) if !ip.is_empty() => ip.to_string(),
+            _ => trimmed,
+        }
+    }
+
     /// Launch the Windows RDP client for a session — MobaXterm-style: when
     /// the session has a saved username+password they are seeded into the
     /// Windows Credential Manager (`cmdkey /generic:TERMSRV/…`) so the
@@ -463,7 +490,7 @@ impl TunnelApp {
     /// NOTE: the password is stored locally in the user's credential store,
     /// the same tradeoff MobaXterm makes for saved RDP logins.
     fn launch_rdp(&mut self, session: &SshSession) {
-        let host = session.host.trim();
+        let host = Self::rdp_target_host(session.host.trim());
         if host.is_empty() {
             self.toast(ToastKind::Info, "Save this session with a host first");
             return;
