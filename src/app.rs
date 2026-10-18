@@ -4,10 +4,10 @@
 //! tab), a tabbed workspace whose first tab is the tunnel manager, and a
 //! one-line status bar. Everything is UI-driven — no commands anywhere.
 
-use crate::log::{LogEntry, LogLevel, SharedLogs};
+use crate::log::{push_log, LogEntry, LogLevel, SharedLogs};
 use crate::session::{
     load_groups, load_sessions, load_tunnels, save_groups, save_sessions, save_tunnels, AuthType,
-    ForwardType, PortForward, SessionGroup, SshSession, StandaloneTunnel,
+    ForwardType, PortForward, Protocol, SessionGroup, SshSession, StandaloneTunnel,
 };
 use crate::terminal::{TermStatus, TerminalSession};
 use crate::theme;
@@ -53,6 +53,7 @@ pub struct TunnelApp {
 enum Tab {
     Tunnels,
     Terminal(Box<TerminalSession>),
+    Files(Box<crate::filebrowser::FileBrowser>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -72,6 +73,7 @@ struct SessionEditor {
     id: Option<String>,
     name: String,
     group: Option<String>,
+    protocol: Protocol,
     host: String,
     port: String,
     username: String,
@@ -88,6 +90,7 @@ impl SessionEditor {
             id: None,
             name: String::new(),
             group: None,
+            protocol: Protocol::Ssh,
             host: String::new(),
             port: "22".to_string(),
             username: String::new(),
@@ -104,6 +107,7 @@ impl SessionEditor {
             id: Some(s.id.clone()),
             name: s.name.clone(),
             group: s.group.clone(),
+            protocol: s.protocol.clone(),
             host: s.host.clone(),
             port: s.port.to_string(),
             username: s.username.clone(),
@@ -263,6 +267,8 @@ enum Confirm {
 enum CardAction {
     Select,
     Connect,
+    /// WinSCP-style SFTP file browser over the session (SSH only).
+    BrowseFiles,
     Edit,
     Duplicate,
     Delete,
@@ -355,8 +361,45 @@ impl TunnelApp {
     fn find_tab_for_session(&self, session_id: &str) -> Option<usize> {
         self.tabs.iter().position(|t| match t {
             Tab::Terminal(term) => term.session_id == session_id,
+            Tab::Files(files) => files.session_id == session_id,
             Tab::Tunnels => false,
         })
+    }
+
+    /// WinSCP-style SFTP browser tab over the session's SSH credentials.
+    /// One browser per session; double-clicking the card again focuses it.
+    fn open_file_browser(&mut self, _ctx: &egui::Context, session_id: &str) {
+        if let Some(i) = self.find_tab_for_session(session_id) {
+            self.active = i;
+            return;
+        }
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .cloned()
+        else {
+            return;
+        };
+        if session.protocol == Protocol::Rdp {
+            self.toast(
+                ToastKind::Info,
+                "SFTP runs over SSH — RDP sessions have no file browser",
+            );
+            return;
+        }
+        if session.host.trim().is_empty() {
+            self.toast(ToastKind::Info, "Save this session with a host first");
+            return;
+        }
+        let fb = crate::filebrowser::FileBrowser::spawn(
+            _ctx,
+            self.rt.clone(),
+            self.logs.clone(),
+            session,
+        );
+        self.tabs.push(Tab::Files(Box::new(fb)));
+        self.active = self.tabs.len() - 1;
     }
 
     fn open_terminal(&mut self, ctx: &egui::Context, session_id: &str) {
@@ -372,6 +415,29 @@ impl TunnelApp {
         else {
             return;
         };
+        if session.protocol == Protocol::Rdp {
+            // Windows desktop session: hand it to the system RDP client,
+            // which collects its own login credentials.
+            let target = format!("/v:{}:{}", session.host.trim(), session.port);
+            match std::process::Command::new("mstsc").arg(&target).spawn() {
+                Ok(_) => {
+                    push_log(
+                        &self.logs,
+                        LogEntry::new(
+                            LogLevel::Success,
+                            &session.name,
+                            &format!("Launched RDP client for {target}"),
+                        ),
+                    );
+                    self.toast(ToastKind::Success, format!("RDP window opened · {}", session.name));
+                }
+                Err(e) => self.toast(
+                    ToastKind::Error,
+                    format!("Could not start mstsc: {e}"),
+                ),
+            }
+            return;
+        }
         if let Err(e) = session.validate() {
             self.toast(ToastKind::Error, format!("Cannot open shell: {e}"));
             return;
@@ -387,6 +453,9 @@ impl TunnelApp {
         }
         if let Tab::Terminal(t) = &self.tabs[index] {
             t.close();
+        }
+        if let Tab::Files(f) = &self.tabs[index] {
+            f.close();
         }
         self.tabs.remove(index);
         if self.active == index {
@@ -560,6 +629,9 @@ impl TunnelApp {
         };
         session.name = ed.name.trim().to_string();
         session.group = ed.group.clone();
+        // Switching SSH↔RDP wipes tunnel ties implicitly: forwards are kept
+        // but only apply to SSH sessions (RDP shells don't use them).
+        session.protocol = ed.protocol.clone();
         session.host = ed.host.trim().to_string();
         session.port = port;
         session.username = ed.username.trim().to_string();
@@ -842,7 +914,7 @@ impl TunnelApp {
     fn terminal_focused(&self, ctx: &egui::Context) -> bool {
         self.tabs.iter().any(|t| match t {
             Tab::Terminal(term) => term.is_focused(ctx),
-            Tab::Tunnels => false,
+            Tab::Files(_) | Tab::Tunnels => false,
         })
     }
 }
@@ -871,7 +943,7 @@ impl TunnelApp {
             }
         }
 
-        // Terminal overlay buttons.
+        // Terminal overlay buttons + file-browser lifecycle.
         let mut close_idx: Option<usize> = None;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             if let Tab::Terminal(t) = tab {
@@ -880,6 +952,14 @@ impl TunnelApp {
                     any_connecting = true;
                 }
                 if t.want_close {
+                    close_idx = Some(i);
+                }
+            }
+            if let Tab::Files(f) = tab {
+                if f.poll() {
+                    ctx.request_repaint();
+                }
+                if f.want_close {
                     close_idx = Some(i);
                 }
             }
@@ -1157,6 +1237,7 @@ impl TunnelApp {
             match action {
                 CardAction::Select => self.selected = Some(id.clone()),
                 CardAction::Connect => self.open_terminal(ctx, &id),
+                CardAction::BrowseFiles => self.open_file_browser(ctx, &id),
                 CardAction::Edit => {
                     if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
                         self.session_editor = Some(SessionEditor::from(s));
@@ -1200,9 +1281,12 @@ impl TunnelApp {
         let tunnel_live = self.tunnels.session_has_active(id);
         let tab_open = self.find_tab_for_session(id).is_some();
         let dot = self.group_dot_color(&session.group.clone().unwrap_or_default());
-        let auth_label = match session.auth_type {
-            AuthType::Password => "Password",
-            AuthType::Key => "Key",
+        let auth_label = match session.protocol {
+            Protocol::Rdp => "RDP",
+            _ => match session.auth_type {
+                AuthType::Password => "Password",
+                AuthType::Key => "Key",
+            },
         };
         let groups_menu: Vec<(String, String)> = self
             .groups
@@ -1301,23 +1385,45 @@ impl TunnelApp {
             let mut close: Option<usize> = None;
             let mut menu_cmd: Option<(usize, TabMenu)> = None;
             for (i, tab) in self.tabs.iter().enumerate().skip(1) {
-                if let Tab::Terminal(t) = tab {
-                    let dot = match &t.status {
-                        TermStatus::Connected => Some(theme::SUCCESS),
-                        TermStatus::Connecting => Some(theme::WARNING),
-                        TermStatus::Closed(_) => Some(theme::DANGER),
-                    };
-                    let (clicked, closed, menu) =
-                        tab_chip(ui, &t.title, dot, self.active == i, true);
-                    if clicked {
-                        activate = Some(i);
+                match tab {
+                    Tab::Terminal(t) => {
+                        let dot = match &t.status {
+                            TermStatus::Connected => Some(theme::SUCCESS),
+                            TermStatus::Connecting => Some(theme::WARNING),
+                            TermStatus::Closed(_) => Some(theme::DANGER),
+                        };
+                        let (clicked, closed, menu) =
+                            tab_chip(ui, &t.title, dot, self.active == i, true);
+                        if clicked {
+                            activate = Some(i);
+                        }
+                        if closed {
+                            close = Some(i);
+                        }
+                        if let Some(m) = menu {
+                            menu_cmd = Some((i, m));
+                        }
                     }
-                    if closed {
-                        close = Some(i);
+                    Tab::Files(f) => {
+                        let dot = match &f.status {
+                            crate::filebrowser::FbStatus::Connected => Some(theme::INFO),
+                            crate::filebrowser::FbStatus::Connecting => Some(theme::WARNING),
+                            crate::filebrowser::FbStatus::Failed(_) => Some(theme::DANGER),
+                        };
+                        let title = format!("{} · files", f.title);
+                        let (clicked, closed, menu) =
+                            tab_chip(ui, &title, dot, self.active == i, true);
+                        if clicked {
+                            activate = Some(i);
+                        }
+                        if closed {
+                            close = Some(i);
+                        }
+                        if let Some(m) = menu {
+                            menu_cmd = Some((i, m));
+                        }
                     }
-                    if let Some(m) = menu {
-                        menu_cmd = Some((i, m));
-                    }
+                    Tab::Tunnels => {}
                 }
             }
             if let Some(i) = activate {
@@ -1371,9 +1477,17 @@ impl TunnelApp {
             self.terminal_grid(ui, ctx);
             return;
         }
-        if let Some(Tab::Terminal(term)) = self.tabs.get_mut(active) {
-            term.ui(ui);
-            return;
+        match self.tabs.get_mut(active) {
+            Some(Tab::Terminal(term)) => {
+                term.ui(ui);
+                return;
+            }
+            Some(Tab::Files(fb)) => {
+                fb.poll();
+                fb.ui(ui);
+                return;
+            }
+            _ => {}
         }
         self.tunnels_page(ui, ctx);
     }
@@ -1746,6 +1860,34 @@ impl TunnelApp {
             );
             ui.add_space(12.0);
 
+            // Protocol: SSH shell (also tunnels + SFTP) or an RDP desktop.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Protocol").size(11.0).color(theme::TEXT_DIM));
+                ui.add_space(2.0);
+                if choice_pill(ui, "SSH", ed.protocol == Protocol::Ssh).clicked() {
+                    ed.protocol = Protocol::Ssh;
+                    if ed.port.trim() == "3389" {
+                        ed.port = "22".to_string();
+                    }
+                    ed.error = None;
+                }
+                if choice_pill(ui, "RDP", ed.protocol == Protocol::Rdp).clicked() {
+                    ed.protocol = Protocol::Rdp;
+                    if ed.port.trim() == "22" {
+                        ed.port = "3389".to_string();
+                    }
+                    ed.error = None;
+                }
+                if ed.protocol == Protocol::Rdp {
+                    ui.label(
+                        RichText::new("opens mstsc — Windows asks for login")
+                            .size(10.0)
+                            .color(theme::TEXT_FAINT),
+                    );
+                }
+            });
+            ui.add_space(8.0);
+
             field(ui, "Name", |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut ed.name)
@@ -1820,24 +1962,36 @@ impl TunnelApp {
                     });
             });
 
-            ui.label(
-                RichText::new("Authentication")
-                    .size(11.0)
-                    .color(theme::TEXT_DIM),
-            );
-            ui.horizontal(|ui| {
-                if choice_pill(ui, "Password", ed.auth_type == AuthType::Password).clicked() {
-                    ed.auth_type = AuthType::Password;
-                    ed.error = None;
-                }
-                if choice_pill(ui, "Private key", ed.auth_type == AuthType::Key).clicked() {
-                    ed.auth_type = AuthType::Key;
-                    ed.error = None;
-                }
-            });
-            ui.add_space(8.0);
+            if ed.protocol == Protocol::Rdp {
+                // mstsc collects its own credentials; no auth block.
+                ui.label(
+                    RichText::new(
+                        "RDP launches the Windows remote-desktop client, which opens its own login window. Port defaults to 3389.",
+                    )
+                    .size(10.5)
+                    .color(theme::TEXT_FAINT),
+                );
+            } else {
+                ui.label(
+                    RichText::new("Authentication")
+                        .size(11.0)
+                        .color(theme::TEXT_DIM),
+                );
+                ui.horizontal(|ui| {
+                    if choice_pill(ui, "Password", ed.auth_type == AuthType::Password).clicked() {
+                        ed.auth_type = AuthType::Password;
+                        ed.error = None;
+                    }
+                    if choice_pill(ui, "Private key", ed.auth_type == AuthType::Key).clicked() {
+                        ed.auth_type = AuthType::Key;
+                        ed.error = None;
+                    }
+                });
+                ui.add_space(8.0);
+            }
 
-            match ed.auth_type {
+            if ed.protocol == Protocol::Ssh {
+                match ed.auth_type {
                 AuthType::Password => {
                     field(ui, "Password", |ui| {
                         ui.add(
@@ -1878,6 +2032,7 @@ impl TunnelApp {
                     });
                 }
             }
+            } // end SSH-only auth section
 
             if let Some(err) = &ed.error {
                 ui.add_space(4.0);
@@ -2706,6 +2861,10 @@ fn session_card(
             action = Some(CardAction::Connect);
             ui.close();
         }
+        if auth_label != "RDP" && ui.button("Browse files (SFTP)").clicked() {
+            action = Some(CardAction::BrowseFiles);
+            ui.close();
+        }
         if ui.button("Edit session…").clicked() {
             action = Some(CardAction::Edit);
             ui.close();
@@ -2813,6 +2972,7 @@ fn group_header_row(
 fn auth_palette(label: &str) -> (Color32, Color32) {
     match label {
         "Key" => (theme::VIOLET, theme::VIOLET_BG),
+        "RDP" => (theme::WARNING, theme::WARNING_BG),
         _ => (theme::INFO, theme::INFO_BG),
     }
 }

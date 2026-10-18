@@ -14,6 +14,15 @@ impl Default for AuthType {
     }
 }
 
+/// Remote protocol a session connects with: an SSH shell (also the base for
+/// tunnels and the SFTP file browser) or an RDP Windows desktop session.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum Protocol {
+    #[default]
+    Ssh,
+    Rdp,
+}
+
 impl AuthType {
     #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
@@ -121,6 +130,8 @@ pub struct SshSession {
     /// environment, customer, team… whatever suites the user.
     #[serde(default)]
     pub group: Option<String>,
+    #[serde(default)]
+    pub protocol: Protocol,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -139,6 +150,7 @@ impl Default for SshSession {
             id: uuid::Uuid::new_v4().to_string(),
             name: "New session".to_string(),
             group: None,
+            protocol: Protocol::Ssh,
             host: "".to_string(),
             port: 22,
             username: "".to_string(),
@@ -185,13 +197,18 @@ impl SshSession {
             return Err("Session name is required".to_string());
         }
         if self.host.trim().is_empty() {
-            return Err("SSH host is required".to_string());
+            return Err("Host is required".to_string());
         }
         if self.port == 0 {
-            return Err("SSH port must be > 0".to_string());
+            return Err("Port must be > 0".to_string());
         }
         if self.username.trim().is_empty() {
             return Err("Username is required".to_string());
+        }
+        if self.protocol == Protocol::Rdp {
+            // The Windows RDP client prompts for its own credentials; the
+            // saved auth block applies to SSH only.
+            return Ok(());
         }
         match self.auth_type {
             AuthType::Password => {
@@ -371,6 +388,7 @@ impl StandaloneTunnel {
             id: format!("tunnel-{}", self.id),
             name: self.label(),
             group: None,
+            protocol: Protocol::Ssh,
             host: self.host.clone(),
             port: self.port,
             username: self.username.clone(),

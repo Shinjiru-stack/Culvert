@@ -49,6 +49,7 @@ pub const TEXT_FAINT: Color32 = Color32::from_rgb(148, 155, 168);
 pub const SUCCESS: Color32 = Color32::from_rgb(7, 133, 83); // #078553
 pub const SUCCESS_BG: Color32 = Color32::from_rgb(230, 246, 238);
 pub const WARNING: Color32 = Color32::from_rgb(184, 110, 8); // #B86E08
+pub const WARNING_BG: Color32 = Color32::from_rgb(253, 244, 223); // soft amber chip
 pub const DANGER: Color32 = Color32::from_rgb(211, 47, 47); // #D32F2F
 pub const DANGER_BTN: Color32 = Color32::from_rgb(211, 47, 47);
 pub const DANGER_BTN_HOVER: Color32 = Color32::from_rgb(178, 34, 34);
