@@ -228,11 +228,6 @@ impl FileBrowser {
         me
     }
 
-    /// Current SFTP connection state, for the session-tab switcher dot.
-    pub fn status(&self) -> &FbStatus {
-        &self.status
-    }
-
     fn start_task(&mut self) {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (evt_tx, evt_rx) = unbounded_channel();

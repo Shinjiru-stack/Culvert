@@ -9,7 +9,7 @@ use crate::session::{
     load_groups, load_sessions, load_tunnels, save_groups, save_sessions, save_tunnels, AuthType,
     ForwardType, PortForward, Protocol, SessionGroup, SshSession, StandaloneTunnel,
 };
-use crate::terminal::{SessionView, TermStatus, TerminalSession};
+use crate::terminal::{TermStatus, TerminalSession};
 use crate::theme;
 use crate::tunnel::{forward_key, TunnelManager};
 use eframe::egui::{
@@ -397,17 +397,6 @@ impl TunnelApp {
         }
     }
 
-    /// Default session-window view depends on the sidebar tool: with the
-    /// docked Files browser active the window lands on the shell (the files
-    /// are already pinned on the left), otherwise it opens the browser.
-    fn default_session_view(&self) -> SessionView {
-        if self.side_mode == SideMode::Files {
-            SessionView::Shell
-        } else {
-            SessionView::Files
-        }
-    }
-
     /// Close the docked browser, if one is pinned to the sidebar.
     fn close_all_docked(&mut self) {
         if let Some((_, fb)) = self.docked.take() {
@@ -442,15 +431,11 @@ impl TunnelApp {
         }
     }
 
-    /// One session window per server: a shell pane and a WinSCP-style SFTP
-    /// files pane behind a Shell | Files switcher (MobaXterm-style; the
-    /// browser always shows the focused session's server).
-    fn open_session(&mut self, ctx: &egui::Context, session_id: &str, view: SessionView) {
+    /// One session window per server: a shell pane whose files live in the
+    /// sidebar's docked Files browser (which follows the focused session).
+    fn open_session(&mut self, ctx: &egui::Context, session_id: &str) {
         if let Some(i) = self.find_tab_for_session(session_id) {
-            if let Tab::Terminal(t) = &mut self.tabs[i] {
-                t.set_view(view);
-                self.active = i;
-            }
+            self.active = i;
             return;
         }
         let Some(session) = self
@@ -492,14 +477,7 @@ impl TunnelApp {
             self.toast(ToastKind::Error, format!("Cannot open session: {e}"));
             return;
         }
-        let mut term = TerminalSession::spawn(
-            ctx,
-            self.rt.clone(),
-            self.logs.clone(),
-            self.editors.clone(),
-            session,
-        );
-        term.set_view(view);
+        let term = TerminalSession::spawn(ctx, self.rt.clone(), self.logs.clone(), session);
         self.tabs.push(Tab::Terminal(Box::new(term)));
         self.active = self.tabs.len() - 1;
     }
@@ -1009,9 +987,6 @@ impl TunnelApp {
                 if t.want_close {
                     close_idx = Some(i);
                 }
-                if t.take_fb_close() {
-                    close_idx = Some(i);
-                }
             }
         }
 
@@ -1336,10 +1311,13 @@ impl TunnelApp {
         for (id, action) in card_actions {
             match action {
                 CardAction::Select => self.selected = Some(id.clone()),
-                CardAction::Connect | CardAction::BrowseFiles => {
-                    self.open_session(ctx, &id, self.default_session_view())
+                CardAction::Connect | CardAction::OpenShell => self.open_session(ctx, &id),
+                // "Browse files": open the session and flip the sidebar to its
+                // docked file browser.
+                CardAction::BrowseFiles => {
+                    self.open_session(ctx, &id);
+                    self.side_mode = SideMode::Files;
                 }
-                CardAction::OpenShell => self.open_session(ctx, &id, SessionView::Shell),
                 CardAction::Edit => {
                     if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
                         self.session_editor = Some(SessionEditor::from(s));
@@ -1554,11 +1532,7 @@ impl TunnelApp {
                             TermStatus::Connecting => Some(theme::WARNING),
                             TermStatus::Closed(_) => Some(theme::DANGER),
                         };
-                        let title = if t.view() == SessionView::Files {
-                            format!("{} · files", t.title)
-                        } else {
-                            t.title.clone()
-                        };
+                        let title = t.title.clone();
                         let (clicked, closed, menu) =
                             tab_chip(ui, &title, dot, self.active == i, true);
                         if clicked {
@@ -1601,9 +1575,9 @@ impl TunnelApp {
                     .clone()
                     .filter(|id| self.sessions.iter().any(|s| &s.id == id))
                 {
-                    Some(id) => self.open_session(ctx, &id, self.default_session_view()),
+                    Some(id) => self.open_session(ctx, &id),
                     None => match self.sessions.first().map(|s| s.id.clone()) {
-                        Some(id) => self.open_session(ctx, &id, self.default_session_view()),
+                        Some(id) => self.open_session(ctx, &id),
                         None => {
                             self.toast(ToastKind::Info, "Add a session first — the + opens a session.");
                         }
@@ -3764,20 +3738,16 @@ mod tests {
 
         // Session tab: spawns against a closed port, fails fast, renders
         // both the connecting and disconnected overlays.
-        app.open_session(&ctx, "demo-session", crate::terminal::SessionView::Shell);
+        app.open_session(&ctx, "demo-session");
         assert!(matches!(app.tabs.last(), Some(Tab::Terminal(_))));
         let _ = run_frames(&mut app, &ctx, egui::vec2(1024.0, 700.0), 6) > 50;
         let _ = rt;
         assert!(app.tabs.len() >= 2);
-        // A second open on the same session switches its view instead of
-        // spawning a duplicate tab (MobaXterm-style one window per server).
-        app.open_session(&ctx, "demo-session", crate::terminal::SessionView::Files);
+        // A second open on the same session focuses the existing tab instead
+        // of spawning a duplicate (one window per server).
+        app.open_session(&ctx, "demo-session");
         assert_eq!(app.tabs.len(), 2);
-        if let Some(Tab::Terminal(t)) = app.tabs.last() {
-            assert_eq!(t.view(), crate::terminal::SessionView::Files);
-        } else {
-            panic!("expected the session tab to still be the terminal");
-        }
+        assert!(matches!(app.tabs.last(), Some(Tab::Terminal(_))));
     }
 
     #[test]
