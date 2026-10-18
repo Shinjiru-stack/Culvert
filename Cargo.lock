@@ -1024,6 +1024,7 @@ name = "culvert"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "chrono",
  "dirs",
  "eframe",

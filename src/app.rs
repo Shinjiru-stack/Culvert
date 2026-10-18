@@ -60,6 +60,15 @@ pub struct TunnelApp {
     docked: Option<(String, crate::filebrowser::FileBrowser)>,
     /// One-shot CLI startup action: (session name, open file browser).
     startup: Option<(String, bool)>,
+    /// Saved command snippets (macros) for the terminal quick-bar.
+    snippets: Vec<crate::snippets::Snippet>,
+    /// Snippet manager modal open, with the pre-edit backup for Cancel.
+    snippets_open: bool,
+    snippets_backup: Vec<crate::snippets::Snippet>,
+    /// Split view column ratio (draggable divider), 0.25–0.75.
+    split_ratio: f32,
+    /// Quick-connect target input: user@host:port.
+    quick_connect: String,
 }
 
 enum Tab {
@@ -377,6 +386,11 @@ impl TunnelApp {
             sidebar_collapsed: false,
             docked: None,
             startup,
+            snippets: crate::snippets::load_snippets(),
+            snippets_open: false,
+            snippets_backup: Vec::new(),
+            split_ratio: 0.5,
+            quick_connect: String::new(),
         }
     }
 
@@ -488,6 +502,70 @@ impl TunnelApp {
         let term = TerminalSession::spawn(ctx, self.rt.clone(), self.logs.clone(), session);
         self.tabs.push(Tab::Terminal(Box::new(term)));
         self.active = self.tabs.len() - 1;
+    }
+
+    /// MobaXterm-style quick connect: `user@host[:port]` → connect now when
+    /// the profile has credentials, otherwise prefill the session editor.
+    fn quick_connect_go(&mut self, ctx: &egui::Context) {
+        use crate::snippets::parse_host_target;
+        let target = self.quick_connect.trim().to_string();
+        if target.is_empty() {
+            self.toast(ToastKind::Info, "Type user@host:port first");
+            return;
+        }
+        match parse_host_target(&target) {
+            Err(e) => self.toast(ToastKind::Error, e),
+            Ok((user, host, port)) => {
+                if port == 3389 {
+                    // Windows desktop target: hand it to the system RDP client.
+                    let target = format!("/v:{host}:{port}");
+                    match std::process::Command::new("mstsc").arg(&target).spawn() {
+                        Ok(_) => {
+                            push_log(
+                                &self.logs,
+                                LogEntry::new(
+                                    LogLevel::Success,
+                                    &host,
+                                    &format!("Launched RDP client for {target}"),
+                                ),
+                            );
+                            self.toast(ToastKind::Success, format!("RDP window opened · {host}"));
+                        }
+                        Err(e) => self.toast(
+                            ToastKind::Error,
+                            format!("Could not start mstsc: {e}"),
+                        ),
+                    }
+                    return;
+                }
+                let mut session = SshSession::default();
+                session.name = format!("{user}@{host}");
+                session.host = host;
+                session.port = port;
+                session.username = user;
+                if let Err(e) = session.validate() {
+                    self.toast(ToastKind::Error, format!("Cannot connect: {e}"));
+                    return;
+                }
+                if session.auth_type == AuthType::Password && session.password.is_empty() {
+                    // No credentials on file — prefill the session editor.
+                    let mut ed = SessionEditor::new();
+                    ed.name = session.name.clone();
+                    ed.host = session.host.clone();
+                    ed.port = port.to_string();
+                    ed.username = session.username.clone();
+                    self.session_editor = Some(ed);
+                    self.toast(
+                        ToastKind::Info,
+                        "Enter credentials and save — then double-click the session to connect",
+                    );
+                } else {
+                    let term = TerminalSession::spawn(ctx, self.rt.clone(), self.logs.clone(), session);
+                    self.tabs.push(Tab::Terminal(Box::new(term)));
+                    self.active = self.tabs.len() - 1;
+                }
+            }
+        }
     }
 
     fn close_tab(&mut self, index: usize) {
@@ -1103,6 +1181,7 @@ impl TunnelApp {
         self.group_editor_modal(ctx);
         self.confirm_modal(ctx);
         self.logs_modal(ctx);
+        self.snippets_modal(ctx);
         self.toast_ui(ctx);
 
         if any_connecting {
@@ -1226,6 +1305,27 @@ impl TunnelApp {
                 .color(theme::TEXT_FAINT()),
         );
         ui.add_space(10.0);
+
+        // MobaXterm-style quick connect: type user@host:port and go. Saving
+        // the session is optional — connect immediately when a password is
+        // on file for the profile, otherwise prefill the session editor.
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - 28.0).max(80.0);
+            let resp = ui
+                .add_sized(
+                    [w, 24.0],
+                    egui::TextEdit::singleline(&mut self.quick_connect)
+                        .hint_text("quick connect: user@host:port")
+                        .margin(egui::vec2(8.0, 4.0)),
+                )
+                .on_hover_text("Quick connect — user@host or user@host:port, then Enter");
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (resp.lost_focus() && enter) || styled_button(ui, RichText::new(tglyph::PLUG).font(theme::icon(13.0)), true, false, Some(egui::vec2(24.0, 24.0))).clicked()
+            {
+                self.quick_connect_go(ctx);
+            }
+        });
+        ui.add_space(8.0);
 
         let full = egui::vec2(ui.available_width(), 26.0);
         if styled_button(
@@ -1712,7 +1812,25 @@ impl TunnelApp {
         }
         match self.tabs.get_mut(active) {
             Some(Tab::Terminal(term)) => {
+                let snippets = self.snippets.clone();
+                let mut manage = false;
+                let action = terminal_quick_bar(ui, term, &snippets, &mut manage);
                 term.ui(ui);
+                if manage {
+                    self.snippets_backup = self.snippets.clone();
+                    self.snippets_open = true;
+                }
+                match action {
+                    QuickAction::None => {}
+                    QuickAction::Copied => {
+                        self.toast(ToastKind::Success, "Screen copied to clipboard")
+                    }
+                    QuickAction::ClipboardEmpty => {
+                        self.toast(ToastKind::Info, "Clipboard is empty")
+                    }
+                    QuickAction::Cleared => self.toast(ToastKind::Success, "Screen cleared"),
+                    QuickAction::Reconnect => self.toast(ToastKind::Info, "Reconnecting…"),
+                }
                 return;
             }
             _ => {}
@@ -1737,7 +1855,9 @@ impl TunnelApp {
     fn terminal_grid(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let area = ui.available_rect_before_wrap();
         let gap = 8.0;
-        let cell_w = (((area.width() - gap) / 2.0) - 2.0).max(220.0);
+        let ratio = self.split_ratio.clamp(0.25, 0.75);
+        let w0 = (area.width() - gap) * ratio;
+        let w1 = (area.width() - gap) * (1.0 - ratio);
         let cell_h = ((area.height() - gap) / 2.0).max(150.0);
         let idxs: Vec<usize> = self
             .tabs
@@ -1752,15 +1872,42 @@ impl TunnelApp {
         ui.allocate_exact_size(area.size(), Sense::hover());
 
         for (n, &i) in idxs.iter().enumerate() {
-            let col = (n % 2) as f32;
-            let row = (n / 2) as f32;
-            let pos = egui::pos2(
-                area.left() + col * (cell_w + gap),
-                area.top() + row * (cell_h + gap),
-            );
-            let cell = egui::vec2(cell_w, cell_h);
+            let col = n % 2;
+            let row = n / 2;
+            let x = if col == 0 {
+                area.left()
+            } else {
+                area.left() + w0 + gap
+            };
+            let cw = if col == 0 { w0 } else { w1 };
+            let pos = egui::pos2(x, area.top() + (row as f32) * (cell_h + gap));
+            let cell = egui::vec2((cw - 2.0).max(220.0), cell_h);
             self.terminal_pane(ui, ctx, i, egui::Rect::from_min_size(pos, cell));
         }
+
+        // Draggable divider between the two columns (double-click resets).
+        let div_x = area.left() + w0 + gap * 0.5;
+        let div = egui::Rect::from_min_size(
+            egui::pos2(div_x - 3.0, area.top()),
+            egui::vec2(6.0, area.height()),
+        );
+        let resp = ui.interact(div, egui::Id::new("split_divider"), Sense::drag());
+        if resp.dragged() {
+            self.split_ratio = (self.split_ratio + resp.drag_delta().x / (area.width() - gap))
+                .clamp(0.25, 0.75);
+        }
+        if resp.double_clicked() {
+            self.split_ratio = 0.5;
+        }
+        let extra = if resp.hovered() || resp.dragged() {
+            theme::ACCENT()
+        } else {
+            theme::BORDER()
+        };
+        ui.painter().line_segment(
+            [egui::pos2(div_x, area.top() + 6.0), egui::pos2(div_x, area.bottom() - 6.0)],
+            Stroke::new(if resp.hovered() || resp.dragged() { 2.0_f32 } else { 1.0 }, extra),
+        );
     }
 
     fn terminal_pane(&mut self, ui: &mut Ui, ctx: &egui::Context, index: usize, pane: egui::Rect) {
@@ -2879,6 +3026,114 @@ impl TunnelApp {
         self.show_logs = keep;
     }
 
+    /// Snippet (macro) manager: edit the list inline, persist on Save,
+    /// revert on Cancel/Esc/✕.
+    fn snippets_modal(&mut self, ctx: &egui::Context) {
+        if !self.snippets_open {
+            return;
+        }
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let mut keep = true;
+        let mut save = false;
+        let resp = egui::Modal::new(egui::Id::new("snippets_modal")).show(ctx, |ui| {
+            ui.set_width(560.0);
+            ui.label(RichText::new("Command snippets").size(16.0).strong());
+            ui.label(
+                RichText::new("One-click commands in the terminal quick-bar Macros menu.")
+                    .size(10.5)
+                    .color(theme::TEXT_FAINT()),
+            );
+            ui.add_space(10.0);
+
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let mut drop: Option<String> = None;
+                    for s in self.snippets.iter_mut() {
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [130.0, 0.0],
+                                egui::TextEdit::singleline(&mut s.name)
+                                    .hint_text("Name")
+                                    .margin(egui::vec2(8.0, 4.0)),
+                            );
+                            ui.add_sized(
+                                [300.0, 0.0],
+                                egui::TextEdit::singleline(&mut s.command)
+                                    .hint_text("command (sent, then Enter)")
+                                    .margin(egui::vec2(8.0, 4.0)),
+                            );
+                            if ghost_button(
+                                ui,
+                                RichText::new("✕").size(11.0).color(theme::DANGER()),
+                                false,
+                            )
+                            .on_hover_text("Delete snippet")
+                            .clicked()
+                            {
+                                drop = Some(s.id.clone());
+                            }
+                        });
+                        ui.add_space(2.0);
+                    }
+                    if let Some(id) = drop {
+                        self.snippets.retain(|s| s.id != id);
+                    }
+                    if self.snippets.is_empty() {
+                        ui.label(
+                            RichText::new("No snippets — add one below.")
+                                .size(10.5)
+                                .color(theme::TEXT_DIM()),
+                        );
+                    }
+                });
+            ui.add_space(8.0);
+            if styled_button(
+                ui,
+                RichText::new("+  New snippet").size(12.0),
+                true,
+                false,
+                Some(egui::vec2(ui.available_width(), 24.0)),
+            )
+            .clicked()
+            {
+                self.snippets.push(crate::snippets::Snippet::new("", ""));
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new(RichText::new("Save").size(12.0)))
+                    .clicked()
+                {
+                    save = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    keep = false;
+                }
+            });
+        });
+        if resp.should_close() || esc {
+            keep = false;
+        }
+        if keep & save {
+            self.snippets.retain(|s| !s.name.trim().is_empty() || !s.command.trim().is_empty());
+            match crate::snippets::save_snippets(&self.snippets) {
+                Ok(_) => self.toast(ToastKind::Success, "Snippets saved"),
+                Err(e) => self.toast(ToastKind::Error, format!("Could not save snippets: {e}")),
+            }
+            keep = false;
+        }
+        if !keep {
+            if !save {
+                // Cancel: revert in-place edits.
+                self.snippets = self.snippets_backup.clone();
+            }
+            self.snippets_backup = Vec::new();
+            self.snippets_open = false;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Status bar + toast
     // -----------------------------------------------------------------------
@@ -3317,6 +3572,121 @@ fn tunnel_row(
     action
 }
 
+/// Terminal quick-bar actions surfaced to the app for toasts/flags.
+#[derive(Clone, Copy, PartialEq)]
+enum QuickAction {
+    None,
+    Copied,
+    ClipboardEmpty,
+    Cleared,
+    Reconnect,
+}
+
+/// MobaXterm-style session toolbar above the shell: copy/paste/clear/
+/// reconnect plus a Macros menu that fires saved snippets into the shell.
+/// Drawn by the app (not the terminal) so it can read the snippet list and
+/// open the manager modal; it acts on the active session directly.
+fn terminal_quick_bar(
+    ui: &mut Ui,
+    term: &mut TerminalSession,
+    snippets: &[crate::snippets::Snippet],
+    want_manage: &mut bool,
+) -> QuickAction {
+    let avail = ui.available_rect_before_wrap();
+    let bar = egui::Rect::from_min_size(avail.min, egui::vec2(avail.width(), 30.0));
+    ui.allocate_rect(bar, egui::Sense::hover());
+    let painter = ui.painter_at(bar);
+    painter.rect_filled(bar, 0.0, theme::BG_PANEL());
+    painter.line_segment(
+        [
+            egui::pos2(bar.left(), bar.bottom() - 0.5),
+            egui::pos2(bar.right(), bar.bottom() - 0.5),
+        ],
+        Stroke::new(0.5_f32, theme::BORDER()),
+    );
+
+    let mut action = QuickAction::None;
+    ui.scope_builder(
+        egui::UiBuilder::new().max_rect(bar).id_salt("terminal_quick_bar"),
+        |ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            ui.add_space(6.0);
+            if ghost_button(ui, RichText::new("Copy").size(10.5), false).clicked() {
+                let text = term.visible_text();
+                if text.trim().is_empty() {
+                    action = QuickAction::ClipboardEmpty;
+                } else {
+                    ui.ctx().copy_text(text);
+                    action = QuickAction::Copied;
+                }
+            }
+            if ghost_button(ui, RichText::new("Paste").size(10.5), false).clicked() {
+                let text = arboard::Clipboard::new()
+                    .and_then(|mut c| c.get_text())
+                    .unwrap_or_default();
+                if text.trim().is_empty() {
+                    action = QuickAction::ClipboardEmpty;
+                } else {
+                    term.paste_text(&text);
+                }
+            }
+            if ghost_button(ui, RichText::new("Clear").size(10.5), false).clicked() {
+                term.clear_screen();
+                action = QuickAction::Cleared;
+            }
+            if ghost_button(ui, RichText::new("Reconnect").size(10.5), false).clicked() {
+                term.reconnect();
+                action = QuickAction::Reconnect;
+            }
+        });
+
+        // Right edge: macros menu — one click fires a snippet into the shell.
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(6.0);
+            ui.menu_button(
+                RichText::new("Macros").size(10.5).color(theme::TEXT_DIM()),
+                |menu| {
+                    if snippets.is_empty() {
+                        menu.add_space(4.0);
+                        menu.label(
+                            RichText::new("No snippets yet.")
+                                .size(10.5)
+                                .color(theme::TEXT_FAINT()),
+                        );
+                    }
+                    for s in snippets {
+                        let label = if s.command.contains('\n') {
+                            format!("{}  ▤", s.name)
+                        } else {
+                            s.name.clone()
+                        };
+                        if menu
+                            .button(RichText::new(label).size(11.0))
+                            .clicked()
+                        {
+                            let mut bytes = s.command.as_bytes().to_vec();
+                            if !s.command.ends_with('\n') {
+                                bytes.push(b'\r');
+                            }
+                            term.send_bytes(bytes);
+                            menu.close();
+                        }
+                    }
+                    menu.separator();
+                    if menu
+                        .button(RichText::new("Manage snippets…").size(11.0))
+                        .clicked()
+                    {
+                        *want_manage = true;
+                    }
+                },
+            );
+        });
+    });
+    action
+}
+
 /// Terminal-style tab chip; right-click opens the Chrome-style tab menu.
 /// Returns (clicked-activate, clicked-close, context-menu command).
 
@@ -3340,6 +3710,8 @@ mod tglyph {
     /// chevron-right / left (rail expand, sidebar collapse)
     pub const CHEVRON_RIGHT: char = '\u{ea61}';
     pub const CHEVRON_LEFT: char = '\u{ea60}';
+    /// plug (quick connect)
+    pub const PLUG: char = '\u{ebd9}';
 }
 
 /// Neutral icon tile for the main toolbar: Tabler glyph over a small label.

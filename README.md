@@ -28,6 +28,17 @@ small, self-contained tool, out of sight and out of the way.
 - **Built-in terminal tabs** — real PTY SSH sessions with 256-colour support,
   scrollback, resize, paste and proper key encoding (Ctrl codes, arrows, F-keys).
   If a session drops you get a reconnect card instead of a dead tab.
+- **Session quick-bar** — Copy / Paste / Clear / Reconnect one row above the
+  shell, plus a **Macros** menu that fires saved command snippets into it.
+- **Command snippets (macros)** — save frequent commands (systemd restarts,
+  log chases…) once in the snippet manager; run them in any shell with one
+  click. Stored locally in `snippets.json`.
+- **Quick connect** — type `user@host:port` in the sidebar and hit Enter:
+  connects on the spot (port 3389 opens the Windows RDP client), or prefills
+  the session editor when credentials aren't on file yet.
+- **Split view** — every open shell side-by-side with one click, focused pane
+  highlighted, and a draggable divider between the columns (double-click it
+  to reset).
 - **UI-only tunnel window** — the first tab is a tunnel manager: add Local,
   Remote or Dynamic forwards with plain fields (no `ssh -L` commands anywhere),
   then **Start/Stop each tunnel individually**. Every tunnel runs on its own SSH

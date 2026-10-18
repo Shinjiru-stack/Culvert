@@ -25,6 +25,10 @@ rfd = "0.15"
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 vt100 = "0.16"
 russh-sftp = "2"
+# Clipboard read for the terminal quick-bar Paste button (eframe already
+# pulls arboard for its own TextEdit paste handling, so this adds no new
+# native dependencies).
+arboard = "3"
 
 [build-dependencies]
 winresource = "0.1"

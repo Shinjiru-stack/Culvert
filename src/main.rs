@@ -4,6 +4,7 @@ mod app;
 mod filebrowser;
 mod log;
 mod session;
+mod snippets;
 mod ssh;
 mod terminal;
 mod theme;

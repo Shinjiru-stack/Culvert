@@ -133,6 +133,38 @@ impl TerminalSession {
         let _ = self.cmd_tx.send(TermCmd::Close);
     }
 
+    /// Raw bytes straight to the shell (macros, quick-bar paste).
+    pub fn send_bytes(&self, bytes: Vec<u8>) {
+        self.send(TermCmd::Write(bytes));
+    }
+
+    /// Visible screen text (quick-bar Copy). Scrollback is not included.
+    pub fn visible_text(&self) -> String {
+        self.parser.screen().contents()
+    }
+
+    /// Clipboard text into the shell, honoring bracketed-paste mode.
+    pub fn paste_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let bracketed = self.parser.screen().bracketed_paste();
+        let mut bytes = Vec::new();
+        if bracketed {
+            bytes.extend_from_slice(b"\x1b[200~");
+        }
+        bytes.extend_from_slice(text.as_bytes());
+        if bracketed {
+            bytes.extend_from_slice(b"\x1b[201~");
+        }
+        self.send(TermCmd::Write(bytes));
+    }
+
+    /// Wipe screen + scrollback but keep the connection up.
+    pub fn clear_screen(&mut self) {
+        self.parser = vt100::Parser::new(self.rows.max(1), self.cols.max(1), SCROLLBACK_LINES);
+    }
+
     /// Drain async shell events into the parser. Returns true
     /// when repainting is needed for a reason other than cursor blink.
     pub fn poll(&mut self) -> bool {
