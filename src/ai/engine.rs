@@ -101,6 +101,8 @@ pub struct Engine {
     logs: SharedLogs,
     audit: SharedAudit,
     exec: Executor,
+    /// OS / package manager learned per host (see [`crate::ai::hosts`]).
+    hosts: crate::ai::hosts::HostBook,
     cmd_rx: UnboundedReceiver<AiCmd>,
     evt_tx: UnboundedSender<AiEvent>,
     ctx: egui::Context,
@@ -130,6 +132,7 @@ impl Engine {
             logs,
             audit,
             exec: Executor::new(),
+            hosts: crate::ai::hosts::HostBook::load(),
             cmd_rx,
             evt_tx,
             ctx,
@@ -501,6 +504,13 @@ impl Engine {
             }
         };
 
+        // -- Learn what this host really runs --------------------------------
+        // Facts feed the next prompt, so the first guess in a fresh chat is the
+        // right package manager instead of one that cannot exist there.
+        if self.learn_host_facts(&ctx, &prepared, &processed) {
+            self.hosts.save();
+        }
+
         push_audit(
             &self.audit,
             "tool",
@@ -523,6 +533,19 @@ impl Engine {
             text: card_text,
         });
         Ok(processed)
+    }
+
+    /// Remember the OS / package manager a tool result revealed about a host.
+    /// Returns `true` when the book changed (so it can be persisted).
+    fn learn_host_facts(&mut self, ctx: &UiContext, prepared: &tools::Call, result: &str) -> bool {
+        let id = prepared_session_id(&prepared.prepared);
+        if id.is_empty() {
+            return false;
+        }
+        let Some(profile) = ctx.profiles.iter().find(|p| p.id == id) else {
+            return false;
+        };
+        self.hosts.learn_from_result(&profile.host, result)
     }
 
     async fn await_action(&mut self, id: u64) -> Result<String, CancelReason> {
@@ -720,9 +743,9 @@ impl Engine {
              - Mention when output was truncated or values were [REDACTED] by Culvert's security layer.\n\
              - For state-changing work, call the tool once — the user will see an approval card.\n\
              - sudo is usable: run it normally when a task needs root (Culvert pipes the saved profile password into sudo -S when required; passwordless sudo works too). Never ask the user for a password.\n\
-             - Package managers vary: apt (Debian/Ubuntu), dnf/yum (Fedora/RHEL), apk (Alpine), zypper (openSUSE), pacman (Arch). If one is missing, do not guess another — run `command -v apt-get dnf yum apk zypper pacman` or `cat /etc/os-release` once, then use what exists. Tool results already include a [hint] with the detected manager after such a failure.\n\
+             - Package managers vary: apt (Debian/Ubuntu), dnf/yum (Fedora/RHEL), apk (Alpine), zypper (openSUSE), pacman (Arch). When a profile below carries a \"last seen\" note, trust it first — that is what the host really has. If one is missing, do not guess another — run `command -v apt-get dnf yum apk zypper pacman` or `cat /etc/os-release` once, then use what exists. Tool results already include a [hint] with the detected manager after such a failure.\n\
              - Full-screen programs (htop, top, vim, less, tmux, watch, tail -f, journalctl -f) never run on the hidden channel: Culvert routes them to the visible terminal automatically and returns as soon as they start, so the user drives them. To confirm something is installed, use `command -v <name>` or `<name> --version` — never run the program itself as a test.\n\
-             - For installs and other interactive work (package managers, prompts, anything needing root where sudo may ask), call execute_command with in_terminal=true: the command is typed into the visible terminal tab, the user can answer prompts there, and the app returns what the screen showed. Output may be only the visible tail. State-changing commands do this by default; read-only ones use the hidden channel.\n\nContext:\n",
+             - For installs and other interactive work (package managers, prompts, anything needing root where sudo may ask), call execute_command with in_terminal=true: the command is typed into the visible terminal tab, the user can answer prompts there, and the app returns what the screen showed. Output may be only the visible tail. State-changing commands do this by default; read-only ones use the hidden channel. Installing packages needs root: always write `sudo apk add …` / `sudo apt-get install …` / `sudo dnf install …` — a package manager run without sudo fails with a permission error.\n\nContext:\n",
         );
         match ctx
             .active_session_id
@@ -776,15 +799,23 @@ impl Engine {
         } else {
             p.push_str("- Saved profiles:\n");
             for s in ctx.profiles_summary.iter().take(40) {
+                // Facts learned from earlier probes: this is what stops a fresh
+                // chat from proposing `apt-get` on an Alpine box.
+                let facts = self
+                    .hosts
+                    .note(&s.host)
+                    .map(|n| format!(" — last seen: {n}"))
+                    .unwrap_or_default();
                 p.push_str(&format!(
-                    "  · {} ({}@{}){}\n",
+                    "  · {} ({}@{}){}{}\n",
                     s.name,
                     s.username,
                     s.host,
                     s.group
                         .as_ref()
                         .map(|g| format!(" [group {g}]"))
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    facts
                 ));
             }
         }

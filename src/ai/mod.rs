@@ -14,6 +14,7 @@
 
 pub mod config;
 pub mod engine;
+pub mod hosts;
 pub mod panel;
 pub mod provider;
 pub mod security;

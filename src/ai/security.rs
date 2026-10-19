@@ -165,11 +165,45 @@ fn classify_segment(segment: &str) -> Option<Verdict> {
             });
         }
         "apt" | "apt-get" | "yum" | "dnf" | "apk" | "pacman" | "zypper" => {
+            // Every manager spells "install" differently: apt/yum/dnf use
+            // install, apk uses `add`, zypper `in`, pacman flags (`-S`).
+            let changes = matches!(
+                second,
+                "install"
+                    | "remove"
+                    | "purge"
+                    | "upgrade"
+                    | "update"
+                    | "autoremove"
+                    | "dist-upgrade"
+                    | "full-upgrade"
+                    | "reinstall"
+                    | "groupinstall"
+                    | "add" // apk add
+                    | "del" // apk del
+                    | "fix" // apk fix
+                    | "rm"  // zypper rm
+                    | "in"  // zypper in
+                    | "dup" // zypper dup
+                    | "up"  // zypper up
+            ) || args.iter().any(|a| {
+                // pacman: -S installs, -R removes, -U upgrades; -Ss/-Si query.
+                (a.starts_with("-S") && !a.starts_with("-Ss") && !a.starts_with("-Si"))
+                    || a.starts_with("-R")
+                    || a.starts_with("-U")
+            });
+            return Some(if changes {
+                v(Risk::Approval, "manages packages")
+            } else {
+                v(Risk::Safe, "read-only package query")
+            });
+        }
+        "snap" => {
             return Some(match second {
-                "install" | "remove" | "purge" | "upgrade" | "update" | "autoremove" => {
-                    v(Risk::Approval, "manages packages")
+                "install" | "remove" | "refresh" | "revert" | "enable" | "disable" => {
+                    v(Risk::Approval, "manages snaps")
                 }
-                _ => v(Risk::Safe, "read-only package query"),
+                _ => v(Risk::Safe, "read-only snap query"),
             });
         }
         "pip" | "pip3" | "npm" | "yarn" | "pnpm" | "gem" | "cargo" | "go" | "composer" => {
@@ -553,5 +587,26 @@ mod tests {
         assert!(sensitive_path("/var/log/nginx/access.log").is_none());
         assert!(sensitive_path("/etc/nginx/nginx.conf").is_none());
         assert!(sensitive_path("/home/u/.ssh/id_rsa.pub").is_none());
+    }
+
+    /// Installing is a state change in every manager's dialect — including the
+    /// ones whose verb is not the word "install".
+    #[test]
+    fn package_install_verbs_need_approval() {
+        assert_eq!(classify_command("sudo apk add tree").risk, Risk::Approval);
+        assert_eq!(classify_command("apk del curl").risk, Risk::Approval);
+        assert_eq!(classify_command("sudo apk fix").risk, Risk::Approval);
+        assert_eq!(classify_command("apk info tree").risk, Risk::Safe);
+        assert_eq!(
+            classify_command("sudo pacman -S --noconfirm htop").risk,
+            Risk::Approval
+        );
+        assert_eq!(classify_command("pacman -Rns htop").risk, Risk::Approval);
+        assert_eq!(classify_command("pacman -Ss htop").risk, Risk::Safe);
+        assert_eq!(classify_command("pacman -Qi htop").risk, Risk::Safe);
+        assert_eq!(classify_command("sudo zypper in tree").risk, Risk::Approval);
+        assert_eq!(classify_command("zypper se tree").risk, Risk::Safe);
+        assert_eq!(classify_command("sudo snap install htop").risk, Risk::Approval);
+        assert_eq!(classify_command("snap list").risk, Risk::Safe);
     }
 }
