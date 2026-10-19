@@ -1261,10 +1261,8 @@ fn md_ui(ui: &mut Ui, text: &str, base: Color32) {
             .or_else(|| t.strip_prefix("* "))
             .or_else(|| t.strip_prefix("• "))
         {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("• ").color(base));
-                inline_ui(ui, item, base);
-            });
+            // Keep the bullet in the same run so it hugs the text.
+            ui.horizontal_wrapped(|ui| inline_ui(ui, &format!("• {item}"), base));
         } else {
             ui.horizontal_wrapped(|ui| inline_ui(ui, t, base));
         }
@@ -1298,6 +1296,16 @@ fn code_frame(ui: &mut Ui, code: &str) {
 
 /// `**bold**` + `` `code` `` inside one wrapped line.
 fn inline_ui(ui: &mut Ui, s: &str, base: Color32) {
+    // Every run is its own label, and egui puts `item_spacing` (8 px) between
+    // labels — that opened gaps before punctuation after an inline `code`
+    // span ("`apk` , not") and after bullets. Hug the runs instead.
+    let prev = ui.spacing().item_spacing.x;
+    ui.spacing_mut().item_spacing.x = 0.0;
+    inline_runs(ui, s, base);
+    ui.spacing_mut().item_spacing.x = prev;
+}
+
+fn inline_runs(ui: &mut Ui, s: &str, base: Color32) {
     // First split on backticks; odd segments are inline code.
     let mut code_mode = false;
     let mut rest = s;
