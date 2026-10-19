@@ -942,7 +942,26 @@ impl Executor {
                     .map_err(|e2| format!("{e2} (after reconnect; first error: {e})"))
             }
         };
-        out.map(|text| sudo_hint(&text, sudo_pw.is_some()))
+        let text = out?;
+        let hinted = sudo_hint(&text, sudo_pw.is_some());
+        // If the shell complained about a missing package manager, probe once
+        // and tell the model what this host actually has — local models
+        // otherwise guess apt → yum → "try" forever.
+        let Some(missing) = missing_package_manager(&hinted) else {
+            return Ok(hinted);
+        };
+        let probe = {
+            let h = self.conns.get(&id).unwrap();
+            run_exec(
+                h,
+                "for c in apt-get dnf yum apk zypper pacman; do command -v \"$c\" 2>/dev/null; done",
+                None,
+            )
+            .await
+            .unwrap_or_default()
+        };
+        let available = available_package_managers(&probe);
+        Ok(package_manager_hint(hinted, missing, &available))
     }
 
     async fn sftp(
@@ -1175,6 +1194,82 @@ fn sudo_hint(out: &str, had_password: bool) -> String {
     }
 }
 
+/// Package managers we can name and use, in preference order.
+/// (binary, label, install verb)
+const PKG_MANAGERS: [(&str, &str, &str); 6] = [
+    ("apt-get", "apt (Debian/Ubuntu)", "apt install -y"),
+    ("dnf", "dnf (Fedora/RHEL)", "dnf install -y"),
+    ("yum", "yum (RHEL/CentOS)", "yum install -y"),
+    ("apk", "apk (Alpine)", "apk add"),
+    ("zypper", "zypper (openSUSE)", "zypper install -y"),
+    ("pacman", "pacman (Arch)", "pacman -S --noconfirm"),
+];
+
+/// Which package-manager binary the shell complained about, if any. Covers
+/// bash ("apt: command not found"), busybox/dash ("apt: not found"), zsh
+/// ("command not found: apt") and sudo ("sudo: apt: command not found").
+fn missing_package_manager(out: &str) -> Option<&'static str> {
+    for bin in ["apt-get", "apt", "dnf", "yum", "apk", "zypper", "pacman"] {
+        if out.contains(&format!("{bin}: command not found"))
+            || out.contains(&format!("{bin}: not found"))
+            || out.contains(&format!("command not found: {bin}"))
+        {
+            return Some(bin);
+        }
+    }
+    None
+}
+
+/// Parse the paths printed by the `command -v` probe (one per line).
+fn available_package_managers(probe: &str) -> Vec<(&'static str, &'static str)> {
+    let mut found = Vec::new();
+    for (bin, label, verb) in PKG_MANAGERS {
+        let hit = probe.lines().any(|l| {
+            let l = l.trim_end();
+            l == bin || l.ends_with(&format!("/{bin}"))
+        });
+        if hit {
+            found.push((label, verb));
+        }
+    }
+    found
+}
+
+/// Next-step note after "command not found" for a package manager, naming the
+/// ones the host really has (and their install syntax).
+fn pm_hint_text(missing: &str, available: &[(&str, &str)]) -> String {
+    if available.is_empty() {
+        return format!(
+            "[hint] `{missing}` is not installed, and no apt/yum/dnf/apk/zypper/pacman was found on this host. Check the OS (`cat /etc/os-release`) before retrying — do not guess another package manager."
+        );
+    }
+    let list = available
+        .iter()
+        .map(|(label, _)| *label)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tries = available
+        .iter()
+        .map(|(_, verb)| format!("`sudo {verb} <package>`"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    format!(
+        "[hint] `{missing}` is not installed on this host. Detected package manager(s): {list}. Retry with {tries} instead of guessing."
+    )
+}
+
+fn package_manager_hint(out: String, missing: &str, available: &[(&str, &str)]) -> String {
+    format!("{out}\n{}", pm_hint_text(missing, available))
+}
+
+/// Hint for a visible-terminal run. `probe` is the output of the `command -v`
+/// probe the shell appends after a failed command (see `AiTermRun::line`).
+/// `None` when the output is not a missing-package-manager error.
+pub(crate) fn terminal_pm_hint(out: &str, probe: &str) -> Option<String> {
+    let missing = missing_package_manager(out)?;
+    Some(pm_hint_text(missing, &available_package_managers(probe)))
+}
+
 /// One exec channel, full output, 45 s cap (streaming commands never finish).
 async fn run_exec(
     handle: &ssh::SshHandle,
@@ -1358,6 +1453,59 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn missing_package_managers_produce_actionable_hints() {
+        // sudo names the missing binary.
+        assert_eq!(
+            missing_package_manager("sudo: apt: command not found"),
+            Some("apt")
+        );
+        // busybox/dash wording.
+        assert_eq!(missing_package_manager("sh: yum: not found"), Some("yum"));
+        // zsh wording.
+        assert_eq!(
+            missing_package_manager("zsh: command not found: dnf"),
+            Some("dnf")
+        );
+        // Ordinary failures are left alone.
+        assert_eq!(missing_package_manager("permission denied"), None);
+        assert_eq!(missing_package_manager("apt-get install: done"), None);
+
+        // Alpine host: apk is the only manager.
+        let probe = "/sbin/apk\n";
+        let avail = available_package_managers(probe);
+        assert_eq!(avail, vec![("apk (Alpine)", "apk add")]);
+        let hinted = package_manager_hint("apt: not found".into(), "apt", &avail);
+        assert!(hinted.contains("apk (Alpine)"));
+        assert!(hinted.contains("`sudo apk add <package>`"));
+        assert!(hinted.contains("instead of guessing"));
+
+        // Debian host: apt wins, install syntax is named.
+        let avail = available_package_managers("/usr/bin/apt-get\n/usr/bin/dnf\n");
+        assert_eq!(avail.len(), 2);
+        let hinted = package_manager_hint("yum: not found".into(), "yum", &avail);
+        assert!(hinted.contains("apt (Debian/Ubuntu), dnf (Fedora/RHEL)"));
+        assert!(hinted.contains("`sudo apt install -y <package>`"));
+
+        // No manager at all: tell the model to look, not guess.
+        let hinted = package_manager_hint("yum: not found".into(), "yum", &[]);
+        assert!(hinted.contains("no apt/yum/dnf/apk/zypper/pacman"));
+        assert!(hinted.contains("cat /etc/os-release"));
+    }
+
+    #[test]
+    fn terminal_package_manager_hint_uses_the_probe() {
+        let hint = terminal_pm_hint("sudo: apt-get: command not found", "/sbin/apk\n")
+            .expect("expected a hint");
+        assert!(hint.contains("apk (Alpine)"), "{hint}");
+        assert!(hint.contains("sudo apk add <package>"), "{hint}");
+        // Unrelated failures stay quiet.
+        assert!(terminal_pm_hint("cat: nope: No such file", "/sbin/apk\n").is_none());
+        // A missing manager with an empty probe still warns.
+        let hint = terminal_pm_hint("sh: yum: not found", "").expect("expected a hint");
+        assert!(hint.contains("no apt/yum/dnf/apk/zypper/pacman"), "{hint}");
+    }
+
     /// Live probe: the exact production path (prepare_exec + stdin feed)
     /// against the demo server. Prefers the real saved profile (host
     /// 127.0.0.1:2222 or a name containing "linux test"), falling back to
@@ -1410,6 +1558,45 @@ mod tests {
                 assert!(out.contains("root"), "sudo must authenticate: {out}");
                 println!("finding: sudo authenticated with the saved password");
             }
+        });
+    }
+
+    /// Live probe for the package-manager hint, against the same demo server.
+    /// Run with: `cargo test -- --ignored --nocapture package_manager`
+    #[test]
+    #[ignore = "needs the local docker ssh test server on 127.0.0.1:2222"]
+    fn live_missing_package_manager_gains_a_hint() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let saved = crate::session::load_sessions().into_iter().find(|s| {
+                s.name.to_lowercase().contains("linux test")
+                    || (s.host == "127.0.0.1" && s.port == 2222)
+            });
+            let session = saved.unwrap_or_else(|| SshSession {
+                name: "probe".into(),
+                host: "127.0.0.1".into(),
+                port: 2222,
+                username: "linuxio".into(),
+                auth_type: AuthType::Password,
+                password: "test123".into(),
+                ..SshSession::default()
+            });
+            let logs: SharedLogs = Arc::new(Mutex::new(Vec::new()));
+            let mut ex = Executor::new();
+            let out = ex
+                .command(&session, "apt update", &logs)
+                .await
+                .expect("exec failed");
+            println!("apt update -> {out:?}");
+            assert!(out.contains("[hint]"), "expected a hint: {out}");
+            assert!(
+                out.contains("Detected package manager"),
+                "expected detection: {out}"
+            );
+            assert!(
+                out.contains("apk (Alpine)") || out.contains("apt (Debian"),
+                "unexpected host: {out}"
+            );
         });
     }
 }

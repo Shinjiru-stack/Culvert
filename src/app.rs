@@ -105,15 +105,21 @@ impl AiTermRun {
     fn exit_tag(&self) -> String {
         format!("<<<culvert-{}-exit:", self.nonce)
     }
+    /// Printed after a failed command together with the `command -v` probe.
+    fn pm_tag(&self) -> String {
+        format!("<<<culvert-{}-pm>>>", self.nonce)
+    }
 
     /// The single line typed into the shell. The command itself goes through
     /// `sh -c '<single-quoted>'` so multi-line scripts and quotes survive, and
     /// the markers bracket its output on the screen. The printed markers are
     /// built with `%s` placeholders so the *echo of the typed line* does not
-    /// contain them (which would let the reader match too early).
+    /// contain them (which would let the reader match too early). On failure
+    /// the shell also probes which package managers exist, so the result can
+    /// carry a `[hint]` naming the host's real manager (apt vs dnf vs apk…).
     fn line(&self) -> String {
         format!(
-            "printf '\\n<<<culvert-%s-start>>>\\n' {n}; sh -c '{cmd}'; printf '\\n<<<culvert-%s-exit:%s>>>\\n' {n} \"$?\"\n",
+            "printf '\\n<<<culvert-%s-start>>>\\n' {n}; sh -c '{cmd}'; rc=$?; if [ \"$rc\" -ne 0 ]; then printf '\\n<<<culvert-%s-pm>>>\\n' {n}; for c in apt-get dnf yum apk zypper pacman; do command -v \"$c\" 2>/dev/null; done; fi; printf '\\n<<<culvert-%s-exit:%s>>>\\n' {n} \"$rc\"\n",
             n = self.nonce,
             cmd = self.command.replace('\'', "'\\''"),
         )
@@ -137,17 +143,28 @@ fn ai_term_result(screen: &str, run: &AiTermRun) -> Option<String> {
         // The start scrolled off: hand over the visible tail.
         None => &screen[..done_at],
     };
+    // A failed command is followed by the shell's `command -v` probe (see
+    // `AiTermRun::line`); split it off so it does not pollute the output.
+    let pm_tag = run.pm_tag();
+    let (body, probe) = match body.rfind(&pm_tag) {
+        Some(at) => (&body[..at], &body[at + pm_tag.len()..]),
+        None => (body, ""),
+    };
     let body = body
         .lines()
         .map(|l| l.trim_end())
         .collect::<Vec<_>>()
         .join("\n");
     let body = body.trim();
-    let body = if body.is_empty() {
+    let mut body = if body.is_empty() {
         "(no output)".to_string()
     } else {
         body.to_string()
     };
+    if let Some(hint) = crate::ai::tools::terminal_pm_hint(&body, probe) {
+        body.push('\n');
+        body.push_str(&hint);
+    }
     Some(format!("[exit {code}]\n{body}"))
 }
 
@@ -5645,5 +5662,30 @@ mod tests {
 
         // Still running: no marker on screen yet.
         assert!(ai_term_result("user@host:~$ df -h\n", &run).is_none());
+    }
+
+    /// A failed install gets the host's real package manager appended, and the
+    /// shell's probe lines are stripped from the model-visible output.
+    #[test]
+    fn terminal_run_strips_probe_and_hints_the_real_package_manager() {
+        let run = sample_term_run("sudo apt-get install -y htop");
+        let screen = format!(
+            "{}\nsudo: apt-get: command not found\n{}\n/sbin/apk\n{}1>>>\nuser@host:~$ ",
+            run.start_tag(),
+            run.pm_tag(),
+            run.exit_tag()
+        );
+        let out = ai_term_result(&screen, &run).expect("marker present");
+        assert!(out.starts_with("[exit 1]"), "{out}");
+        assert!(
+            !out.contains(&run.pm_tag()),
+            "probe marker must be stripped: {out}"
+        );
+        assert!(
+            !out.contains("/sbin/apk"),
+            "probe output must be stripped: {out}"
+        );
+        assert!(out.contains("apk (Alpine)"), "{out}");
+        assert!(out.contains("`sudo apk add <package>`"), "{out}");
     }
 }

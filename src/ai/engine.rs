@@ -257,21 +257,46 @@ impl Engine {
             };
 
             let text = reply.text.trim().to_string();
-            if !text.is_empty() {
-                self.emit(AiEvent::AssistantText(text.clone()));
-                push_audit(&self.audit, "info", format!("assistant: {}", truncate(&text, 300)));
+            let mut calls = reply.tool_calls.clone();
+            let mut shown = text.clone();
+            // Some local models (llama3.1) print the call as JSON text instead
+            // of using the tool-calling channel. Recover it: the call still
+            // goes through validation, risk classification and approval below.
+            if calls.is_empty() {
+                if let Some((call, range)) = salvage_text_call(&text) {
+                    shown = format!("{}{}", &text[..range.start], &text[range.end..])
+                        .trim()
+                        .to_string();
+                    push_audit(
+                        &self.audit,
+                        "info",
+                        format!("recovered a tool call printed as text: {}", call.name),
+                    );
+                    self.emit(AiEvent::Info(format!(
+                        "Recovered a `{}` call the model printed as text.",
+                        call.name
+                    )));
+                    calls.push(call);
+                }
             }
-            if reply.tool_calls.is_empty() {
-                if !text.is_empty() {
-                    self.convo.push(Msg::assistant(text, Vec::new()));
+            if !shown.is_empty() {
+                self.emit(AiEvent::AssistantText(shown.clone()));
+                push_audit(
+                    &self.audit,
+                    "info",
+                    format!("assistant: {}", truncate(&shown, 300)),
+                );
+            }
+            if calls.is_empty() {
+                if !shown.is_empty() {
+                    self.convo.push(Msg::assistant(shown, Vec::new()));
                 }
                 break;
             }
 
-            self.convo
-                .push(Msg::assistant(text, reply.tool_calls.clone()));
+            self.convo.push(Msg::assistant(shown, calls.clone()));
             let mut cancelled = false;
-            for (i, call) in reply.tool_calls.iter().enumerate() {
+            for (i, call) in calls.iter().enumerate() {
                 match self.run_call(call).await {
                     Ok(result) => {
                         self.convo
@@ -280,7 +305,7 @@ impl Engine {
                     Err(CancelReason::Stopped) => {
                         // Keep the transcript valid for strict providers: every
                         // tool call must have a result before the next turn.
-                        for rest in &reply.tool_calls[i..] {
+                        for rest in &calls[i..] {
                             self.convo.push(Msg::tool_result(
                                 &rest.id,
                                 &rest.name,
@@ -693,6 +718,7 @@ impl Engine {
              - Mention when output was truncated or values were [REDACTED] by Culvert's security layer.\n\
              - For state-changing work, call the tool once — the user will see an approval card.\n\
              - sudo is usable: run it normally when a task needs root (Culvert pipes the saved profile password into sudo -S when required; passwordless sudo works too). Never ask the user for a password.\n\
+             - Package managers vary: apt (Debian/Ubuntu), dnf/yum (Fedora/RHEL), apk (Alpine), zypper (openSUSE), pacman (Arch). If one is missing, do not guess another — run `command -v apt-get dnf yum apk zypper pacman` or `cat /etc/os-release` once, then use what exists. Tool results already include a [hint] with the detected manager after such a failure.\n\
              - For installs and other interactive work (package managers, prompts, anything needing root where sudo may ask), call execute_command with in_terminal=true: the command is typed into the visible terminal tab, the user can answer prompts there, and the app returns what the screen showed. Output may be only the visible tail. State-changing commands do this by default; read-only ones use the hidden channel.\n\nContext:\n",
         );
         match ctx
@@ -829,4 +855,99 @@ fn preview(s: &str) -> String {
 
 fn clip_result(s: &str) -> String {
     truncate(s, 6000)
+}
+
+/// Recover a tool call that a model printed as JSON text instead of using the
+/// native tool-calling channel (llama3.1 does this intermittently). Only
+/// objects whose `name` matches a registered tool and whose
+/// `parameters`/`arguments` is an object are accepted; the recovered call still
+/// goes through validation, risk classification and approval.
+fn salvage_text_call(text: &str) -> Option<(ToolCall, std::ops::Range<usize>)> {
+    let mut from = 0;
+    while let Some(rel) = text[from..].find('{') {
+        let begin = from + rel;
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut escaped = false;
+        let mut end = None;
+        for (i, ch) in text[begin..].char_indices() {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_str = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(begin + i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text[begin..end]) {
+            let name = v.get("name").and_then(|n| n.as_str());
+            let args = v.get("parameters").or_else(|| v.get("arguments"));
+            if let (Some(name), Some(args)) = (name, args) {
+                if args.is_object() && tools::defs().iter().any(|d| d.name == name) {
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    return Some((
+                        ToolCall {
+                            id: format!("text-{stamp}"),
+                            name: name.to_string(),
+                            args: args.to_string(),
+                        },
+                        begin..end,
+                    ));
+                }
+            }
+        }
+        from = end;
+    }
+    None
+}
+
+#[cfg(test)]
+mod salvage_tests {
+    use super::*;
+
+    #[test]
+    fn recovers_a_tool_call_printed_as_text() {
+        let text = "Since the detected package manager is apk, we will use it.\n\n{\"name\": \"execute_command\", \"parameters\": {\"command\":\"sudo apk add htop\",\"in_terminal\":true}}";
+        let (call, range) = salvage_text_call(text).expect("recovered");
+        assert_eq!(call.name, "execute_command");
+        assert!(call.args.contains("apk add htop"), "{}", call.args);
+        let cleaned = format!("{}{}", &text[..range.start], &text[range.end..]);
+        assert!(!cleaned.contains("\"parameters\""), "{cleaned}");
+        assert!(cleaned.contains("detected package manager"), "{cleaned}");
+
+        // Fenced JSON and the `arguments` spelling both work.
+        let fenced = "```json\n{\"name\":\"list_tunnels\",\"arguments\":{}}\n```";
+        assert_eq!(salvage_text_call(fenced).unwrap().0.name, "list_tunnels");
+
+        // Ordinary JSON in an answer is not a tool call.
+        assert!(salvage_text_call("result: {\"nested\": true}").is_none());
+        // Unknown tool names are ignored.
+        assert!(
+            salvage_text_call("{\"name\":\"rm_rf\",\"parameters\":{\"x\":1}}").is_none()
+        );
+        // Braces inside strings do not confuse the scan.
+        assert!(
+            salvage_text_call("{\"name\":\"get_active_session\",\"parameters\":{\"x\":\"}\"}}")
+                .is_some()
+        );
+    }
 }
