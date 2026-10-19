@@ -94,6 +94,9 @@ struct AiTermRun {
     opened: bool,
     /// The command has been typed into the shell.
     sent: bool,
+    /// Interactive programs are handed over to the user: the run completes as
+    /// soon as the command is typed, instead of waiting for an exit marker.
+    wait_for_exit: bool,
     armed_at: std::time::Instant,
     sent_at: std::time::Instant,
 }
@@ -623,6 +626,7 @@ impl TunnelApp {
                 nonce,
                 opened: false,
                 sent: false,
+                wait_for_exit: crate::ai::tools::interactive_program(command).is_none(),
                 armed_at: std::time::Instant::now(),
                 sent_at: std::time::Instant::now(),
             });
@@ -681,8 +685,20 @@ impl TunnelApp {
             run.sent_at = std::time::Instant::now();
             // Show the tab so the user can watch (and answer prompts).
             self.active = idx;
-            self.ai_term = Some(run);
             ctx.request_repaint();
+            if !run.wait_for_exit {
+                // Full-screen program: hand the terminal over and let the
+                // model move on instead of blocking on an exit marker.
+                self.ai.complete_action(
+                    run.id,
+                    format!(
+                        "[started] `{}` is running in the terminal tab now — it is a full-screen program, so Culvert handed the terminal to the user instead of capturing its output. It keeps running until the user quits it; you can report that it started.",
+                        run.command
+                    ),
+                );
+                return;
+            }
+            self.ai_term = Some(run);
             return;
         }
         if let Some(result) = ai_term_result(&term.visible_text(), &run) {
@@ -5618,6 +5634,7 @@ mod tests {
             nonce: "abc12345".into(),
             opened: false,
             sent: false,
+            wait_for_exit: true,
             armed_at: std::time::Instant::now(),
             sent_at: std::time::Instant::now(),
         }

@@ -103,7 +103,7 @@ pub fn defs() -> Vec<crate::ai::provider::ToolDef> {
         },
         ToolDef {
             name: "execute_command",
-            description: "Run a shell command on a server over SSH and return its output. Read-only commands run immediately over a hidden channel; state-changing and destructive commands need approval and are typed into the visible terminal tab by default, so the user can watch progress and answer sudo/password prompts there. Pass in_terminal=true to force the visible terminal (installs, interactive prompts) or in_terminal=false to force the hidden channel. `sudo` also works hidden when the profile has a saved password (Culvert feeds it to `sudo -S`). Avoid streaming commands (top, tail -f, watch, less); use bounded forms (`cmd | tail -n 200`).",
+            description: "Run a shell command on a server over SSH and return its output. Read-only commands run immediately over a hidden channel; state-changing and destructive commands need approval and are typed into the visible terminal tab by default, so the user can watch progress and answer sudo/password prompts there. Full-screen programs (htop, top, vim, less, tmux, watch, tail -f) always go to the visible terminal: Culvert hands the terminal to the user and returns as soon as the program starts — to check whether a package is installed use `command -v <name>` or `<name> --version`, not the program itself. Pass in_terminal=true to force the visible terminal, in_terminal=false to force the hidden channel. `sudo` also works hidden when the profile has a saved password (Culvert feeds it to `sudo -S`).",
             parameters: s(json!({
                 "type": "object",
                 "properties": {
@@ -475,14 +475,20 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
             }
             let (id, label) = resolve_server(ctx, args)?;
             let verdict = classify_command(&command);
+            // Full-screen programs (htop, vim, less, watch, tail -f, …) need a
+            // PTY: the hidden channel has none, so they die with "terminal type
+            // is unknown". They always run in the visible terminal, where the
+            // user drives them.
+            let interactive = interactive_program(&command);
             // Default: read-only commands use the hidden exec channel (full,
             // fast output); state-changing work is typed into the visible
             // terminal so the user can watch and answer prompts. An explicit
             // in_terminal overrides either way.
-            let in_terminal = args
-                .get("in_terminal")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(verdict.risk != Risk::Safe);
+            let in_terminal = interactive.is_some()
+                || args
+                    .get("in_terminal")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(verdict.risk != Risk::Safe);
             if in_terminal {
                 if let Some(p) = ctx.profiles.iter().find(|p| p.id == id) {
                     if p.protocol == crate::session::Protocol::Rdp {
@@ -492,12 +498,21 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                     }
                 }
             }
+            // An interactive program takes over the shell, so always show the
+            // approval card for it even when the command itself is read-only.
+            let risk = if interactive.is_some() {
+                Risk::Approval
+            } else {
+                verdict.risk
+            };
             let summary = if in_terminal {
                 format!("run in the terminal on {label}: {command}")
             } else {
                 format!("run on {label}: {command}")
             };
-            let reason = if in_terminal {
+            let reason = if let Some(p) = interactive {
+                format!("{p} is a full-screen program and takes over the terminal")
+            } else if in_terminal {
                 format!("{} — typed into the visible terminal", verdict.reason)
             } else {
                 verdict.reason
@@ -505,7 +520,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
             Ok(Call {
                 tool: tool.to_string(),
                 summary,
-                risk: verdict.risk,
+                risk,
                 reason,
                 command: Some(command.clone()),
                 sensitive: None,
@@ -517,7 +532,6 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                 },
             })
         }
-
         "get_system_info" => {
             let (id, label) = resolve_server(ctx, args)?;
             let script = "echo '== user'; whoami; echo '== host'; hostname; echo '== cpus'; nproc 2>/dev/null; echo '== load'; cat /proc/loadavg 2>/dev/null; echo '== memory'; free -h 2>/dev/null || head -3 /proc/meminfo; echo '== disk'; df -h /; echo '== uptime'; uptime";
@@ -943,7 +957,7 @@ impl Executor {
             }
         };
         let text = out?;
-        let hinted = sudo_hint(&text, sudo_pw.is_some());
+        let hinted = terminal_needed_hint(&sudo_hint(&text, sudo_pw.is_some()));
         // If the shell complained about a missing package manager, probe once
         // and tell the model what this host actually has — local models
         // otherwise guess apt → yum → "try" forever.
@@ -1270,6 +1284,81 @@ pub(crate) fn terminal_pm_hint(out: &str, probe: &str) -> Option<String> {
     Some(pm_hint_text(missing, &available_package_managers(probe)))
 }
 
+/// Full-screen programs that take over the terminal. They need a PTY; the
+/// hidden exec channel has none, so they die there with "terminal type is
+/// unknown" (which looks like "not installed" to a model).
+const INTERACTIVE_PROGRAMS: [&str; 20] = [
+    "htop", "top", "btop", "atop", "glances", "vi", "vim", "nvim", "nano", "emacs", "less",
+    "more", "man", "watch", "tmux", "screen", "mc", "mutt", "w3m", "links",
+];
+
+/// The interactive program a command line runs, if any. Scans every pipeline
+/// segment (`df -h | less` counts) and skips leading wrappers (`sudo -u root
+/// htop`, `env FOO=1 top`, `/usr/bin/vim`).
+pub(crate) fn interactive_program(command: &str) -> Option<&'static str> {
+    for segment in command.split(|c| matches!(c, ';' | '|' | '&' | '\n')) {
+        let mut words = segment.split_whitespace().peekable();
+        while let Some(w) = words.peek() {
+            let base = w.rsplit('/').next().unwrap_or(w);
+            match base {
+                "sudo" | "doas" | "env" | "nice" | "ionice" | "nohup" | "time" | "command"
+                | "builtin" | "exec" | "stdbuf" => {
+                    words.next();
+                }
+                "-u" | "-g" | "-p" | "-C" | "-n" => {
+                    words.next();
+                    words.next();
+                }
+                _ if base.starts_with('-') | base.contains('=') => {
+                    words.next();
+                }
+                _ => break,
+            }
+        }
+        let Some(prog) = words.next() else { continue };
+        let base = prog.rsplit('/').next().unwrap_or(prog);
+        if let Some(p) = INTERACTIVE_PROGRAMS.iter().copied().find(|p| *p == base) {
+            // `htop --version`, `vim --help`, … print and exit: no PTY needed.
+            if segment
+                .split_whitespace()
+                .any(|w| matches!(w, "--version" | "-V" | "--help" | "-h" | "--usage"))
+            {
+                continue;
+            }
+            return Some(p);
+        }
+        // Followers run until interrupted and also need the terminal.
+        if matches!(base, "tail" | "journalctl")
+            && segment
+                .split_whitespace()
+                .any(|w| w == "-f" || w == "-F" || w == "--follow")
+        {
+            return Some(if base == "tail" {
+                "tail -f"
+            } else {
+                "journalctl -f"
+            });
+        }
+    }
+    None
+}
+
+/// Next-step note when a program failed because the exec channel has no PTY.
+fn terminal_needed_hint(out: &str) -> String {
+    let needs_tty = out.contains("terminal type is unknown")
+        || out.contains("Error opening terminal")
+        || out.contains("TERM environment variable not set")
+        || out.contains("no job control")
+        || out.contains("not a terminal");
+    if needs_tty {
+        format!(
+            "{out}\n[hint] that program needs an interactive terminal; the hidden channel has none (TERM is unknown). Full-screen programs (htop, top, vim, less, tmux, watch…) run in the visible terminal instead — pass in_terminal=true. To confirm a package is installed, use `command -v <name>` or `<name> --version`, not the program itself."
+        )
+    } else {
+        out.to_string()
+    }
+}
+
 /// One exec channel, full output, 45 s cap (streaming commands never finish).
 async fn run_exec(
     handle: &ssh::SshHandle,
@@ -1451,6 +1540,69 @@ mod tests {
         assert!(prepared(
             serde_json::json!({ "command": "hostname", "in_terminal": true })
         ));
+    }
+
+    #[test]
+    fn interactive_programs_are_detected_and_routed_to_the_terminal() {
+        assert_eq!(interactive_program("htop"), Some("htop"));
+        assert_eq!(interactive_program("sudo htop"), Some("htop"));
+        assert_eq!(
+            interactive_program("sudo -u root /usr/bin/vim /etc/hosts"),
+            Some("vim")
+        );
+        assert_eq!(interactive_program("env FOO=1 top"), Some("top"));
+        assert_eq!(interactive_program("df -h | less"), Some("less"));
+        assert_eq!(interactive_program("htop; df -h"), Some("htop"));
+        assert_eq!(
+            interactive_program("tail -f /var/log/messages"),
+            Some("tail -f")
+        );
+        assert_eq!(interactive_program("journalctl -f -u nginx"), Some("journalctl -f"));
+        assert_eq!(interactive_program("systemctl status nginx"), None);
+        // Verification commands are not interactive.
+        assert_eq!(interactive_program("htop --version"), None);
+        assert_eq!(interactive_program("vim --help"), None);
+
+        // The TERM-error hint points at the real cause.
+        let hinted = terminal_needed_hint("Error opening terminal: unknown.");
+        assert!(hinted.contains("[hint]"), "{hinted}");
+        assert!(hinted.contains("command -v <name>"), "{hinted}");
+        assert_eq!(terminal_needed_hint("root\n"), "root\n");
+
+        // prepare() forces the terminal and an approval card for a TUI.
+        let ctx = crate::ai::UiContext {
+            active_session_id: Some("demo".into()),
+            open_session_ids: Vec::new(),
+            dock: None,
+            profiles_summary: vec![crate::ai::CtxSession {
+                id: "demo".into(),
+                name: "demo".into(),
+                host: "10.0.0.5".into(),
+                username: "root".into(),
+                protocol: "ssh".into(),
+                group: None,
+            }],
+            tunnels: Vec::new(),
+            profiles: vec![SshSession {
+                id: "demo".into(),
+                name: "demo".into(),
+                host: "10.0.0.5".into(),
+                username: "root".into(),
+                ..SshSession::default()
+            }],
+        };
+        let call = prepare(
+            "execute_command",
+            &serde_json::json!({ "command": "htop", "in_terminal": false }),
+            &ctx,
+        )
+        .expect("prepare");
+        assert_eq!(call.risk, Risk::Approval);
+        match call.prepared {
+            Prepared::Ssh { in_terminal, .. } => assert!(in_terminal),
+            _ => panic!("expected an ssh call"),
+        }
+        assert!(call.reason.contains("full-screen"), "{}", call.reason);
     }
 
     #[test]

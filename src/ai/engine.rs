@@ -430,7 +430,9 @@ impl Engine {
                     label: format!("run in the terminal on {label}"),
                 });
                 let result = self.await_action(rid).await?;
-                let ok = result.starts_with("[exit 0]");
+                // `[started]` is the handover of a full-screen program to the
+                // visible terminal: the command is running, not failed.
+                let ok = result.starts_with("[exit 0]") || result.starts_with("[started]");
                 crate::log::push_log(
                     &self.logs,
                     LogEntry::new(
@@ -719,6 +721,7 @@ impl Engine {
              - For state-changing work, call the tool once — the user will see an approval card.\n\
              - sudo is usable: run it normally when a task needs root (Culvert pipes the saved profile password into sudo -S when required; passwordless sudo works too). Never ask the user for a password.\n\
              - Package managers vary: apt (Debian/Ubuntu), dnf/yum (Fedora/RHEL), apk (Alpine), zypper (openSUSE), pacman (Arch). If one is missing, do not guess another — run `command -v apt-get dnf yum apk zypper pacman` or `cat /etc/os-release` once, then use what exists. Tool results already include a [hint] with the detected manager after such a failure.\n\
+             - Full-screen programs (htop, top, vim, less, tmux, watch, tail -f, journalctl -f) never run on the hidden channel: Culvert routes them to the visible terminal automatically and returns as soon as they start, so the user drives them. To confirm something is installed, use `command -v <name>` or `<name> --version` — never run the program itself as a test.\n\
              - For installs and other interactive work (package managers, prompts, anything needing root where sudo may ask), call execute_command with in_terminal=true: the command is typed into the visible terminal tab, the user can answer prompts there, and the app returns what the screen showed. Output may be only the visible tail. State-changing commands do this by default; read-only ones use the hidden channel.\n\nContext:\n",
         );
         match ctx
