@@ -3,9 +3,9 @@
 //! machine. Persisted next to the other Culvert JSON files
 //! (`%APPDATA%\culvert\ai.json`).
 //!
-//! NOTE: the API key shares the same on-disk tradeoff as saved session
-//! passwords — plain JSON in the user profile (exactly what MobaXterm does
-//! for saved sessions). Protect your Windows profile accordingly.
+//! The API key is sealed with Windows DPAPI (see `crate::secrets`) before it
+//! is written, exactly like saved session passwords — the JSON around it
+//! stays readable, the key itself does not.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -115,10 +115,21 @@ pub fn audit_log_file() -> PathBuf {
 }
 
 pub fn load() -> AiConfig {
-    std::fs::read_to_string(ai_config_file())
-        .ok()
-        .and_then(|raw| serde_json::from_str(raw.trim_start_matches('\u{feff}')).ok())
-        .unwrap_or_default()
+    let Some(raw) = std::fs::read_to_string(ai_config_file()).ok() else {
+        return AiConfig::default();
+    };
+    let Ok(mut value) =
+        serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}'))
+    else {
+        return AiConfig::default();
+    };
+    let migrated = crate::secrets::unprotect_value(&mut value);
+    let cfg = serde_json::from_value(value).unwrap_or_default();
+    if migrated {
+        // Upgrade a plaintext key to DPAPI on the spot.
+        let _ = persist(&cfg);
+    }
+    cfg
 }
 
 pub fn persist(cfg: &AiConfig) -> anyhow::Result<()> {
@@ -126,6 +137,8 @@ pub fn persist(cfg: &AiConfig) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(cfg)?)?;
+    let mut value = serde_json::to_value(cfg)?;
+    crate::secrets::protect_value(&mut value);
+    std::fs::write(&path, serde_json::to_string_pretty(&value)?)?;
     Ok(())
 }

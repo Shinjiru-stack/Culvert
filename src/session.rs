@@ -258,12 +258,34 @@ fn strip_bom(s: &str) -> &str {
     s.strip_prefix('\u{feff}').unwrap_or(s)
 }
 
+/// Parse a config document, opening any DPAPI-sealed secret fields. The
+/// returned flag is true when legacy plaintext secrets were found (so the
+/// caller can immediately rewrite the file encrypted).
+fn parse_with_secrets<T: serde::de::DeserializeOwned>(raw: &str) -> (T, bool)
+where
+    T: Default,
+{
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(strip_bom(raw)) else {
+        return (T::default(), false);
+    };
+    let migrated = crate::secrets::unprotect_value(&mut value);
+    (serde_json::from_value(value).unwrap_or_default(), migrated)
+}
+
+/// Serialize a config document with every secret field sealed for this user.
+fn to_sealed_json<T: serde::Serialize + ?Sized>(value: &T) -> anyhow::Result<String> {
+    let mut value = serde_json::to_value(value)?;
+    crate::secrets::protect_value(&mut value);
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
 pub fn load_sessions() -> Vec<SshSession> {
     let path = sessions_file();
     if !path.exists() {
         // First launch after the rename: import and persist old sessions.
         if let Ok(s) = fs::read_to_string(legacy_sessions_file()) {
-            if let Ok(sessions) = serde_json::from_str::<Vec<SshSession>>(strip_bom(&s)) {
+            let (sessions, _) = parse_with_secrets::<Vec<SshSession>>(&s);
+            if !sessions.is_empty() {
                 let _ = save_sessions(&sessions);
                 return sessions;
             }
@@ -272,7 +294,12 @@ pub fn load_sessions() -> Vec<SshSession> {
     }
     match fs::read_to_string(&path) {
         Ok(s) => {
-            serde_json::from_str::<Vec<SshSession>>(strip_bom(&s)).unwrap_or_else(|_| Vec::new())
+            let (sessions, migrated) = parse_with_secrets::<Vec<SshSession>>(&s);
+            if migrated && !sessions.is_empty() {
+                // Upgrade plaintext credentials to DPAPI on the spot.
+                let _ = save_sessions(&sessions);
+            }
+            sessions
         }
         Err(_) => Vec::new(),
     }
@@ -283,8 +310,7 @@ pub fn save_sessions(sessions: &[SshSession]) -> anyhow::Result<PathBuf> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(sessions)?;
-    fs::write(&path, json)?;
+    fs::write(&path, to_sealed_json(sessions)?)?;
     Ok(path)
 }
 
@@ -407,7 +433,13 @@ pub fn tunnels_file() -> PathBuf {
 
 pub fn load_tunnels() -> Vec<StandaloneTunnel> {
     match fs::read_to_string(tunnels_file()) {
-        Ok(s) => serde_json::from_str::<Vec<StandaloneTunnel>>(strip_bom(&s)).unwrap_or_default(),
+        Ok(s) => {
+            let (tunnels, migrated) = parse_with_secrets::<Vec<StandaloneTunnel>>(&s);
+            if migrated && !tunnels.is_empty() {
+                let _ = save_tunnels(&tunnels);
+            }
+            tunnels
+        }
         Err(_) => Vec::new(),
     }
 }
@@ -417,8 +449,7 @@ pub fn save_tunnels(tunnels: &[StandaloneTunnel]) -> anyhow::Result<PathBuf> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(tunnels)?;
-    fs::write(&path, json)?;
+    fs::write(&path, to_sealed_json(tunnels)?)?;
     Ok(path)
 }
 

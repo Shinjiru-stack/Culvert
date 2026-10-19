@@ -48,13 +48,16 @@ enum MonCmd {
 }
 
 /// Non-interactive server-health snapshot taken through a dedicated exec
-/// channel every 10 s (MobaXterm-style status bar under the shell).
+/// channel every 30 s (MobaXterm-style status bar under the shell).
 #[derive(Clone, Debug, Default)]
 struct ServerData {
     user: String,
     host: String,
     /// One-minute load average.
     load: f32,
+    /// Five- and fifteen-minute load averages (tooltip).
+    load5: f32,
+    load15: f32,
     cores: u32,
     mem_used: u64,
     mem_total: u64,
@@ -62,7 +65,14 @@ struct ServerData {
     /// df "Capacity" percentage for the root filesystem.
     disk_pct: f32,
     disk_free: u64,
+    /// Compact "3 days, 2:15" uptime for the bar.
     uptime: String,
+    /// Raw `uptime` output for the hover card.
+    uptime_text: String,
+    /// Raw `df -h` output for the storage hover card.
+    df_text: String,
+    /// Raw `free -h` output for the memory hover card.
+    free_text: String,
 }
 
 impl ServerData {
@@ -323,8 +333,9 @@ impl TerminalSession {
     }
 
     /// Slim server-health strip under the shell canvas: user, load, memory,
-    /// root-disk usage and uptime, refreshed every 10 s over its own exec
-    /// channel (MobaXterm look).
+    /// root-disk usage and uptime, refreshed every 30 s over its own exec
+    /// channel (MobaXterm look). Hovering a segment opens a card with the raw
+    /// command output behind it (`uptime`, `df -h`, `free -h`).
     fn server_bar(&self, ui: &mut egui::Ui, rect: Rect) {
         const BAR_BG: Color32 = Color32::from_rgb(20, 21, 23);
         const HAIRLINE: Color32 = Color32::from_rgb(52, 55, 59);
@@ -361,55 +372,165 @@ impl TerminalSession {
         let mono = FontId::new(10.5, FontFamily::Monospace);
         let iconf = theme::icon(12.0);
 
-        let mut x = rect.left() + 8.0;
-        // helper-closure: draws glyph + text, advances x by the text width.
-        let seg = |p: &egui::Painter,
-                   icon_glyph: char,
-                   icon_color: Color32,
-                   text: &String,
-                   text_color: Color32,
-                   x: &mut f32,
-                   gap: f32| {
-            p.text(
-                egui::pos2(*x, cy),
-                Align2::LEFT_CENTER,
-                icon_glyph.to_string(),
-                iconf.clone(),
-                icon_color,
-            );
-            *x += 16.0;
-            p.text(egui::pos2(*x, cy), Align2::LEFT_CENTER, text.clone(), mono.clone(), text_color);
-            *x += p
-                .layout_no_wrap(text.clone(), mono.clone(), text_color)
-                .rect
-                .width()
-                + gap;
+        /// Painter-based segment writer that returns the rect it covered, so
+        /// hover cards can be attached to exactly what was drawn.
+        struct Seg<'a> {
+            painter: &'a egui::Painter,
+            iconf: FontId,
+            mono: FontId,
+            cy: f32,
+            x: f32,
+        }
+        impl Seg<'_> {
+            fn add(
+                &mut self,
+                icon: char,
+                icon_color: Color32,
+                text: &str,
+                text_color: Color32,
+                gap: f32,
+            ) -> Rect {
+                let start = self.x;
+                self.painter.text(
+                    egui::pos2(start, self.cy),
+                    Align2::LEFT_CENTER,
+                    icon.to_string(),
+                    self.iconf.clone(),
+                    icon_color,
+                );
+                self.x += 16.0;
+                self.painter.text(
+                    egui::pos2(self.x, self.cy),
+                    Align2::LEFT_CENTER,
+                    text.to_string(),
+                    self.mono.clone(),
+                    text_color,
+                );
+                self.x += self
+                    .painter
+                    .layout_no_wrap(text.to_string(), self.mono.clone(), text_color)
+                    .rect
+                    .width()
+                    + gap;
+                Rect::from_min_max(
+                    egui::pos2(start, self.cy - 11.0),
+                    egui::pos2(self.x, self.cy + 11.0),
+                )
+            }
+        }
+
+        let mut seg = Seg {
+            painter: &painter,
+            iconf,
+            mono,
+            cy,
+            x: rect.left() + 8.0,
         };
+        // (rect, tooltip title, tooltip body)
+        let mut cards: Vec<(Rect, String, String)> = Vec::new();
 
-        seg(&painter, GLYPH_USER, ICON_COLOR, &format!("{}@{}", d.user, d.host), BAR_TEXT, &mut x, 16.0);
+        let r = seg.add(
+            GLYPH_USER,
+            ICON_COLOR,
+            &format!("{}@{}", d.user, d.host),
+            BAR_TEXT,
+            16.0,
+        );
+        cards.push((
+            r,
+            "Connection".to_string(),
+            format!(
+                "user   {}\nhost   {}\nssh    {}",
+                d.user,
+                d.host,
+                self.connection_label()
+            ),
+        ));
 
-        let cpu_ptr = if d.cores > 0 { d.load / d.cores as f32 * 100.0 } else { 0.0 };
+        let cpu_ptr = if d.cores > 0 {
+            d.load / d.cores as f32 * 100.0
+        } else {
+            0.0
+        };
         let cpu_txt = if d.cores > 0 {
             format!("CPU {:.0}% ({:.2}/{n} cores)", cpu_ptr, d.load, n = d.cores)
         } else {
             format!("load {:.2}", d.load)
         };
-        seg(&painter, GLYPH_CPU, ICON_COLOR, &cpu_txt, tint(cpu_ptr, 75.0, 95.0), &mut x, 16.0);
+        let r = seg.add(
+            GLYPH_CPU,
+            ICON_COLOR,
+            &cpu_txt,
+            tint(cpu_ptr, 75.0, 95.0),
+            16.0,
+        );
+        let body = if d.cores > 0 {
+            format!(
+                "load average   {:.2}   {:.2}   {:.2}    (1m / 5m / 15m)\n\
+                 cores          {n}\n\
+                 per-core load  {:.0}%   ({:.2} on {n} cores)",
+                d.load, d.load5, d.load15, cpu_ptr, d.load, n = d.cores
+            )
+        } else {
+            format!("load average   {:.2}   {:.2}   {:.2}", d.load, d.load5, d.load15)
+        };
+        cards.push((r, "CPU load".to_string(), body));
 
         let mem_txt = if d.mem_total > 0 {
             format!("MEM {} ({:.0}%)", d.mem_text(), d.mem_pct())
         } else {
             "MEM n/a".to_string()
         };
-        seg(&painter, GLYPH_MEM, ICON_COLOR, &mem_txt, tint(d.mem_pct(), 85.0, 95.0), &mut x, 16.0);
+        let r = seg.add(GLYPH_MEM, ICON_COLOR, &mem_txt, tint(d.mem_pct(), 85.0, 95.0), 16.0);
+        let body = if d.free_text.is_empty() {
+            format!(
+                "used    {}\ntotal   {}\n({:.0}% used)",
+                fmt_size(d.mem_used),
+                fmt_size(d.mem_total),
+                d.mem_pct()
+            )
+        } else {
+            d.free_text.trim_end().to_string()
+        };
+        cards.push((r, "Memory — free -h".to_string(), body));
 
         if d.disk_free > 0 && d.disk_pct > 0.0 {
             let disk_txt = format!("/ {} ({:.0}%)", d.disk_text(), d.disk_pct);
-            seg(&painter, GLYPH_DISK, ICON_COLOR, &disk_txt, tint(d.disk_pct, 80.0, 90.0), &mut x, 16.0);
+            let r = seg.add(GLYPH_DISK, ICON_COLOR, &disk_txt, tint(d.disk_pct, 80.0, 90.0), 16.0);
+            let body = if d.df_text.is_empty() {
+                format!(
+                    "mount   {}\nfree    {}\nused    {:.0}%",
+                    d.disk_path,
+                    d.disk_text(),
+                    d.disk_pct
+                )
+            } else {
+                d.df_text.trim_end().to_string()
+            };
+            cards.push((r, "Storage — df -h".to_string(), body));
         }
 
         if !d.uptime.is_empty() {
-            seg(&painter, GLYPH_UPTIME, ICON_COLOR, &d.uptime, BAR_TEXT, &mut x, 0.0);
+            let r = seg.add(GLYPH_UPTIME, ICON_COLOR, &d.uptime, BAR_TEXT, 0.0);
+            let body = if d.uptime_text.is_empty() {
+                format!("up {}", d.uptime)
+            } else {
+                d.uptime_text.clone()
+            };
+            cards.push((r, "Uptime".to_string(), body));
+        }
+
+        for (i, (r, title, body)) in cards.iter().enumerate() {
+            let resp = ui.interact(*r, egui::Id::new((self.focus_id, "mon_card", i)), egui::Sense::hover());
+            let _ = resp.on_hover_ui(|ui| {
+                ui.set_max_width(560.0);
+                ui.label(RichText::new(title).size(11.5).strong());
+                ui.add_space(3.0);
+                ui.add(
+                    egui::Label::new(RichText::new(body).monospace().size(10.5))
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            });
         }
     }
 
@@ -755,21 +876,51 @@ const GLYPH_UPTIME: char = '\u{ebea}'; // history
 
 /// One cheap POSIX probe, echoed with deterministic markers. Missing pieces
 /// (macOS has no /proc) parse to "n/a" instead of failing the whole bar.
+/// The `@@` sections carry the raw command output shown in the hover cards.
 const MON_SCRIPT: &str = "echo U=$(whoami 2>/dev/null); \
 echo H=$(hostname 2>/dev/null); \
 echo C=$(nproc 2>/dev/null); \
 echo L=$(cat /proc/loadavg 2>/dev/null); \
 grep -E '^(MemTotal|MemAvailable):' /proc/meminfo 2>/dev/null; \
 echo D=$(df -P / 2>/dev/null | tail -n 1); \
-echo T=[$(uptime 2>/dev/null)]";
+echo @@UPTIME; uptime 2>/dev/null; \
+echo @@DF; df -h 2>/dev/null | head -n 12; \
+echo @@FREE; free -h 2>/dev/null | head -n 6";
 
 /// Parse the MON_SCRIPT output into a [`ServerData`].
 fn parse_server_data(out: &str) -> Option<ServerData> {
     let mut d = ServerData::default();
     let mut saw_something = false;
+    // Raw-output capture: "" = the key/value header, otherwise a section.
+    let mut section = "";
     for raw in out.lines() {
         let line = raw.trim();
         saw_something = saw_something || !line.is_empty();
+        if let Some(name) = line.strip_prefix("@@") {
+            section = name;
+            continue;
+        }
+        match section {
+            "UPTIME" => {
+                d.uptime_text = line.to_string();
+                continue;
+            }
+            "DF" => {
+                if !line.is_empty() {
+                    d.df_text.push_str(line);
+                    d.df_text.push('\n');
+                }
+                continue;
+            }
+            "FREE" => {
+                if !line.is_empty() {
+                    d.free_text.push_str(line);
+                    d.free_text.push('\n');
+                }
+                continue;
+            }
+            _ => {}
+        }
         if let Some(v) = line.strip_prefix("U=") {
             d.user = v.trim().to_string();
         } else if let Some(v) = line.strip_prefix("H=") {
@@ -777,11 +928,10 @@ fn parse_server_data(out: &str) -> Option<ServerData> {
         } else if let Some(v) = line.strip_prefix("C=") {
             d.cores = v.trim().parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("L=") {
-            d.load = v
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0);
+            let mut parts = v.split_whitespace();
+            d.load = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            d.load5 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            d.load15 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
         } else if let Some(v) = line.strip_prefix("MemTotal:") {
             d.mem_total = v.trim().split_whitespace().next().unwrap_or("0").parse().unwrap_or(0) * 1024;
         } else if let Some(v) = line.strip_prefix("MemAvailable:") {
@@ -798,27 +948,28 @@ fn parse_server_data(out: &str) -> Option<ServerData> {
                 d.disk_path = f.get(5).unwrap_or(&"/").to_string();
                 let _ = total;
             }
-        } else if let Some(v) = line.strip_prefix("T=[") {
-            let body = v.strip_suffix(']').unwrap_or(v);
-            // "… up 3 days,  2:15,  1 user, …" → keep the time segments
-            // between "up" and the user/load-average tail.
-            let tail = body.split(" up ").nth(1).unwrap_or("");
-            let mut parts: Vec<String> = Vec::new();
-            for seg in tail.split(", ") {
-                let s = seg.trim();
-                if s.is_empty() || s.contains(" user") || s.starts_with("load average") {
-                    break;
-                }
-                parts.push(s.to_string());
-            }
-            d.uptime = parts.join(", ");
         }
+    }
+    if d.uptime.is_empty() && !d.uptime_text.is_empty() {
+        // "… up 3 days,  2:15,  1 user, …" → keep the time segments between
+        // "up" and the user/load-average tail.
+        let tail = d.uptime_text.split(" up ").nth(1).unwrap_or("");
+        let mut parts: Vec<String> = Vec::new();
+        for seg in tail.split(", ") {
+            let s = seg.trim();
+            if s.is_empty() || s.contains(" user") || s.starts_with("load average") {
+                break;
+            }
+            parts.push(s.to_string());
+        }
+        d.uptime = parts.join(", ");
     }
     saw_something.then_some(d)
 }
 
-/// Own low-rate SSH connection per tab: samples server health every 10 s.
-/// Ends when the stop queue closes (tab replaced/closed) or the app exits.
+/// Own low-rate SSH connection per tab: samples server health every 30 s
+/// (the first sample lands as soon as the shell connects). Ends when the stop
+/// queue closes (tab replaced/closed) or the app exits.
 async fn monitor_task(
     session: SshSession,
     logs: SharedLogs,
@@ -826,14 +977,17 @@ async fn monitor_task(
     evt_tx: UnboundedSender<TermEvent>,
     mut cmd_rx: UnboundedReceiver<MonCmd>,
 ) {
-    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     let mut handle: Option<ssh::SshHandle> = None;
+    // `interval`'s first tick is immediate, so the bar is not blank for a
+    // whole period after connecting.
+    let mut tick = tokio::time::interval(INTERVAL);
 
     loop {
         // One sample per tick; stop whenever asked.
         let mut stop = false;
         tokio::select! {
-            _ = tokio::time::sleep(INTERVAL) => {}
+            _ = tick.tick() => {}
             r = cmd_rx.recv() => {
                 stop = r.is_none() || matches!(r, Some(MonCmd::Stop));
             }
@@ -1261,5 +1415,45 @@ mod tests {
         assert_eq!(idx_color(16, false), Color32::from_rgb(0, 0, 0));
         assert_eq!(idx_color(231, false), Color32::from_rgb(255, 255, 255));
         assert_eq!(idx_color(255, false), Color32::from_rgb(238, 238, 238));
+    }
+
+    #[test]
+    fn monitor_probe_parses_header_and_hover_sections() {
+        let out = "\
+U=root
+H=web01
+C=8
+L=0.42 0.31 0.25 1/234 5678
+MemTotal:        8123456 kB
+MemAvailable:    3456789 kB
+D=/dev/sda1 102400000 51200000 51200000 50% /
+@@UPTIME
+ 14:02:31 up 12 days,  4:31,  2 users,  load average: 0.42, 0.31, 0.25
+@@DF
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda1        98G   49G   46G  52% /
+@@FREE
+              total        used        free      shared  buff/cache   available
+Mem:           7.7G        4.2G        1.1G         12M        2.4G        3.3G
+Swap:          2.0G        128M        1.9G";
+        let d = parse_server_data(out).expect("probe output parses");
+        assert_eq!(d.user, "root");
+        assert_eq!(d.host, "web01");
+        assert_eq!(d.cores, 8);
+        assert_eq!(d.load, 0.42);
+        assert_eq!(d.load5, 0.31);
+        assert_eq!(d.load15, 0.25);
+        assert_eq!(d.mem_total, 8123456 * 1024);
+        assert_eq!(d.mem_used, (8123456 - 3456789) * 1024);
+        assert_eq!(d.disk_pct, 50.0);
+        assert_eq!(d.disk_free, 51200000 * 1024);
+        assert_eq!(d.disk_path, "/");
+        assert_eq!(d.uptime, "12 days, 4:31");
+        // Hover-card payloads: the raw command output survives verbatim.
+        assert!(d.uptime_text.contains("up 12 days"));
+        assert!(d.df_text.contains("Filesystem"));
+        assert!(d.df_text.contains("/dev/sda1"));
+        assert!(d.free_text.contains("buff/cache"));
+        assert!(d.free_text.contains("Swap:"));
     }
 }

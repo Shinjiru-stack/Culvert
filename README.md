@@ -61,7 +61,9 @@ for your approval at every fork in the road.
   automatically while the editor is open (one more push on close).
 - **Server monitor bar** — a MobaXterm-style strip under every live shell:
   user@host, CPU load, memory, root-disk usage and uptime, refreshed every
-  10 s over its own idle SSH connection (green/amber/red thresholds).
+  30 s over its own idle SSH connection (green/amber/red thresholds).
+  Hover any segment for the detail behind it — load averages per core,
+  `free -h`, `df -h` and the full `uptime` line.
 - **Command snippets (macros)** — save frequent commands (systemd restarts,
   log chases…) once in the snippet manager; run them in any shell with one
   click. Stored locally in `snippets.json`.
@@ -126,7 +128,9 @@ editor; saves sync straight back to the server:
 ![File browser](docs/screenshots/filebrowser.png)
 
 **Server monitor bar** — under every connected shell: user@host, CPU load,
-memory, root-disk usage and uptime, refreshed every 10 s:
+memory, root-disk usage and uptime, sampled every 30 s. Hover a segment for
+its detail card — load averages per core, raw `free -h`, `df -h` and
+`uptime`:
 
 ![Server monitor bar](docs/screenshots/monitor-bar.png)
 
@@ -242,6 +246,12 @@ Sessions (including credentials) are stored as JSON:
   next to it in `groups.json`, `snippets.json` and `tunnels.json`)
 - Linux/macOS: `~/.config/culvert/sessions.json`
 
+Passwords, key passphrases and the AI API key are **not** written as
+plaintext: they are sealed with the OS keystore — on Windows, DPAPI
+(`CryptProtectData`), so only your Windows account on this machine can open
+them. Existing plaintext files are upgraded in place the first time Culvert
+loads them. The rest of each file stays human-readable JSON.
+
 The AI Copilot keeps its settings (provider, model, security mode) in
 `ai.json` next to those, with the audit trail in `ai-audit.log`.
 
@@ -250,10 +260,10 @@ the old `ssh-tunnel-manager` folder the first time Culvert runs.
 
 ## Security notes
 
-- Passwords and key passphrases are kept in plain JSON on your machine for reuse
-  convenience (the same trade-off desktop SSH clients traditionally make).
-  Protect your user profile; consider a dedicated key without a passphrase
-  otherwise. The AI provider API key lives in `ai.json` under the same rules.
+- Credentials are encrypted at rest with Windows DPAPI (per-user, per-machine;
+  an extra app-specific entropy value is mixed in). Copying `sessions.json`,
+  `tunnels.json` or `ai.json` to another account or machine leaves the secrets
+  unreadable — the account is the key, so protect your Windows profile.
 - The Copilot never sends raw tool output to a cloud provider without passing
   the redaction layer, and remote actions only ever run through Culvert's own
   SSH/SFTP stack (the same code paths as the UI) after risk classification.

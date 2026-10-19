@@ -4,6 +4,7 @@ mod app;
 mod ai;
 mod filebrowser;
 mod log;
+mod secrets;
 mod session;
 mod snippets;
 mod ssh;

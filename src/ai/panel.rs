@@ -920,7 +920,7 @@ impl AiPanel {
                             .hint_text(flavor.key_hint()),
                     );
                     ui.label(
-                        RichText::new("Stored next to your saved sessions (protect your Windows profile).")
+                        RichText::new("Encrypted with Windows DPAPI (your Windows account is the key).")
                             .size(9.5)
                             .color(theme::TEXT_FAINT()),
                     );

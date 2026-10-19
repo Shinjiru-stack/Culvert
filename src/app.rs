@@ -202,10 +202,11 @@ impl TunnelEditor {
 
     /// A tunnel that works on its own: fresh SSH details, no saved session.
     fn new_standalone() -> Self {
-        Self {
-            standalone: true,
-            ..Self::new(String::new())
-        }
+        // The sentinel (not an empty id) is what `save_tunnel_editor` keys
+        // off, so "New tunnel" saves even with zero saved sessions.
+        let mut ed = Self::new(STANDALONE_TUNNEL.to_string());
+        ed.standalone = true;
+        ed
     }
 
     fn from(session_id: &str, f: &PortForward) -> Self {
@@ -1063,7 +1064,7 @@ impl TunnelApp {
             ed.error = Some(e);
             return;
         }
-        if ed.session_id == STANDALONE_TUNNEL {
+        if ed.standalone {
             // Tunnel with its own SSH endpoint — no saved session involved.
             let host = ed.host.trim().to_string();
             if host.is_empty() {
@@ -1720,8 +1721,10 @@ impl TunnelApp {
             .show(ctx, |ui| self.statusbar(ui));
 
         if self.sidebar_collapsed {
-            // Compact MobaXterm-style icon rail.
-            egui::SidePanel::left("sessions")
+            // Compact MobaXterm-style icon rail. Its own panel id, so
+            // collapsing never overwrites the width the user dragged the
+            // expanded panel to (egui stores width per panel id).
+            egui::SidePanel::left("sessions_rail")
                 .exact_width(56.0)
                 .resizable(false)
                 .frame(
@@ -3163,6 +3166,7 @@ impl TunnelApp {
                             .clicked()
                         {
                             ed.standalone = true;
+                            ed.session_id = STANDALONE_TUNNEL.to_string();
                         }
                         for (id, label) in &session_names {
                             if ui.selectable_label(!ed.standalone && id == &ed.session_id, label)
@@ -5366,6 +5370,17 @@ mod tests {
         app.open_session(&ctx, "demo-session");
         assert_eq!(app.tabs.len(), 2);
         assert!(matches!(app.tabs.last(), Some(Tab::Terminal(_))));
+    }
+
+    /// Regression: "New tunnel" must be savable with zero saved sessions —
+    /// the editor carries the standalone sentinel, and the save path keys
+    /// off the flag (not an empty session id).
+    #[test]
+    fn standalone_tunnel_editor_needs_no_session() {
+        let ed = TunnelEditor::new_standalone();
+        assert!(ed.standalone);
+        assert_eq!(ed.session_id, STANDALONE_TUNNEL);
+        assert!(ed.forward_id.is_none());
     }
 
     #[test]
