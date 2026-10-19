@@ -659,7 +659,8 @@ impl Engine {
              - Use bounded, non-interactive commands (grep ... | tail -n 200). Never use top/tail -f/watch/less.\n\
              - Keep answers short: what you found, the exact command(s) used in `backticks`, and the next useful step.\n\
              - Mention when output was truncated or values were [REDACTED] by Culvert's security layer.\n\
-             - For state-changing work, call the tool once — the user will see an approval card.\n\nContext:\n",
+             - For state-changing work, call the tool once — the user will see an approval card.\n\
+             - sudo is usable: run it normally when a task needs root (Culvert pipes the saved profile password into sudo -S when required; passwordless sudo works too). Never ask the user for a password.\n\nContext:\n",
         );
         match ctx
             .active_session_id

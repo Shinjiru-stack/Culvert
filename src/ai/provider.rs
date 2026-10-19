@@ -89,6 +89,7 @@ pub struct ChatReply {
 pub enum Flavor {
     OpenRouter,
     OpenAi,
+    Grok,
     Ollama,
     Gemini,
     Anthropic,
@@ -96,9 +97,10 @@ pub enum Flavor {
 }
 
 impl Flavor {
-    pub const ALL: [Flavor; 6] = [
+    pub const ALL: [Flavor; 7] = [
         Flavor::OpenRouter,
         Flavor::OpenAi,
+        Flavor::Grok,
         Flavor::Ollama,
         Flavor::Gemini,
         Flavor::Anthropic,
@@ -109,6 +111,7 @@ impl Flavor {
         match self {
             Flavor::OpenRouter => "openrouter",
             Flavor::OpenAi => "openai",
+            Flavor::Grok => "grok",
             Flavor::Ollama => "ollama",
             Flavor::Gemini => "gemini",
             Flavor::Anthropic => "anthropic",
@@ -119,6 +122,7 @@ impl Flavor {
     pub fn from_id(id: &str) -> Flavor {
         match id {
             "openai" => Flavor::OpenAi,
+            "grok" => Flavor::Grok,
             "ollama" => Flavor::Ollama,
             "gemini" => Flavor::Gemini,
             "anthropic" => Flavor::Anthropic,
@@ -131,6 +135,7 @@ impl Flavor {
         match self {
             Flavor::OpenRouter => "OpenRouter",
             Flavor::OpenAi => "OpenAI",
+            Flavor::Grok => "Grok (xAI)",
             Flavor::Ollama => "Ollama (local)",
             Flavor::Gemini => "Google Gemini",
             Flavor::Anthropic => "Anthropic",
@@ -142,6 +147,7 @@ impl Flavor {
         match self {
             Flavor::OpenRouter => "https://openrouter.ai/api/v1",
             Flavor::OpenAi => "https://api.openai.com/v1",
+            Flavor::Grok => "https://api.x.ai/v1",
             Flavor::Ollama => "http://localhost:11434/v1",
             Flavor::Gemini => "https://generativelanguage.googleapis.com/v1beta",
             Flavor::Anthropic => "https://api.anthropic.com",
@@ -153,6 +159,7 @@ impl Flavor {
         match self {
             Flavor::OpenRouter => "sk-or-…",
             Flavor::OpenAi => "sk-…",
+            Flavor::Grok => "xai-…",
             Flavor::Ollama => "not required for a local Ollama",
             Flavor::Gemini => "AIza…",
             Flavor::Anthropic => "sk-ant-…",

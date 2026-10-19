@@ -13,7 +13,7 @@
 use crate::ai::security::{classify_command, sensitive_path, Risk};
 use crate::ai::{CtxTunnel, UiAction, UiContext};
 use crate::log::SharedLogs;
-use crate::session::SshSession;
+use crate::session::{AuthType, SshSession};
 use crate::ssh;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
@@ -103,7 +103,7 @@ pub fn defs() -> Vec<crate::ai::provider::ToolDef> {
         },
         ToolDef {
             name: "execute_command",
-            description: "Run a shell command on a server over SSH and return its output. Read-only commands run immediately; state-changing and destructive commands need the user's approval first. Avoid interactive or streaming commands (top, tail -f, watch, less); use bounded forms (`cmd | tail -n 200`).",
+            description: "Run a shell command on a server over SSH and return its output. Read-only commands run immediately; state-changing and destructive commands need the user's approval first. `sudo` works: when the profile has a saved password Culvert feeds it to `sudo -S` (passwordless sudo also works) — do not avoid sudo for that reason. Avoid interactive or streaming commands (top, tail -f, watch, less); use bounded forms (`cmd | tail -n 200`).",
             parameters: s(json!({
                 "type": "object",
                 "properties": {
@@ -882,6 +882,9 @@ impl Executor {
         command: &str,
         logs: &SharedLogs,
     ) -> Result<String, String> {
+        // PTY-less exec channels cannot answer sudo's password prompt;
+        // rewrite + feed the saved password when there is one.
+        let (cmd, sudo_pw) = prepare_exec(profile, command);
         let id = profile.id.clone();
         if !self.conns.contains_key(&id) {
             let h = self.connect_handle(profile, logs).await?;
@@ -889,9 +892,9 @@ impl Executor {
         }
         let first = {
             let h = self.conns.get(&id).unwrap();
-            run_exec(h, command).await
+            run_exec(h, &cmd, sudo_pw.clone()).await
         };
-        match first {
+        let out = match first {
             Ok(out) => Ok(out),
             Err(e) => {
                 // Stale connection: reconnect once before giving up.
@@ -899,11 +902,12 @@ impl Executor {
                 let h = self.connect_handle(profile, logs).await?;
                 self.conns.insert(id.clone(), h);
                 let h = self.conns.get(&id).unwrap();
-                run_exec(h, command)
+                run_exec(h, &cmd, sudo_pw.clone())
                     .await
                     .map_err(|e2| format!("{e2} (after reconnect; first error: {e})"))
             }
-        }
+        };
+        out.map(|text| sudo_hint(&text, sudo_pw.is_some()))
     }
 
     async fn sftp(
@@ -1049,8 +1053,99 @@ impl Executor {
     }
 }
 
+/// `sudo` cannot prompt on a PTY-less exec channel ("a terminal is required
+/// to read the password"). When the profile carries a saved password, the
+/// first `sudo` invocation is rewritten to `sudo -S` and that password goes
+/// to the channel's stdin — the same thing `ssh -t` plus typing does. The
+/// password never appears on the command line, in the audit log or to the
+/// model. Returns the (possibly rewritten) command plus the stdin data.
+fn prepare_exec(profile: &SshSession, command: &str) -> (String, Option<String>) {
+    if profile.auth_type != AuthType::Password || profile.password.is_empty() {
+        return (command.to_string(), None);
+    }
+    let Some(at) = find_sudo(command) else {
+        return (command.to_string(), None);
+    };
+    let rewritten = if command[at..].starts_with("sudo -S") {
+        command.to_string()
+    } else {
+        let end = at + "sudo".len();
+        format!("{} -S -p ''{}", &command[..end], &command[end..])
+    };
+    (rewritten, Some(format!("{}\n", profile.password)))
+}
+
+/// Byte offset of the first real `sudo` invocation: at the start of the
+/// command or after a separator, on a word boundary, and *outside* quotes —
+/// a mention inside a string is not an invocation, and rewriting inside
+/// single quotes would break the quoting outright.
+fn find_sudo(command: &str) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if b == b'\'' || b == b'"' {
+                    quote = Some(b);
+                } else if command[i..].starts_with("sudo") {
+                    let before_ok = i == 0
+                        || matches!(
+                            bytes[i - 1],
+                            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b'`' | b'{'
+                        );
+                    let end = i + 4;
+                    let after_ok = end >= bytes.len() || matches!(bytes[end], b' ' | b'\t');
+                    if before_ok && after_ok {
+                        return Some(i);
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Next-step note appended to output when sudo could not authenticate, so
+/// both the model and the user know what to do (the model otherwise retries
+/// blind or gives up).
+fn sudo_hint(out: &str, had_password: bool) -> String {
+    if out.contains("a terminal is required to read the password")
+        || out.contains("a password is required")
+    {
+        format!(
+            "{out}\n[hint] sudo could not prompt for a password on this exec channel. Culvert feeds the saved session password to `sudo -S` automatically — save this profile with Password auth (Auth: Password), or configure passwordless sudo for this user."
+        )
+    } else if had_password
+        && (out.contains("Sorry, try again") || out.contains("incorrect password attempt"))
+    {
+        format!(
+            "{out}\n[hint] the saved SSH password was rejected by sudo on this host — it differs from the login password, or this user is not a sudoer."
+        )
+    } else if out.contains("is not in the sudoers file") {
+        format!(
+            "{out}\n[hint] this account has no sudo rights on the host at all (not a sudoer). Another admin account, or adding the user to sudoers, is required — installing software as this user is not possible."
+        )
+    } else {
+        out.to_string()
+    }
+}
+
 /// One exec channel, full output, 45 s cap (streaming commands never finish).
-async fn run_exec(handle: &ssh::SshHandle, command: &str) -> Result<String, String> {
+async fn run_exec(
+    handle: &ssh::SshHandle,
+    command: &str,
+    stdin_data: Option<String>,
+) -> Result<String, String> {
     let fut = async {
         let mut ch = handle
             .channel_open_session()
@@ -1059,6 +1154,14 @@ async fn run_exec(handle: &ssh::SshHandle, command: &str) -> Result<String, Stri
         ch.exec(false, command)
             .await
             .map_err(|e| format!("exec: {e}"))?;
+        if let Some(data) = stdin_data {
+            // `sudo -S` reads the password here; EOF afterwards makes a
+            // wrong password fail fast instead of hanging.
+            ch.data_bytes(data.into_bytes())
+                .await
+                .map_err(|e| format!("stdin: {e}"))?;
+            ch.eof().await.map_err(|e| format!("stdin close: {e}"))?;
+        }
         let mut out: Vec<u8> = Vec::new();
         let mut exit: Option<u32> = None;
         while let Some(msg) = ch.wait().await {
@@ -1095,5 +1198,122 @@ async fn run_exec(handle: &ssh::SshHandle, command: &str) -> Result<String, Stri
             }
             Ok(text)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn password_profile() -> SshSession {
+        SshSession {
+            auth_type: AuthType::Password,
+            password: "hunter2".into(),
+            ..SshSession::default()
+        }
+    }
+
+    #[test]
+    fn sudo_gets_stdin_flags_and_password() {
+        let p = password_profile();
+        let (cmd, pw) = prepare_exec(&p, "sudo apt install docker.io -y");
+        assert_eq!(cmd, "sudo -S -p '' apt install docker.io -y");
+        assert_eq!(pw.as_deref(), Some("hunter2\n"));
+
+        let (cmd, pw) = prepare_exec(&p, "echo hi && sudo systemctl restart nginx");
+        assert_eq!(cmd, "echo hi && sudo -S -p '' systemctl restart nginx");
+        assert!(pw.is_some());
+
+        // Already interactive-ready: keep the command, still feed stdin.
+        let (cmd, pw) = prepare_exec(&p, "sudo -S whoami");
+        assert_eq!(cmd, "sudo -S whoami");
+        assert!(pw.is_some());
+    }
+
+    #[test]
+    fn non_sudo_and_quoted_mentions_are_untouched() {
+        let p = password_profile();
+        let (cmd, pw) = prepare_exec(&p, "df -h && free -m");
+        assert_eq!(cmd, "df -h && free -m");
+        assert!(pw.is_none());
+
+        // A quoted mention or a longer word is not an invocation.
+        let (cmd, pw) = prepare_exec(&p, "echo 'install with sudo apt'");
+        assert_eq!(cmd, "echo 'install with sudo apt'");
+        assert!(pw.is_none());
+        let (cmd, _) = prepare_exec(&p, "cat /etc/sudoers");
+        assert_eq!(cmd, "cat /etc/sudoers");
+    }
+
+    #[test]
+    fn key_auth_profiles_have_no_password_to_feed() {
+        let p = SshSession {
+            auth_type: AuthType::Key,
+            key_path: "C:\\keys\\id_ed25519".into(),
+            ..SshSession::default()
+        };
+        let (cmd, pw) = prepare_exec(&p, "sudo whoami");
+        assert_eq!(cmd, "sudo whoami");
+        assert!(pw.is_none());
+    }
+
+    #[test]
+    fn sudo_failures_gain_actionable_hints() {
+        let no_tty = "sudo: a terminal is required to read the password; either use ssh's -t option or configure an askpass helper";
+        let hinted = sudo_hint(no_tty, false);
+        assert!(hinted.contains("[hint]"));
+        assert!(hinted.contains("Password auth"));
+
+        let wrong = "Sorry, try again.\nsudo: 3 incorrect password attempts";
+        let hinted = sudo_hint(wrong, true);
+        assert!(hinted.contains("rejected by sudo"));
+
+        let not_sudoer = "linuxio is not in the sudoers file.\nThis incident has been reported.";
+        let hinted = sudo_hint(not_sudoer, true);
+        assert!(hinted.contains("no sudo rights"));
+
+        // Ordinary output passes through untouched.
+        assert_eq!(sudo_hint("root\n", true), "root\n");
+    }
+
+    /// Live probe: the exact production path (prepare_exec + stdin feed)
+    /// against the docker test server. Run with:
+    /// `cargo test -- --ignored --nocapture sudo_exec`
+    ///
+    /// The demo container's `linuxio` is intentionally not a sudoer, so the
+    /// assertion checks the mechanism (the password is fed — sudo no longer
+    /// reports a missing terminal) rather than root access.
+    #[test]
+    #[ignore = "needs the local docker ssh test server on 127.0.0.1:2222"]
+    fn sudo_exec_feeds_saved_password() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let session = SshSession {
+                name: "probe".into(),
+                host: "127.0.0.1".into(),
+                port: 2222,
+                username: "linuxio".into(),
+                auth_type: AuthType::Password,
+                password: "test123".into(),
+                ..SshSession::default()
+            };
+            let logs: SharedLogs = Arc::new(Mutex::new(Vec::new()));
+            let mut ex = Executor::new();
+            let out = ex
+                .command(&session, "sudo whoami", &logs)
+                .await
+                .expect("exec failed");
+            println!("sudo whoami -> {out:?}");
+            assert!(
+                !out.contains("a terminal is required") && !out.contains("a password is required"),
+                "the saved password must reach sudo's stdin: {out}"
+            );
+            if out.contains("is not in the sudoers file") {
+                println!("note: linuxio is not a sudoer on this container (expected)");
+            } else {
+                assert!(out.contains("root"), "sudo must authenticate: {out}");
+            }
+        });
     }
 }

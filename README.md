@@ -38,7 +38,7 @@ for your approval at every fork in the road.
   commands run straight away, state changes and destructive commands wait on an
   approval card showing the exact command, and secrets found in output stop at
   a redaction gate before they reach a provider. Works with OpenRouter, OpenAI,
-  Gemini, Anthropic, a local Ollama (fully offline) or any OpenAI-compatible
+  Grok (xAI), Gemini, Anthropic, a local Ollama (fully offline) or any OpenAI-compatible
   endpoint. See [AI Copilot](#ai-copilot).
 - **Sessions sidebar** — save host, port, username and auth once; double-click
   any session to open a shell tab (right-click for edit/duplicate/delete).
@@ -175,7 +175,7 @@ directory, selected file, running tunnels, saved profiles — is attached
 automatically, so `/var/log/nginx` in the file browser plus *“Show the latest
 errors”* just works.
 
-**Providers** — OpenRouter, OpenAI, Ollama (fully local), Google Gemini,
+**Providers** — OpenRouter, OpenAI, Grok (xAI), Ollama (fully local), Google Gemini,
 Anthropic, or any custom OpenAI-compatible endpoint. The settings panel has
 provider, API key, base URL, model (with a *Fetch models* helper), temperature,
 a streaming toggle and a *Test connection* button.

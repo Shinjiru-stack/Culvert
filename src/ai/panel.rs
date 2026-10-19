@@ -1120,8 +1120,11 @@ fn card_ui(ui: &mut Ui, card: &mut Card, toggles: &mut Vec<usize>, idx: usize) {
         .inner_margin(Margin::symmetric(8, 5))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                // Status + show/hide are reserved on the right first, so a
-                // long summary truncates instead of colliding with them.
+                // Controls on the right first, then the tool name on the
+                // left. The summary gets its own line below: inside a nested
+                // layout a truncating label drifts and wraps oddly (the
+                // "sudo / linux test" floating-text bug), so it is drawn as
+                // a plain full-width row instead.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let status = match card.status {
                         CardStatus::Running => "running…",
@@ -1152,19 +1155,19 @@ fn card_ui(ui: &mut Ui, card: &mut Card, toggles: &mut Vec<usize>, idx: usize) {
                                 .size(10.5)
                                 .strong(),
                         );
-                        if !card.summary.is_empty() {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(clip(&card.summary, 160))
-                                        .size(10.0)
-                                        .color(theme::TEXT_DIM()),
-                                )
-                                .wrap_mode(egui::TextWrapMode::Truncate),
-                            );
-                        }
                     });
                 });
             });
+            if !card.summary.is_empty() {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(clip(&card.summary, 220))
+                            .size(10.0)
+                            .color(theme::TEXT_DIM()),
+                    )
+                    .wrap_mode(egui::TextWrapMode::Truncate),
+                );
+            }
             if card.expanded && !card.result.is_empty() {
                 ui.add_space(3.0);
                 egui::Frame::NONE
