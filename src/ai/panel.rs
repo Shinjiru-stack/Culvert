@@ -901,9 +901,32 @@ impl AiPanel {
                                             f.label(),
                                         )
                                         .clicked()
+                                        && self.draft.provider != f.id()
                                     {
+                                        // Stash the outgoing provider's key,
+                                        // endpoint and model under its id, then
+                                        // load the target provider's saved
+                                        // values — switching back later must
+                                        // not lose the earlier key or model.
+                                        let old = std::mem::take(&mut self.draft.provider);
+                                        self.draft.providers.insert(
+                                            old,
+                                            config::ProviderPrefs {
+                                                api_key: std::mem::take(&mut self.draft.api_key),
+                                                base_url: std::mem::take(&mut self.draft.base_url),
+                                                model: std::mem::take(&mut self.draft.model),
+                                            },
+                                        );
+                                        let prefs = self
+                                            .draft
+                                            .providers
+                                            .get(f.id())
+                                            .cloned()
+                                            .unwrap_or_default();
                                         self.draft.provider = f.id().to_string();
-                                        self.draft.base_url.clear();
+                                        self.draft.api_key = prefs.api_key;
+                                        self.draft.base_url = prefs.base_url;
+                                        self.draft.model = prefs.model;
                                         self.models.clear();
                                         self.models_note = None;
                                     }
@@ -1039,6 +1062,14 @@ impl AiPanel {
                             )
                             .clicked()
                         {
+                            self.draft.providers.insert(
+                                self.draft.provider.clone(),
+                                config::ProviderPrefs {
+                                    api_key: self.draft.api_key.clone(),
+                                    base_url: self.draft.base_url.clone(),
+                                    model: self.draft.model.clone(),
+                                },
+                            );
                             self.cfg = self.draft.clone();
                             match config::persist(&self.cfg) {
                                 Ok(()) => {
@@ -1159,14 +1190,19 @@ fn card_ui(ui: &mut Ui, card: &mut Card, toggles: &mut Vec<usize>, idx: usize) {
                 });
             });
             if !card.summary.is_empty() {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(clip(&card.summary, 220))
-                            .size(10.0)
-                            .color(theme::TEXT_DIM()),
-                    )
-                    .wrap_mode(egui::TextWrapMode::Truncate),
-                );
+                // Indent past the bolt glyph so the summary lines up with the
+                // tool name above it instead of hugging the card edge.
+                ui.horizontal(|ui| {
+                    ui.add_space(20.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(clip(&card.summary, 220))
+                                .size(10.0)
+                                .color(theme::TEXT_DIM()),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Truncate),
+                    );
+                });
             }
             if card.expanded && !card.result.is_empty() {
                 ui.add_space(3.0);

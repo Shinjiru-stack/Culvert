@@ -103,12 +103,13 @@ pub fn defs() -> Vec<crate::ai::provider::ToolDef> {
         },
         ToolDef {
             name: "execute_command",
-            description: "Run a shell command on a server over SSH and return its output. Read-only commands run immediately; state-changing and destructive commands need the user's approval first. `sudo` works: when the profile has a saved password Culvert feeds it to `sudo -S` (passwordless sudo also works) — do not avoid sudo for that reason. Avoid interactive or streaming commands (top, tail -f, watch, less); use bounded forms (`cmd | tail -n 200`).",
+            description: "Run a shell command on a server over SSH and return its output. Read-only commands run immediately over a hidden channel; state-changing and destructive commands need approval and are typed into the visible terminal tab by default, so the user can watch progress and answer sudo/password prompts there. Pass in_terminal=true to force the visible terminal (installs, interactive prompts) or in_terminal=false to force the hidden channel. `sudo` also works hidden when the profile has a saved password (Culvert feeds it to `sudo -S`). Avoid streaming commands (top, tail -f, watch, less); use bounded forms (`cmd | tail -n 200`).",
             parameters: s(json!({
                 "type": "object",
                 "properties": {
                     "server": { "type": "string", "description": "Profile name or host. Omit to use the active session." },
-                    "command": { "type": "string", "description": "The shell command line." }
+                    "command": { "type": "string", "description": "The shell command line." },
+                    "in_terminal": { "type": "boolean", "description": "Override where it runs: true = visible terminal tab (interactive, user can answer prompts), false = hidden channel. Defaults to true for state-changing commands and false for read-only ones." }
                 },
                 "required": ["command"]
             })),
@@ -249,6 +250,9 @@ pub enum Prepared {
         session_id: String,
         label: String,
         command: String,
+        /// Run by typing into the visible shell tab (so the user can answer
+        /// sudo/password prompts) instead of a hidden exec channel.
+        in_terminal: bool,
     },
     ListDir {
         session_id: String,
@@ -471,17 +475,45 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
             }
             let (id, label) = resolve_server(ctx, args)?;
             let verdict = classify_command(&command);
+            // Default: read-only commands use the hidden exec channel (full,
+            // fast output); state-changing work is typed into the visible
+            // terminal so the user can watch and answer prompts. An explicit
+            // in_terminal overrides either way.
+            let in_terminal = args
+                .get("in_terminal")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(verdict.risk != Risk::Safe);
+            if in_terminal {
+                if let Some(p) = ctx.profiles.iter().find(|p| p.id == id) {
+                    if p.protocol == crate::session::Protocol::Rdp {
+                        return Err(
+                            "in_terminal needs an SSH session (this profile is RDP)".into()
+                        );
+                    }
+                }
+            }
+            let summary = if in_terminal {
+                format!("run in the terminal on {label}: {command}")
+            } else {
+                format!("run on {label}: {command}")
+            };
+            let reason = if in_terminal {
+                format!("{} — typed into the visible terminal", verdict.reason)
+            } else {
+                verdict.reason
+            };
             Ok(Call {
                 tool: tool.to_string(),
-                summary: format!("run on {label}: {command}"),
+                summary,
                 risk: verdict.risk,
-                reason: verdict.reason,
+                reason,
                 command: Some(command.clone()),
                 sensitive: None,
                 prepared: Prepared::Ssh {
                     session_id: id,
                     label,
                     command,
+                    in_terminal,
                 },
             })
         }
@@ -500,6 +532,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                     session_id: id,
                     label,
                     command: script.to_string(),
+                    in_terminal: false,
                 },
             })
         }
@@ -525,6 +558,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                     session_id: id,
                     label,
                     command,
+                    in_terminal: false,
                 },
             })
         }
@@ -573,6 +607,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                     session_id: id,
                     label,
                     command: full,
+                    in_terminal: false,
                 },
             })
         }
@@ -1275,6 +1310,52 @@ mod tests {
 
         // Ordinary output passes through untouched.
         assert_eq!(sudo_hint("root\n", true), "root\n");
+    }
+
+    #[test]
+    fn state_changing_commands_default_to_the_visible_terminal() {
+        let ctx = crate::ai::UiContext {
+            active_session_id: Some("demo".into()),
+            open_session_ids: Vec::new(),
+            dock: None,
+            profiles_summary: vec![crate::ai::CtxSession {
+                id: "demo".into(),
+                name: "demo".into(),
+                host: "10.0.0.5".into(),
+                username: "root".into(),
+                protocol: "ssh".into(),
+                group: None,
+            }],
+            tunnels: Vec::new(),
+            profiles: vec![SshSession {
+                id: "demo".into(),
+                name: "demo".into(),
+                host: "10.0.0.5".into(),
+                username: "root".into(),
+                ..SshSession::default()
+            }],
+        };
+
+        let prepared = |args: Value| match prepare("execute_command", &args, &ctx) {
+            Ok(Call {
+                prepared: Prepared::Ssh { in_terminal, .. },
+                ..
+            }) => in_terminal,
+            Ok(_) => panic!("expected an SSH call"),
+            Err(e) => panic!("prepare failed: {e}"),
+        };
+        // Writes go through the visible terminal (approval card first) so the
+        // user can watch and answer any sudo prompt.
+        assert!(prepared(serde_json::json!({ "command": "touch /tmp/x" })));
+        // Read-only probes keep the hidden channel (full output).
+        assert!(!prepared(serde_json::json!({ "command": "df -h" })));
+        // Explicit overrides win both ways.
+        assert!(!prepared(
+            serde_json::json!({ "command": "touch /tmp/x", "in_terminal": false })
+        ));
+        assert!(prepared(
+            serde_json::json!({ "command": "hostname", "in_terminal": true })
+        ));
     }
 
     /// Live probe: the exact production path (prepare_exec + stdin feed)

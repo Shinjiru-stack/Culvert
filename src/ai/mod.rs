@@ -94,6 +94,15 @@ pub enum UiAction {
     StopTunnel { key: String },
     /// Point the docked file browser at a path (its session must be shown).
     DockNavigate { session_id: String, path: String },
+    /// Type a command into the visible shell tab for `session_id` (opening the
+    /// tab first if needed) and report the output once the shell prints the
+    /// completion marker. Interactive: the user can answer sudo/password
+    /// prompts and watch the command run.
+    RunInTerminal {
+        session_id: String,
+        label: String,
+        command: String,
+    },
     /// Open a remote file in the local editor (download → edit → auto-sync).
     OpenFile { session_id: String, path: String },
 }

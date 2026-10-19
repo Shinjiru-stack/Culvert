@@ -384,6 +384,38 @@ impl Engine {
 
         let (raw, ok) = match &prepared.prepared {
             Prepared::State(q) => (tools::state_answer(*q, &ctx), true),
+            Prepared::Ssh {
+                session_id,
+                label,
+                command,
+                in_terminal: true,
+            } => {
+                // Interactive work goes through the UI: the command lands in
+                // the visible shell tab (opened if needed), where the user can
+                // answer sudo/password prompts and watch it run.
+                let rid = self.next_rt_id;
+                self.next_rt_id += 1;
+                self.emit(AiEvent::Action {
+                    id: rid,
+                    action: UiAction::RunInTerminal {
+                        session_id: session_id.clone(),
+                        label: label.clone(),
+                        command: command.clone(),
+                    },
+                    label: format!("run in the terminal on {label}"),
+                });
+                let result = self.await_action(rid).await?;
+                let ok = result.starts_with("[exit 0]");
+                crate::log::push_log(
+                    &self.logs,
+                    LogEntry::new(
+                        LogLevel::Info,
+                        "AI",
+                        &format!("{label} · terminal: {command}"),
+                    ),
+                );
+                (result, ok)
+            }
             Prepared::Action { action, label } => {
                 let id = self.next_rt_id;
                 self.next_rt_id += 1;
@@ -660,7 +692,8 @@ impl Engine {
              - Keep answers short: what you found, the exact command(s) used in `backticks`, and the next useful step.\n\
              - Mention when output was truncated or values were [REDACTED] by Culvert's security layer.\n\
              - For state-changing work, call the tool once — the user will see an approval card.\n\
-             - sudo is usable: run it normally when a task needs root (Culvert pipes the saved profile password into sudo -S when required; passwordless sudo works too). Never ask the user for a password.\n\nContext:\n",
+             - sudo is usable: run it normally when a task needs root (Culvert pipes the saved profile password into sudo -S when required; passwordless sudo works too). Never ask the user for a password.\n\
+             - For installs and other interactive work (package managers, prompts, anything needing root where sudo may ask), call execute_command with in_terminal=true: the command is typed into the visible terminal tab, the user can answer prompts there, and the app returns what the screen showed. Output may be only the visible tail. State-changing commands do this by default; read-only ones use the hidden channel.\n\nContext:\n",
         );
         match ctx
             .active_session_id

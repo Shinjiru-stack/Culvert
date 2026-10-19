@@ -8,6 +8,7 @@
 //! stays readable, the key itself does not.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// How much data the security layer lets through to an external model.
@@ -50,9 +51,22 @@ impl SecMode {
     }
 }
 
+/// One provider's remembered credentials and endpoint. Keeping these per
+/// provider means switching Gemini → Groq → Gemini never loses the Gemini key
+/// or model (the top-level fields only describe the *active* provider).
+#[derive(Clone, Default, Serialize, Deserialize, Debug)]
+pub struct ProviderPrefs {
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub model: String,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct AiConfig {
-    /// Flavor id: openrouter | openai | gemini | anthropic | ollama | custom.
+    /// Flavor id: openrouter | openai | groq | gemini | anthropic | ollama | custom.
     #[serde(default = "def_provider")]
     pub provider: String,
     #[serde(default)]
@@ -72,6 +86,9 @@ pub struct AiConfig {
     /// still asks; high-risk commands always ask.
     #[serde(default = "def_true")]
     pub auto_safe: bool,
+    /// Remembered key/model/endpoint per provider id.
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderPrefs>,
 }
 
 fn def_provider() -> String {
@@ -95,6 +112,7 @@ impl Default for AiConfig {
             streaming: true,
             security: SecMode::Balanced,
             auto_safe: true,
+            providers: BTreeMap::new(),
         }
     }
 }
@@ -124,7 +142,8 @@ pub fn load() -> AiConfig {
         return AiConfig::default();
     };
     let migrated = crate::secrets::unprotect_value(&mut value);
-    let cfg = serde_json::from_value(value).unwrap_or_default();
+    let mut cfg: AiConfig = serde_json::from_value(value).unwrap_or_default();
+    seed_active(&mut cfg);
     if migrated {
         // Upgrade a plaintext key to DPAPI on the spot.
         let _ = persist(&cfg);
@@ -132,13 +151,98 @@ pub fn load() -> AiConfig {
     cfg
 }
 
+/// Fill the active provider's entry from the top-level fields when it has no
+/// entry yet (files written before per-provider memory existed).
+fn seed_active(cfg: &mut AiConfig) {
+    if cfg.api_key.is_empty() && cfg.base_url.is_empty() && cfg.model.is_empty() {
+        return;
+    }
+    let e = cfg.providers.entry(cfg.provider.clone()).or_default();
+    if e.api_key.is_empty() {
+        e.api_key = cfg.api_key.clone();
+    }
+    if e.base_url.is_empty() {
+        e.base_url = cfg.base_url.clone();
+    }
+    if e.model.is_empty() {
+        e.model = cfg.model.clone();
+    }
+}
+
+/// Mirror the active provider into its remembered entry, so every save (Test
+/// connection, model change, …) is switch-proof.
+fn mirror_active(cfg: &mut AiConfig) {
+    let e = cfg.providers.entry(cfg.provider.clone()).or_default();
+    e.api_key = cfg.api_key.clone();
+    e.base_url = cfg.base_url.clone();
+    e.model = cfg.model.clone();
+}
+
 pub fn persist(cfg: &AiConfig) -> anyhow::Result<()> {
     let path = ai_config_file();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut value = serde_json::to_value(cfg)?;
+    let mut cfg = cfg.clone();
+    mirror_active(&mut cfg);
+    let mut value = serde_json::to_value(&cfg)?;
     crate::secrets::protect_value(&mut value);
     std::fs::write(&path, serde_json::to_string_pretty(&value)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn providers_remember_key_and_model_per_provider() {
+        // Two providers configured; the top-level fields describe the active
+        // one, the map keeps the other's key + model for when we switch back.
+        let mut cfg = AiConfig::default();
+        cfg.provider = "gemini".into();
+        cfg.api_key = "AIza-gemini".into();
+        cfg.model = "gemini-2.5-flash".into();
+        mirror_active(&mut cfg);
+        cfg.providers.insert(
+            "groq".into(),
+            ProviderPrefs {
+                api_key: "gsk_groq".into(),
+                base_url: String::new(),
+                model: "llama-3.3-70b-versatile".into(),
+            },
+        );
+
+        let text = serde_json::to_string(&cfg).unwrap();
+        let back: AiConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.providers["groq"].api_key, "gsk_groq");
+        assert_eq!(back.providers["groq"].model, "llama-3.3-70b-versatile");
+        assert_eq!(back.providers["gemini"].api_key, "AIza-gemini");
+        assert_eq!(back.providers["gemini"].model, "gemini-2.5-flash");
+    }
+
+    #[test]
+    fn legacy_single_provider_config_seeds_the_map() {
+        // An ai.json from before per-provider memory: no `providers` map, one
+        // key/model at the top level.
+        let legacy: AiConfig = serde_json::from_value(serde_json::json!({
+            "provider": "openrouter",
+            "api_key": "sk-or-abc",
+            "model": "openai/gpt-4o-mini",
+            "temperature": 0.2
+        }))
+        .unwrap();
+        assert!(legacy.providers.is_empty());
+
+        let mut cfg = legacy;
+        seed_active(&mut cfg);
+        assert_eq!(cfg.providers["openrouter"].api_key, "sk-or-abc");
+        assert_eq!(cfg.providers["openrouter"].model, "openai/gpt-4o-mini");
+
+        // Seeding never overwrites an existing entry.
+        cfg.providers.get_mut("openrouter").unwrap().api_key = "sk-or-new".into();
+        cfg.api_key = "sk-or-rewritten".into();
+        seed_active(&mut cfg);
+        assert_eq!(cfg.providers["openrouter"].api_key, "sk-or-new");
+    }
 }

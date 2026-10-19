@@ -76,6 +76,79 @@ pub struct TunnelApp {
     quick_connect: String,
     /// AI Copilot: right-hand chat panel + engine channels + settings.
     ai: AiPanel,
+    /// A Copilot command currently being typed into a shell tab (interactive
+    /// runs answer the engine when the completion marker shows up).
+    ai_term: Option<AiTermRun>,
+}
+
+/// One Copilot `RunInTerminal` action in flight: the app opens/finds the
+/// session's shell tab, types the command plus start/exit markers, and reads
+/// the screen back once the shell prints the exit marker.
+struct AiTermRun {
+    id: u64,
+    session_id: String,
+    label: String,
+    command: String,
+    nonce: String,
+    /// The tab was requested (opening it happens once).
+    opened: bool,
+    /// The command has been typed into the shell.
+    sent: bool,
+    armed_at: std::time::Instant,
+    sent_at: std::time::Instant,
+}
+
+impl AiTermRun {
+    fn start_tag(&self) -> String {
+        format!("<<<culvert-{}-start>>>", self.nonce)
+    }
+    fn exit_tag(&self) -> String {
+        format!("<<<culvert-{}-exit:", self.nonce)
+    }
+
+    /// The single line typed into the shell. The command itself goes through
+    /// `sh -c '<single-quoted>'` so multi-line scripts and quotes survive, and
+    /// the markers bracket its output on the screen. The printed markers are
+    /// built with `%s` placeholders so the *echo of the typed line* does not
+    /// contain them (which would let the reader match too early).
+    fn line(&self) -> String {
+        format!(
+            "printf '\\n<<<culvert-%s-start>>>\\n' {n}; sh -c '{cmd}'; printf '\\n<<<culvert-%s-exit:%s>>>\\n' {n} \"$?\"\n",
+            n = self.nonce,
+            cmd = self.command.replace('\'', "'\\''"),
+        )
+    }
+}
+
+/// Pull `(exit status, output)` out of the screen once the exit marker is in
+/// it. `None` while the marker has not appeared yet.
+fn ai_term_result(screen: &str, run: &AiTermRun) -> Option<String> {
+    let exit_tag = run.exit_tag();
+    let done_at = screen.find(&exit_tag)?;
+    let code = screen[done_at + exit_tag.len()..]
+        .split(">>>")
+        .next()
+        .unwrap_or("?")
+        .trim()
+        .to_string();
+    let start_tag = run.start_tag();
+    let body = match screen.find(&start_tag) {
+        Some(s) => &screen[s + start_tag.len()..done_at],
+        // The start scrolled off: hand over the visible tail.
+        None => &screen[..done_at],
+    };
+    let body = body
+        .lines()
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = body.trim();
+    let body = if body.is_empty() {
+        "(no output)".to_string()
+    } else {
+        body.to_string()
+    };
+    Some(format!("[exit {code}]\n{body}"))
 }
 
 enum Tab {
@@ -401,6 +474,7 @@ impl TunnelApp {
             split_ratio: 0.5,
             quick_connect: String::new(),
             ai,
+            ai_term: None,
         }
     }
 
@@ -508,8 +582,111 @@ impl TunnelApp {
     }
 
     /// Execute a Copilot UI action with the app's own code paths and answer
-    /// the engine with a human-readable result.
-    fn ai_apply_action(&mut self, ctx: &egui::Context, action: &UiAction) -> String {
+    /// the engine with a human-readable result. `None` means the work runs
+    /// asynchronously — see [`Self::tick_ai_terminal`], which answers once the
+    /// command typed into the shell tab has finished.
+    fn ai_apply_action(
+        &mut self,
+        ctx: &egui::Context,
+        id: u64,
+        action: &UiAction,
+    ) -> Option<String> {
+        if let UiAction::RunInTerminal {
+            session_id,
+            label,
+            command,
+        } = action
+        {
+            let nonce = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+            self.ai_term = Some(AiTermRun {
+                id,
+                session_id: session_id.clone(),
+                label: label.clone(),
+                command: command.clone(),
+                nonce,
+                opened: false,
+                sent: false,
+                armed_at: std::time::Instant::now(),
+                sent_at: std::time::Instant::now(),
+            });
+            return None;
+        }
+        Some(self.ai_apply_action_now(ctx, action))
+    }
+
+    /// Drive a Copilot command running in a shell tab: open the tab, type the
+    /// command once the shell is up, then hand the screen's output back to the
+    /// engine when the exit marker appears.
+    fn tick_ai_terminal(&mut self, ctx: &egui::Context) {
+        let Some(mut run) = self.ai_term.take() else {
+            return;
+        };
+        // A cancelled turn no longer wants the answer: stop waiting. The
+        // command, if it was already typed, keeps running in its tab.
+        if !self.ai.busy {
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(250));
+
+        let Some(idx) = self.find_tab_for_session(&run.session_id) else {
+            if !run.opened {
+                run.opened = true;
+                self.open_session(ctx, &run.session_id);
+            } else if run.armed_at.elapsed() > Duration::from_secs(60) {
+                self.ai.complete_action(
+                    run.id,
+                    format!("error: could not open a shell to {} (check the profile)", run.label),
+                );
+                return;
+            }
+            self.ai_term = Some(run);
+            return;
+        };
+
+        let Some(Tab::Terminal(term)) = self.tabs.get_mut(idx) else {
+            self.ai_term = Some(run);
+            return;
+        };
+        if !run.sent {
+            if !matches!(term.status, TermStatus::Connected) {
+                if run.armed_at.elapsed() > Duration::from_secs(60) {
+                    self.ai.complete_action(
+                        run.id,
+                        format!("error: the shell to {} did not connect in time", run.label),
+                    );
+                    return;
+                }
+                self.ai_term = Some(run);
+                return;
+            }
+            term.send_bytes(run.line().into_bytes());
+            run.sent = true;
+            run.sent_at = std::time::Instant::now();
+            // Show the tab so the user can watch (and answer prompts).
+            self.active = idx;
+            self.ai_term = Some(run);
+            ctx.request_repaint();
+            return;
+        }
+        if let Some(result) = ai_term_result(&term.visible_text(), &run) {
+            self.ai.complete_action(run.id, result);
+            ctx.request_repaint();
+            return;
+        }
+        if run.sent_at.elapsed() > Duration::from_secs(300) {
+            self.ai.complete_action(
+                run.id,
+                format!(
+                    "error: no result after 5 minutes — it may still be running in the terminal tab ({}) or waiting for input there",
+                    run.label
+                ),
+            );
+            return;
+        }
+        self.ai_term = Some(run);
+    }
+
+    fn ai_apply_action_now(&mut self, ctx: &egui::Context, action: &UiAction) -> String {
         match action {
             UiAction::OpenSession { session_id } => {
                 let name = self
@@ -586,6 +763,9 @@ impl TunnelApp {
                             .to_string()
                     }
                 }
+            }
+            UiAction::RunInTerminal { .. } => {
+                "Internal: terminal runs are answered asynchronously.".to_string()
             }
         }
     }
@@ -1664,10 +1844,12 @@ impl TunnelApp {
             ctx.request_repaint();
         }
         if let Some((id, action, _label)) = self.ai.take_action() {
-            let result = self.ai_apply_action(ctx, &action);
-            self.ai.complete_action(id, result);
+            if let Some(result) = self.ai_apply_action(ctx, id, &action) {
+                self.ai.complete_action(id, result);
+            }
             ctx.request_repaint();
         }
+        self.tick_ai_terminal(ctx);
         if self.ai.settings_modal(ctx) {
             self.toast(ToastKind::Success, "AI Copilot settings saved");
         }
@@ -5408,5 +5590,60 @@ mod tests {
         let cmd = ssh_command(&s);
         assert!(cmd.contains("root@10.0.0.5"));
         assert!(cmd.contains("-p 22"));
+    }
+
+    fn sample_term_run(command: &str) -> AiTermRun {
+        AiTermRun {
+            id: 7,
+            session_id: "demo-session".into(),
+            label: "Demo server".into(),
+            command: command.into(),
+            nonce: "abc12345".into(),
+            opened: false,
+            sent: false,
+            armed_at: std::time::Instant::now(),
+            sent_at: std::time::Instant::now(),
+        }
+    }
+
+    /// The typed line must not contain the printed markers verbatim — the
+    /// shell echoes what we type, and a literal match would look like "done"
+    /// before the command even ran.
+    #[test]
+    fn terminal_run_line_quotes_command_and_hides_markers() {
+        let run = sample_term_run("echo 'hi there' && df -h");
+        let line = run.line();
+        assert!(!line.contains(&run.start_tag()));
+        assert!(!line.contains(&run.exit_tag()));
+        // The command survives quoting: a quote becomes '\'' inside sh -c.
+        assert!(line.contains(r#"sh -c 'echo '\''hi there'\'' && df -h'"#));
+        assert!(line.ends_with('\n'));
+
+        // Newlines stay inside the single-quoted sh -c string.
+        let multi = sample_term_run("cd /tmp\nls -la");
+        assert!(multi.line().contains("'cd /tmp\nls -la'"));
+    }
+
+    #[test]
+    fn terminal_run_reads_exit_status_and_output() {
+        let run = sample_term_run("df -h");
+        let screen = format!(
+            "user@host:~$ printf ...\n{}\nFilesystem      Size  Used\n/dev/sda1        40G   12G\n{}0>>>\nuser@host:~$ ",
+            run.start_tag(),
+            run.exit_tag()
+        );
+        let out = ai_term_result(&screen, &run).expect("marker present");
+        assert!(out.starts_with("[exit 0]"), "{out}");
+        assert!(out.contains("/dev/sda1"), "{out}");
+        assert!(!out.contains("printf"), "{out}");
+
+        // Non-zero status is reported as-is.
+        let failed = format!("{}\nsudo: a password is required\n{}1>>>", run.start_tag(), run.exit_tag());
+        let out = ai_term_result(&failed, &run).unwrap();
+        assert!(out.starts_with("[exit 1]"));
+        assert!(out.contains("password is required"));
+
+        // Still running: no marker on screen yet.
+        assert!(ai_term_result("user@host:~$ df -h\n", &run).is_none());
     }
 }

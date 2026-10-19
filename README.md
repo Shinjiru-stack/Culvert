@@ -164,7 +164,12 @@ model.
    `journalctl`) or shows an **approval card** with the exact planned action —
    *Execute · Edit · Cancel*. Destructive commands (`rm`, `reboot`, `mkfs`,
    `userdel`, `drop database`, …) always ask, shown in red.
-4. Results are filtered by the security layer and fed back so the model can
+4. Commands run where you can see them. Read-only probes use a hidden channel
+   for full, fast output; state-changing commands (installs, service changes)
+   are typed into a real shell tab with start/exit markers, so you can watch
+   progress and answer `sudo`/password prompts right in the terminal. The model
+   can choose either mode per call with `in_terminal`.
+5. Results are filtered by the security layer and fed back so the model can
    summarise or take the next step (multi-step workflows, up to 8 rounds).
 
 **Tools it can use** — connect/disconnect sessions, run commands, start/stop
@@ -178,7 +183,9 @@ errors”* just works.
 **Providers** — OpenRouter, OpenAI, Groq, Ollama (fully local), Google Gemini,
 Anthropic, or any custom OpenAI-compatible endpoint. The settings panel has
 provider, API key, base URL, model (with a *Fetch models* helper), temperature,
-a streaming toggle and a *Test connection* button.
+a streaming toggle and a *Test connection* button. Each provider keeps its own
+key, base URL and model: switch to Gemini and back, and Ollama's settings return
+as you left them.
 
 **Security layer** — nothing sensitive leaves the machine unchecked. Culvert
 detects private keys, certificates, passwords, tokens, API keys, connection
