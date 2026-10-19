@@ -389,19 +389,24 @@ impl AiPanel {
         ui.add_space(4.0);
         ui.separator();
 
-        let footer = 92.0;
-        let body_h = (ui.available_height() - footer).max(120.0);
+        // Pin the composer to the bottom in its own child Ui. Reserving it
+        // before the transcript (rather than laying it out after the
+        // ScrollArea) keeps it exactly where it is painted no matter how wide
+        // the conversation content grows.
+        egui::TopBottomPanel::bottom("ai_composer")
+            .frame(egui::Frame::NONE)
+            .show_inside(ui, |ui| {
+                ui.add_space(2.0);
+                self.input_row(ui);
+            });
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .max_height(body_h)
             .stick_to_bottom(true)
             .show(ui, |ui| match self.tab {
                 Tab::Chat => self.chat_body(ui),
                 Tab::History => self.history_body(ui),
             });
-
-        ui.add_space(4.0);
-        self.input_row(ui);
     }
 
     fn header(&mut self, ui: &mut Ui) {
@@ -466,7 +471,14 @@ impl AiPanel {
                             .corner_radius(CornerRadius::same(6))
                             .inner_margin(Margin::symmetric(8, 5))
                             .show(ui, |ui| {
-                                ui.label(RichText::new(&m.text).size(12.0));
+                                // egui extends text instead of wrapping inside
+                                // horizontal layouts, so cap the bubble and ask
+                                // for wrapping explicitly.
+                                ui.set_max_width((ui.available_width() * 0.88).max(80.0));
+                                ui.add(
+                                    egui::Label::new(RichText::new(&m.text).size(12.0))
+                                        .wrap_mode(egui::TextWrapMode::Wrap),
+                                );
                             });
                     });
                     ui.add_space(6.0);
@@ -557,7 +569,7 @@ impl AiPanel {
                         .corner_radius(CornerRadius::same(6))
                         .inner_margin(Margin::symmetric(9, 7))
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(
                                     RichText::new(tglyph::SHIELD)
                                         .font(theme::icon(13.0))

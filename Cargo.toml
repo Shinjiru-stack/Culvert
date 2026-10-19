@@ -2,7 +2,7 @@
 name = "culvert"
 version = "0.3.0"
 edition = "2021"
-description = "Modern, native SSH client and tunnel manager for the desktop — local, remote and dynamic port forwarding with a built-in terminal"
+description = "Native SSH client, tunnel manager and AI Copilot for the desktop — shells, local/remote/dynamic port forwarding, an SFTP browser and natural-language server control with approval gates"
 authors = ["Shinjiru-stack"]
 license = "MIT"
 

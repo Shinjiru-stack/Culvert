@@ -2,10 +2,16 @@
 
 <img src="assets/icon.png" width="96" alt="Culvert app icon">
 
-**A modern, native SSH client and port-forwarding manager for the desktop.**
-Open shells to any saved host in tabs and run local (`-L`), remote (`-R`) and
-dynamic SOCKS5 (`-D`) tunnels — all point-and-click, no commands to remember.
-One self-contained `.exe`: no webview, no external SSH binaries.
+**A native desktop SSH client, tunnel manager, SFTP browser — and an AI Copilot
+that actually operates them.** Save your hosts, open shell tabs, run local
+(`-L`), remote (`-R`) and dynamic SOCKS5 (`-D`) forwards by point-and-click —
+or describe the job in plain English (“check disk space on the demo host”,
+“tail the nginx errors”, “start the database tunnel”) and let the Copilot run
+it. The model only *proposes* actions: Culvert classifies every one of them,
+gates anything risky behind an approval card, and redacts secrets before they
+reach a provider. One self-contained `.exe`: no webview, no external SSH
+binaries, no cloud account required — point it at a local Ollama and nothing
+ever leaves your machine.
 
 Built in Rust with [`egui`](https://github.com/emilk/egui) for the interface,
 [`russh`](https://github.com/Eugeny/russh) for a pure-Rust SSH client, and a
@@ -16,13 +22,24 @@ app.
 
 A culvert is the humble pipe that carries a stream under a road — quiet
 infrastructure keeping traffic flowing where you'd never look for it. That's
-the job here too: Culvert channels your shells and port forwards through one
-small, self-contained tool, out of sight and out of the way.
+the job here too: Culvert channels your shells, tunnels and file transfers
+through one small, self-contained tool — and now your *intent* as well. Say
+what you want in plain language and the Copilot works the same pipes, pausing
+for your approval at every fork in the road.
 
 ---
 
 ## Features
 
+- **AI Copilot** — a chat panel beside the workspace that drives the same
+  sessions, tunnels and files as the UI: “show the running containers”, “start
+  the database tunnel”, “find last week's logs on prod-web-01”. The model only
+  *proposes* structured tool calls; Culvert classifies each one — read-only
+  commands run straight away, state changes and destructive commands wait on an
+  approval card showing the exact command, and secrets found in output stop at
+  a redaction gate before they reach a provider. Works with OpenRouter, OpenAI,
+  Gemini, Anthropic, a local Ollama (fully offline) or any OpenAI-compatible
+  endpoint. See [AI Copilot](#ai-copilot).
 - **Sessions sidebar** — save host, port, username and auth once; double-click
   any session to open a shell tab (right-click for edit/duplicate/delete).
 - **Full menu bar** — Terminal / Sessions / View / Tools / Macros / Help above
@@ -71,12 +88,6 @@ small, self-contained tool, out of sight and out of the way.
   retrying). The switch can be flipped live even while the tunnel is running.
 - **Tab management** — right-click any terminal tab: close it, close others,
   close tabs to the right or all of them, browser-style.
-- **AI Copilot** — a natural-language control layer on top of everything
-  above: ask “check disk space on the demo host”, “tail the nginx errors” or
-  “start the database tunnel” in the right-hand chat panel. The model only
-  *proposes* structured tool calls; Culvert validates and runs them, and every
-  state-changing or destructive action waits behind an approval card. Read-only
-  commands run straight away. See [AI Copilot](#ai-copilot).
 - **Classic desktop chrome** — clean light-gray Windows-style chrome with a
   `#0078D7` blue accent, Segoe UI for the interface and Consolas in the
   terminal, like the terminal suites you already know.
@@ -85,6 +96,20 @@ small, self-contained tool, out of sight and out of the way.
   choice persists across launches.
 
 ## Screenshots
+
+**The AI Copilot** — describe the job in plain language and watch it happen:
+the model's tool calls stream into cards (`execute_command`, `read_file`, …),
+and anything sensitive stops at a **redaction gate** before it ever reaches a
+provider — send the original, send a redacted version, or cancel. The panel
+drives the same sessions, tunnels and files as the rest of the app:
+
+![AI Copilot beside the tunnel manager](docs/screenshots/copilot-window.png)
+
+**What the model actually received** — after the gate above, the reply carries
+a literal `[REDACTED]` marker: Culvert rewrote the payload before it left the
+machine:
+
+![Redacted result sent to the model](docs/screenshots/ai-copilot.png)
 
 **One double-click, one shell** — grouped sessions sidebar opens straight
 into a tabbed terminal (real PTY, full colour, scrollback), with the menu
@@ -117,46 +142,13 @@ palette (chrome, cards and terminal canvas); the choice persists:
 
 ![Dark theme](docs/screenshots/theme-dark.png)
 
-**AI Copilot** — ask in plain language; the model proposes tool calls, Culvert
-runs them after risk classification, and anything sensitive is gated or
-redacted before it ever reaches the provider (the `[REDACTED]` result below is
-what the model actually received):
-
-![AI Copilot](docs/screenshots/ai-copilot.png)
-
-## Download
-
-Grab `culvert-<version>-windows-x64.zip` from the
-[Releases](../../releases) page. Every push to `main` builds and publishes a
-fresh release automatically (see [Release automation](#release-automation)).
-
-## Quick start
-
-1. Launch `culvert.exe`.
-2. Press **New session**, give it a name, host, port, and username.
-3. Choose **Password** or **Private key** and fill in the credentials.
-4. **Double-click the session** in the sidebar — a shell tab opens and you are
-   on the remote machine.
-5. Switch to the **Tunnels** tab, press **New tunnel**, pick the session, choose
-   Local / Remote / Dynamic and fill in the ports.
-6. Press **Start** on the tunnel row — traffic flows. **Stop** any time.
-
-## Understanding the forwards
-
-| Type | Direction | Typical use |
-| --- | --- | --- |
-| Local `-L` | `listen:8080 → dest:5432` over the server | Reach a service on the remote network through a local port. |
-| Remote `-R` | `server listen:9000 → this machine:3000` | Expose something on your machine to the remote server. |
-| Dynamic `-D` | `SOCKS5 proxy on 127.0.0.1:1080` | Turn the SSH server into a SOCKS5 proxy for any app. |
-
-The tunnel editor explains the selected type in one line and validates every
-field before saving.
-
 ## AI Copilot
 
 The Copilot is a first-class panel (toolbar tile **Copilot**, or *View → AI
 Copilot*) — not a separate app. It drives the same SSH connections, tunnels and
-file transfers the rest of Culvert uses.
+file transfers the rest of Culvert uses, so there is nothing new to learn: the
+first time you open it, it walks you through choosing a provider, key and
+model.
 
 **How it works**
 
@@ -204,6 +196,34 @@ and redacted values appear as `[REDACTED]` markers.
 **Audit trail** — every request, tool call, approval, file access and security
 decision is listed in the panel's *History* tab and appended to
 `%APPDATA%\culvert\ai-audit.log`.
+
+## Download
+
+Grab `culvert-<version>-windows-x64.zip` from the
+[Releases](../../releases) page. Every push to `main` builds and publishes a
+fresh release automatically (see [Release automation](#release-automation)).
+
+## Quick start
+
+1. Launch `culvert.exe`.
+2. Press **New session**, give it a name, host, port, and username.
+3. Choose **Password** or **Private key** and fill in the credentials.
+4. **Double-click the session** in the sidebar — a shell tab opens and you are
+   on the remote machine.
+5. Switch to the **Tunnels** tab, press **New tunnel**, pick the session, choose
+   Local / Remote / Dynamic and fill in the ports.
+6. Press **Start** on the tunnel row — traffic flows. **Stop** any time.
+
+## Understanding the forwards
+
+| Type | Direction | Typical use |
+| --- | --- | --- |
+| Local `-L` | `listen:8080 → dest:5432` over the server | Reach a service on the remote network through a local port. |
+| Remote `-R` | `server listen:9000 → this machine:3000` | Expose something on your machine to the remote server. |
+| Dynamic `-D` | `SOCKS5 proxy on 127.0.0.1:1080` | Turn the SSH server into a SOCKS5 proxy for any app. |
+
+The tunnel editor explains the selected type in one line and validates every
+field before saving.
 
 ## Keyboard shortcuts
 

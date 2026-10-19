@@ -1559,7 +1559,7 @@ impl TunnelApp {
                     self.toast(
                         ToastKind::Info,
                         format!(
-                            "Culvert {} · {} · MIT · original Rust implementation",
+                            "Culvert {} · {} · MIT · SSH, tunnels and an AI Copilot in one exe",
                             version::tag(),
                             version::display()
                         ),
@@ -4524,7 +4524,7 @@ fn welcome_hero(
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.label(RichText::new("Culvert").size(30.0).strong());
                 ui.label(
-                    RichText::new(format!("{} · native SSH client", version::tag()))
+                    RichText::new(format!("{} · SSH client · AI Copilot", version::tag()))
                         .size(11.0)
                         .color(theme::TEXT_FAINT()),
                 );
