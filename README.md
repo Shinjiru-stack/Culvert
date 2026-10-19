@@ -26,8 +26,8 @@ small, self-contained tool, out of sight and out of the way.
 - **Sessions sidebar** — save host, port, username and auth once; double-click
   any session to open a shell tab (right-click for edit/duplicate/delete).
 - **Full menu bar** — Terminal / Sessions / View / Tools / Macros / Help above
-  a flat tile toolbar (Session · Tunnel · Split · Activity · Theme), all wired
-  to real actions.
+  a flat tile toolbar (Session · Tunnel · Sessions · Files · Split ·
+  Activity), all wired to real actions.
 - **Windows RDP pass-through** — double-click an RDP session to launch the
   system RDP client with saved credentials seeded into Windows Credential
   Manager; loopback targets (WSL/docker relays at `127.0.0.1`) are remapped to
@@ -37,6 +37,14 @@ small, self-contained tool, out of sight and out of the way.
   If a session drops you get a reconnect card instead of a dead tab.
 - **Session quick-bar** — Copy / Paste / Clear / Reconnect one row above the
   shell, plus a **Macros** menu that fires saved command snippets into it.
+- **File browser** — an SFTP dock for the focused tab: upload / download many
+  files at once, multi-select with Ctrl/Shift, copy selected paths, delete,
+  show dot-files, create files and folders, type a path to jump, and open
+  files in your local editor — every save is re-uploaded to the server
+  automatically while the editor is open (one more push on close).
+- **Server monitor bar** — a MobaXterm-style strip under every live shell:
+  user@host, CPU load, memory, root-disk usage and uptime, refreshed every
+  10 s over its own idle SSH connection (green/amber/red thresholds).
 - **Command snippets (macros)** — save frequent commands (systemd restarts,
   log chases…) once in the snippet manager; run them in any shell with one
   click. Stored locally in `snippets.json`.
@@ -63,12 +71,12 @@ small, self-contained tool, out of sight and out of the way.
   retrying). The switch can be flipped live even while the tunnel is running.
 - **Tab management** — right-click any terminal tab: close it, close others,
   close tabs to the right or all of them, browser-style.
-- **Modern light theme** — macOS-like white chrome with an indigo accent that
-  matches the app icon, a GitHub-style light terminal palette, and bundled
-  Inter + JetBrains Mono type system.
-- **Light and dark themes** — one click on the *Theme* tile flips the whole
-  palette (chrome, cards, terminal canvas included); the choice persists
-  across launches.
+- **Classic desktop chrome** — clean light-gray Windows-style chrome with a
+  `#0078D7` blue accent, Segoe UI for the interface and Consolas in the
+  terminal, like the terminal suites you already know.
+- **Light and dark themes** — one click on the moon toggle in the right rail
+  flips the whole palette (chrome, cards, terminal canvas included); the
+  choice persists across launches.
 
 ## Screenshots
 
@@ -78,24 +86,30 @@ bar, tile toolbar and the session quick-bar above the shell:
 
 ![Connected shell](docs/screenshots/session-shell.png)
 
-**File browser docked in the sidebar** — SFTP listing with upload, folder
-create, rename and delete; browsing follows whichever connected tab is
-focused:
+**File browser docked in the sidebar** — SFTP listing for the focused tab with
+a one-row icon toolbar: upload / download (multi-select), copy path, delete,
+show-hidden toggle, new file and new folder — plus an address bar underneath
+you can edit to jump anywhere. Double-click opens a file in your local
+editor; saves sync straight back to the server:
 
 ![File browser](docs/screenshots/filebrowser.png)
 
+**Server monitor bar** — under every connected shell: user@host, CPU load,
+memory, root-disk usage and uptime, refreshed every 10 s:
+
+![Server monitor bar](docs/screenshots/monitor-bar.png)
+
 **Tunnel manager** — Local, Remote and Dynamic forwards as rows with
-per-tunnel Start/Stop, auto-reconnect and port-collision guard (the welcome
-hero with the theme picker sits on top when no shell tab is open):
+per-tunnel Start/Stop, auto-reconnect and port-collision guard:
 
 ![Tunnel manager](docs/screenshots/tunnels-dark.png)
 
-**Light and dark themes** — one click on the *Theme* tile flips the whole
+**Light and dark themes** — one click on the rail toggle flips the whole
 palette (chrome, cards and terminal canvas); the choice persists:
 
-![Dark theme](docs/screenshots/tunnels-dark.png)
+![Light theme](docs/screenshots/theme-light.png)
 
-![Light theme](docs/screenshots/tunnels-light.png)
+![Dark theme](docs/screenshots/theme-dark.png)
 
 ## Download
 

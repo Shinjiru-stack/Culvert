@@ -13,6 +13,66 @@ use eframe::egui::style::WidgetVisuals;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
+// Icon glyphs
+// ---------------------------------------------------------------------------
+/// Tabler Icons glyphs (MIT, bundled webfont in `assets/fonts/tabler-icons.ttf`)
+/// — shared line icons for the app shell (toolbar, rail, terminal quick-bar)
+/// and the docked SFTP browser.
+pub mod tglyph {
+    /// terminal-2 (session / shell)
+    pub const SESSION: char = '\u{ebef}';
+    /// arrows-exchange (tunnel)
+    pub const TUNNEL: char = '\u{f1f4}';
+    /// columns-2 (split view)
+    pub const SPLIT: char = '\u{f6d5}';
+    /// activity (pulse)
+    pub const ACTIVITY: char = '\u{ed23}';
+    /// sun / moon (theme switch — pick the theme you'll get)
+    pub const SUN: char = '\u{eb30}';
+    pub const MOON: char = '\u{eaf8}';
+    /// server-2 / folder (collapsed rail tiles)
+    pub const RAIL_SESSIONS: char = '\u{f07c}';
+    pub const RAIL_FILES: char = '\u{eaad}';
+    /// chevron-right / left (rail expand, sidebar collapse)
+    pub const CHEVRON_RIGHT: char = '\u{ea61}';
+    pub const CHEVRON_LEFT: char = '\u{ea60}';
+    pub const CHEVRON_UP: char = '\u{ea62}';
+    /// plug (quick connect)
+    pub const PLUG: char = '\u{ebd9}';
+
+    // --- File-browser dock + terminal quick-bar tools ---
+    /// upload (multi-file upload)
+    pub const UPLOAD: char = '\u{eb47}';
+    /// download (multi-file download)
+    pub const DOWNLOAD: char = '\u{ea96}';
+    /// trash (delete selection)
+    pub const TRASH: char = '\u{eb41}';
+    /// copy (copy selection path)
+    pub const COPY: char = '\u{ea7a}';
+    /// clipboard-text (paste / insert)
+    pub const PASTE: char = '\u{f089}';
+    /// refresh (relist current directory)
+    pub const REFRESH: char = '\u{eb13}';
+    /// eye / eye-off (show-hidden-files toggle)
+    pub const EYE: char = '\u{ea9a}';
+    pub const EYE_OFF: char = '\u{ecf0}';
+    /// file-plus (create new file)
+    pub const FILE_PLUS: char = '\u{eaa0}';
+    /// folder-plus (create new folder)
+    pub const FOLDER_PLUS: char = '\u{eaab}';
+    /// pencil (local editors)
+    pub const PENCIL: char = '\u{eb04}';
+    /// eraser (clear terminal screen)
+    pub const ERASER: char = '\u{eb8b}';
+    /// reload (reconnect session)
+    pub const RELOAD: char = '\u{f3ae}';
+
+    /// Directory / file row glyphs for the SFTP listing.
+    pub const FOLDER_ROW: char = '\u{eaad}';
+    pub const FILE_ROW: char = '\u{eaa4}';
+}
+
+// ---------------------------------------------------------------------------
 // Palette
 // ---------------------------------------------------------------------------
 // Light: modern macOS-style white chrome, Linear-like accents; Dark: GitHub

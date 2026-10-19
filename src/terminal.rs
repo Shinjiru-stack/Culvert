@@ -37,6 +37,73 @@ enum TermEvent {
     Output(Vec<u8>),
     Connected,
     Closed(String),
+    /// Fresh server-health snapshot for the monitor strip (None = unreachable).
+    Mon(Option<ServerData>),
+}
+
+/// Monitor control: the strip keeper runs its own low-rate SSH connection per
+/// tab and stops when the tab closes/reconnects.
+enum MonCmd {
+    Stop,
+}
+
+/// Non-interactive server-health snapshot taken through a dedicated exec
+/// channel every 10 s (MobaXterm-style status bar under the shell).
+#[derive(Clone, Debug, Default)]
+struct ServerData {
+    user: String,
+    host: String,
+    /// One-minute load average.
+    load: f32,
+    cores: u32,
+    mem_used: u64,
+    mem_total: u64,
+    disk_path: String,
+    /// df "Capacity" percentage for the root filesystem.
+    disk_pct: f32,
+    disk_free: u64,
+    uptime: String,
+}
+
+impl ServerData {
+    fn mem_pct(&self) -> f32 {
+        if self.mem_total == 0 {
+            0.0
+        } else {
+            self.mem_used as f32 / self.mem_total as f32 * 100.0
+        }
+    }
+
+    /// Compact "512M / 2.0G" memory readout.
+    fn mem_text(&self) -> String {
+        if self.mem_total == 0 {
+            return "n/a".to_string();
+        }
+        format!("{} / {}", fmt_size(self.mem_used), fmt_size(self.mem_total))
+    }
+
+    /// Compact "<free> free" disk readout.
+    fn disk_text(&self) -> String {
+        if self.disk_free == 0 {
+            return "n/a".to_string();
+        }
+        format!("{} free", fmt_size(self.disk_free))
+    }
+}
+
+/// Human-size from bytes the df/meminfo way (top unit, one decimal for G+).
+fn fmt_size(v: u64) -> String {
+    if v >= 1024 * 1024 * 1024 * 1024 {
+        format!("{:.2}T", v as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0))
+    } else if v >= 1024 * 1024 * 1024 {
+        format!("{:.1}G", v as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if v >= 1024 * 1024 {
+        format!("{:.0}M", v as f64 / (1024.0 * 1024.0))
+    } else if v >= 1024 {
+        format!("{:.0}K", v as f64 / 1024.0)
+    } else {
+        format!("{v}B")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -67,6 +134,11 @@ pub struct TerminalSession {
     logs: SharedLogs,
     cols: u16,
     rows: u16,
+    /// Stop line for the server-monitor task (own per-tab SSH connection);
+    /// replacing it on reconnect/close drops the sender and ends the task.
+    mon_tx: Option<UnboundedSender<MonCmd>>,
+    /// Latest monitor snapshot for the strip under the shell.
+    mon: Option<ServerData>,
 }
 
 impl TerminalSession {
@@ -94,6 +166,8 @@ impl TerminalSession {
             logs,
             cols: 100,
             rows: 30,
+            mon_tx: None,
+            mon: None,
         };
         me.start_task();
         me
@@ -107,9 +181,23 @@ impl TerminalSession {
         let session = self.session.clone();
         let logs = self.logs.clone();
         let ctx = self.ctx.clone();
+        let evt_tx_mon = evt_tx.clone();
         let (cols, rows) = (self.cols, self.rows);
         self.rt.spawn(async move {
             shell_task(session, logs, ctx, evt_tx, cmd_rx, cols, rows).await;
+        });
+
+        // Server-monitor task: its own persistent SSH connection, sampled
+        // every 10 s and rendered in the strip under the shell. Replacing
+        // `mon_tx` (reconnect/close) drops the queue and ends the task.
+        let (mon_tx, mon_rx) = tokio::sync::mpsc::unbounded_channel::<MonCmd>();
+        self.mon_tx = Some(mon_tx);
+        self.mon = None;
+        let session = self.session.clone();
+        let logs = self.logs.clone();
+        let ctx = self.ctx.clone();
+        self.rt.spawn(async move {
+            monitor_task(session, logs, ctx, evt_tx_mon, mon_rx).await;
         });
     }
 
@@ -123,6 +211,9 @@ impl TerminalSession {
 
     pub fn close(&self) {
         let _ = self.cmd_tx.send(TermCmd::Close);
+        if let Some(m) = &self.mon_tx {
+            let _ = m.send(MonCmd::Stop);
+        }
     }
 
     /// Raw bytes straight to the shell (macros, quick-bar paste).
@@ -171,8 +262,18 @@ impl TerminalSession {
                     self.status = TermStatus::Connected;
                     changed = true;
                 }
+                TermEvent::Mon(data) => {
+                    self.mon = data;
+                    changed = true;
+                }
                 TermEvent::Closed(reason) => {
                     self.status = TermStatus::Closed(reason);
+                    self.mon = None;
+                    // The shell died: the monitor strip no longer has a home
+                    // (its own connection would keep polling pointlessly).
+                    if let Some(m) = self.mon_tx.take() {
+                        let _ = m.send(MonCmd::Stop);
+                    }
                     changed = true;
                 }
             }
@@ -201,12 +302,115 @@ impl TerminalSession {
         // Session tool strip: the session name and connection state (files
         // browsing lives in the sidebar Files tool, not in this window).
         let strip = Rect::from_min_size(rect.min, egui::vec2(rect.width(), 28.0));
+        // MobaXterm-style server monitor bar when the shell is live.
+        let mon_h = match self.status {
+            TermStatus::Connected => 22.0,
+            _ => 0.0,
+        };
         let body = Rect::from_min_max(
             egui::pos2(rect.left(), strip.bottom()),
-            egui::pos2(rect.right(), rect.bottom()),
+            egui::pos2(rect.right(), rect.bottom() - mon_h),
         );
         self.session_strip(ui, strip);
         self.shell_body(ui, body);
+        if mon_h > 0.0 {
+            let mon_rect = Rect::from_min_max(
+                egui::pos2(rect.left(), body.bottom()),
+                egui::pos2(rect.right(), rect.bottom()),
+            );
+            self.server_bar(ui, mon_rect);
+        }
+    }
+
+    /// Slim server-health strip under the shell canvas: user, load, memory,
+    /// root-disk usage and uptime, refreshed every 10 s over its own exec
+    /// channel (MobaXterm look).
+    fn server_bar(&self, ui: &mut egui::Ui, rect: Rect) {
+        const BAR_BG: Color32 = Color32::from_rgb(20, 21, 23);
+        const HAIRLINE: Color32 = Color32::from_rgb(52, 55, 59);
+        const BAR_TEXT: Color32 = Color32::from_gray(206);
+        const GOOD: Color32 = Color32::from_rgb(141, 206, 133);
+        const WARN: Color32 = Color32::from_rgb(224, 166, 60);
+        const BAD: Color32 = Color32::from_rgb(232, 116, 108);
+        const ICON_COLOR: Color32 = Color32::from_rgb(132, 200, 240);
+
+        let tint = |pct: f32, warn: f32, bad: f32| {
+            if pct >= bad {
+                BAD
+            } else if pct >= warn {
+                WARN
+            } else {
+                GOOD
+            }
+        };
+
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, BAR_BG);
+        painter.line_segment(
+            [
+                egui::pos2(rect.left(), rect.top() + 0.5),
+                egui::pos2(rect.right(), rect.top() + 0.5),
+            ],
+            Stroke::new(0.5_f32, HAIRLINE),
+        );
+
+        let Some(d) = &self.mon else {
+            return;
+        };
+        let cy = rect.center().y;
+        let mono = FontId::new(10.5, FontFamily::Monospace);
+        let iconf = theme::icon(12.0);
+
+        let mut x = rect.left() + 8.0;
+        // helper-closure: draws glyph + text, advances x by the text width.
+        let seg = |p: &egui::Painter,
+                   icon_glyph: char,
+                   icon_color: Color32,
+                   text: &String,
+                   text_color: Color32,
+                   x: &mut f32,
+                   gap: f32| {
+            p.text(
+                egui::pos2(*x, cy),
+                Align2::LEFT_CENTER,
+                icon_glyph.to_string(),
+                iconf.clone(),
+                icon_color,
+            );
+            *x += 16.0;
+            p.text(egui::pos2(*x, cy), Align2::LEFT_CENTER, text.clone(), mono.clone(), text_color);
+            *x += p
+                .layout_no_wrap(text.clone(), mono.clone(), text_color)
+                .rect
+                .width()
+                + gap;
+        };
+
+        seg(&painter, GLYPH_USER, ICON_COLOR, &format!("{}@{}", d.user, d.host), BAR_TEXT, &mut x, 16.0);
+
+        let cpu_ptr = if d.cores > 0 { d.load / d.cores as f32 * 100.0 } else { 0.0 };
+        let cpu_txt = if d.cores > 0 {
+            format!("CPU {:.0}% ({:.2}/{n} cores)", cpu_ptr, d.load, n = d.cores)
+        } else {
+            format!("load {:.2}", d.load)
+        };
+        seg(&painter, GLYPH_CPU, ICON_COLOR, &cpu_txt, tint(cpu_ptr, 75.0, 95.0), &mut x, 16.0);
+
+        let mem_txt = if d.mem_total > 0 {
+            format!("MEM {} ({:.0}%)", d.mem_text(), d.mem_pct())
+        } else {
+            "MEM n/a".to_string()
+        };
+        seg(&painter, GLYPH_MEM, ICON_COLOR, &mem_txt, tint(d.mem_pct(), 85.0, 95.0), &mut x, 16.0);
+
+        if d.disk_free > 0 && d.disk_pct > 0.0 {
+            let disk_txt = format!("/ {} ({:.0}%)", d.disk_text(), d.disk_pct);
+            seg(&painter, GLYPH_DISK, ICON_COLOR, &disk_txt, tint(d.disk_pct, 80.0, 90.0), &mut x, 16.0);
+        }
+
+        if !d.uptime.is_empty() {
+            seg(&painter, GLYPH_UPTIME, ICON_COLOR, &d.uptime, BAR_TEXT, &mut x, 0.0);
+        }
     }
 
     /// Session-window header strip with connection state.
@@ -536,6 +740,151 @@ impl TerminalSession {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Server monitor (MobaXterm-style strip under the shell)
+// ---------------------------------------------------------------------------
+
+// Tabler glyphs for the strip (codepoints resolved from the bundled font).
+const GLYPH_USER: char = '\u{eb4d}'; // user
+const GLYPH_CPU: char = '\u{ef8e}'; // cpu
+const GLYPH_MEM: char = '\u{eb1f}'; // server (RAM)
+const GLYPH_DISK: char = '\u{ea88}'; // database (disk)
+const GLYPH_UPTIME: char = '\u{ebea}'; // history
+
+/// One cheap POSIX probe, echoed with deterministic markers. Missing pieces
+/// (macOS has no /proc) parse to "n/a" instead of failing the whole bar.
+const MON_SCRIPT: &str = "echo U=$(whoami 2>/dev/null); \
+echo H=$(hostname 2>/dev/null); \
+echo C=$(nproc 2>/dev/null); \
+echo L=$(cat /proc/loadavg 2>/dev/null); \
+grep -E '^(MemTotal|MemAvailable):' /proc/meminfo 2>/dev/null; \
+echo D=$(df -P / 2>/dev/null | tail -n 1); \
+echo T=[$(uptime 2>/dev/null)]";
+
+/// Parse the MON_SCRIPT output into a [`ServerData`].
+fn parse_server_data(out: &str) -> Option<ServerData> {
+    let mut d = ServerData::default();
+    let mut saw_something = false;
+    for raw in out.lines() {
+        let line = raw.trim();
+        saw_something = saw_something || !line.is_empty();
+        if let Some(v) = line.strip_prefix("U=") {
+            d.user = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("H=") {
+            d.host = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("C=") {
+            d.cores = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("L=") {
+            d.load = v
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+        } else if let Some(v) = line.strip_prefix("MemTotal:") {
+            d.mem_total = v.trim().split_whitespace().next().unwrap_or("0").parse().unwrap_or(0) * 1024;
+        } else if let Some(v) = line.strip_prefix("MemAvailable:") {
+            let avail = v.trim().split_whitespace().next().unwrap_or("0").parse::<u64>().unwrap_or(0) * 1024;
+            d.mem_used = d.mem_total.saturating_sub(avail);
+        } else if let Some(v) = line.strip_prefix("D=") {
+            // df -P fields: fs blocks used avail capacity mount
+            let f: Vec<&str> = v.split_whitespace().collect();
+            if f.len() >= 5 {
+                let total: u64 = f[1].parse().unwrap_or(0);
+                let avail: u64 = f[3].parse().unwrap_or(0);
+                d.disk_pct = f[4].trim_end_matches('%').parse().unwrap_or(0.0);
+                d.disk_free = avail * 1024;
+                d.disk_path = f.get(5).unwrap_or(&"/").to_string();
+                let _ = total;
+            }
+        } else if let Some(v) = line.strip_prefix("T=[") {
+            let body = v.strip_suffix(']').unwrap_or(v);
+            // "… up 3 days,  2:15,  1 user, …" → keep the time segments
+            // between "up" and the user/load-average tail.
+            let tail = body.split(" up ").nth(1).unwrap_or("");
+            let mut parts: Vec<String> = Vec::new();
+            for seg in tail.split(", ") {
+                let s = seg.trim();
+                if s.is_empty() || s.contains(" user") || s.starts_with("load average") {
+                    break;
+                }
+                parts.push(s.to_string());
+            }
+            d.uptime = parts.join(", ");
+        }
+    }
+    saw_something.then_some(d)
+}
+
+/// Own low-rate SSH connection per tab: samples server health every 10 s.
+/// Ends when the stop queue closes (tab replaced/closed) or the app exits.
+async fn monitor_task(
+    session: SshSession,
+    logs: SharedLogs,
+    ctx: egui::Context,
+    evt_tx: UnboundedSender<TermEvent>,
+    mut cmd_rx: UnboundedReceiver<MonCmd>,
+) {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+    let mut handle: Option<ssh::SshHandle> = None;
+
+    loop {
+        // One sample per tick; stop whenever asked.
+        let mut stop = false;
+        tokio::select! {
+            _ = tokio::time::sleep(INTERVAL) => {}
+            r = cmd_rx.recv() => {
+                stop = r.is_none() || matches!(r, Some(MonCmd::Stop));
+            }
+        }
+        if stop {
+            break;
+        }
+
+        if handle.is_none() {
+            let (ftx, _frx) = tokio::sync::mpsc::unbounded_channel();
+            match ssh::connect(&session, logs.clone(), ftx).await {
+                Ok(h) => handle = Some(h),
+                Err(_) => {
+                    // Server unreachable: report empty; retry next tick.
+                    let _ = evt_tx.send(TermEvent::Mon(None));
+                    ctx.request_repaint();
+                    continue;
+                }
+            }
+        }
+
+        let data = if let Some(h) = handle.as_ref() {
+            sample_server(h).await
+        } else {
+            None
+        };
+        if data.is_none() {
+            // Connection went stale — reconnect next cycle.
+            handle = None;
+        }
+        let _ = evt_tx.send(TermEvent::Mon(data));
+        ctx.request_repaint();
+    }
+}
+
+/// Run MON_SCRIPT in a throwaway exec channel and parse the output.
+async fn sample_server(handle: &ssh::SshHandle) -> Option<ServerData> {
+    let mut ch = handle.channel_open_session().await.ok()?;
+    ch.exec(false, MON_SCRIPT).await.ok()?;
+    let mut out = Vec::new();
+    loop {
+        match ch.wait().await {
+            Some(ChannelMsg::Data { data }) => out.extend_from_slice(&data),
+            Some(ChannelMsg::ExtendedData { data, .. }) => out.extend_from_slice(&data),
+            Some(ChannelMsg::ExitStatus { .. }) => {}
+            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+            _ => {}
+        }
+    }
+    let _ = ch.close().await;
+    parse_server_data(&String::from_utf8_lossy(&out))
 }
 
 // ---------------------------------------------------------------------------

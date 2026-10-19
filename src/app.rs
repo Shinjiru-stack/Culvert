@@ -11,6 +11,7 @@ use crate::session::{
 };
 use crate::terminal::{TermStatus, TerminalSession};
 use crate::theme;
+use crate::theme::tglyph;
 use crate::tunnel::{forward_key, TunnelManager};
 use crate::version;
 #[cfg(windows)]
@@ -1521,7 +1522,7 @@ impl TunnelApp {
             egui::SidePanel::left("sessions")
                 .resizable(true)
                 .default_width(220.0)
-                .width_range(200.0..=380.0)
+                .width_range(180.0..=380.0)
                 .frame(
                     Frame::NONE
                         .fill(theme::BG_PANEL())
@@ -1628,22 +1629,47 @@ impl TunnelApp {
         // MobaXterm-style quick connect: type user@host:port and go. Saving
         // the session is optional — connect immediately when a password is
         // on file for the profile, otherwise prefill the session editor.
+        let mut quick_go = false;
         ui.horizontal(|ui| {
-            let w = (ui.available_width() - 28.0).max(80.0);
-            let resp = ui
-                .add_sized(
-                    [w, 24.0],
-                    egui::TextEdit::singleline(&mut self.quick_connect)
-                        .hint_text("quick connect: user@host:port")
-                        .margin(egui::vec2(8.0, 4.0)),
+            // Put the button on the right first, then let the text field fill
+            // the remaining width. Sizing the field as "available - N" left it
+            // a few pixels too wide (button padding varies), which inflated the
+            // panel's content width and made every sidebar resize snap back.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if styled_button(
+                    ui,
+                    RichText::new(tglyph::PLUG).font(theme::icon(13.0)),
+                    true,
+                    false,
+                    Some(egui::vec2(24.0, 24.0)),
                 )
-                .on_hover_text("Quick connect — user@host or user@host:port, then Enter");
-            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (resp.lost_focus() && enter) || styled_button(ui, RichText::new(tglyph::PLUG).font(theme::icon(13.0)), true, false, Some(egui::vec2(24.0, 24.0))).clicked()
-            {
-                self.quick_connect_go(ctx);
-            }
+                .on_hover_text("Quick connect")
+                .clicked()
+                {
+                    quick_go = true;
+                }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    let w = ui.available_width();
+                    let resp = ui
+                        .add_sized(
+                            [w, 24.0],
+                            egui::TextEdit::singleline(&mut self.quick_connect)
+                                .hint_text("quick connect: user@host:port")
+                                .margin(egui::vec2(8.0, 4.0)),
+                        )
+                        .on_hover_text(
+                            "Quick connect — user@host or user@host:port, then Enter",
+                        );
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if resp.lost_focus() && enter {
+                        quick_go = true;
+                    }
+                });
+            });
         });
+        if quick_go {
+            self.quick_connect_go(ctx);
+        }
         ui.add_space(8.0);
 
         let full = egui::vec2(ui.available_width(), 26.0);
@@ -3690,13 +3716,30 @@ fn session_card(
                     [c + egui::vec2(0.0, 2.0), c + egui::vec2(3.5, 2.0)],
                     prompt,
                 );
-                let shown: String = if name.chars().count() > 16 {
-                    name.chars().take(15).collect::<String>() + "…"
-                } else {
-                    name.to_string()
-                };
-                ui.label(RichText::new(shown).size(12.0).color(theme::TEXT()))
+                // Show the whole name whenever the row has room; truncate
+                // only when the icon, badge and status dot need the space.
+                let chip_w = ui
+                    .painter()
+                    .layout_no_wrap(
+                        auth_label.to_owned(),
+                        egui::FontId::proportional(9.5),
+                        a_fg,
+                    )
+                    .size()
+                    .x
+                    + 12.0;
+                let name_w =
+                    (ui.available_width() - chip_w - 6.0 - 16.0 - 8.0).max(48.0);
+                ui.scope(|ui| {
+                    ui.set_max_width(name_w);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(name).size(12.0).color(theme::TEXT()),
+                        )
+                        .truncate(),
+                    )
                     .on_hover_text(conn);
+                });
                 chip(ui, auth_label, a_fg, a_bg);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if tunnel_live {
@@ -3992,8 +4035,12 @@ fn terminal_quick_bar(
         |ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-            ui.add_space(6.0);
-            if ghost_button(ui, RichText::new("Copy").size(10.5), false).clicked() {
+            ui.add_space(4.0);
+            // MobaXterm-style icon strip: proper glyphs, tooltips on hover.
+            if ghost_button(ui, RichText::new(tglyph::COPY).font(theme::icon(15.0)), false)
+                .on_hover_text("Copy screen to clipboard")
+                .clicked()
+            {
                 let text = term.visible_text();
                 if text.trim().is_empty() {
                     action = QuickAction::ClipboardEmpty;
@@ -4002,7 +4049,10 @@ fn terminal_quick_bar(
                     action = QuickAction::Copied;
                 }
             }
-            if ghost_button(ui, RichText::new("Paste").size(10.5), false).clicked() {
+            if ghost_button(ui, RichText::new(tglyph::PASTE).font(theme::icon(15.0)), false)
+                .on_hover_text("Paste from clipboard")
+                .clicked()
+            {
                 let text = arboard::Clipboard::new()
                     .and_then(|mut c| c.get_text())
                     .unwrap_or_default();
@@ -4012,11 +4062,17 @@ fn terminal_quick_bar(
                     term.paste_text(&text);
                 }
             }
-            if ghost_button(ui, RichText::new("Clear").size(10.5), false).clicked() {
+            if ghost_button(ui, RichText::new(tglyph::ERASER).font(theme::icon(15.0)), false)
+                .on_hover_text("Clear screen")
+                .clicked()
+            {
                 term.clear_screen();
                 action = QuickAction::Cleared;
             }
-            if ghost_button(ui, RichText::new("Reconnect").size(10.5), false).clicked() {
+            if ghost_button(ui, RichText::new(tglyph::RELOAD).font(theme::icon(15.0)), false)
+                .on_hover_text("Reconnect")
+                .clicked()
+            {
                 term.reconnect();
                 action = QuickAction::Reconnect;
             }
@@ -4070,30 +4126,6 @@ fn terminal_quick_bar(
 
 /// Terminal-style tab chip; right-click opens the Chrome-style tab menu.
 /// Returns (clicked-activate, clicked-close, context-menu command).
-
-/// Tabler Icons glyphs (MIT, bundled webfont) — professional line icons for
-/// the toolbar and rail.
-mod tglyph {
-    /// terminal-2 (session / shell)
-    pub const SESSION: char = '\u{ebef}';
-    /// arrows-exchange (tunnel)
-    pub const TUNNEL: char = '\u{f1f4}';
-    /// columns-2 (split view)
-    pub const SPLIT: char = '\u{f6d5}';
-    /// activity (pulse)
-    pub const ACTIVITY: char = '\u{ed23}';
-    /// sun / moon (theme switch — pick the theme you'll get)
-    pub const SUN: char = '\u{eb30}';
-    pub const MOON: char = '\u{eaf8}';
-    /// server-2 / folder (collapsed rail tiles)
-    pub const RAIL_SESSIONS: char = '\u{f07c}';
-    pub const RAIL_FILES: char = '\u{eaad}';
-    /// chevron-right / left (rail expand, sidebar collapse)
-    pub const CHEVRON_RIGHT: char = '\u{ea61}';
-    pub const CHEVRON_LEFT: char = '\u{ea60}';
-    /// plug (quick connect)
-    pub const PLUG: char = '\u{ebd9}';
-}
 
 /// Flat MobaXterm-style toolbar tile: colored Tabler glyph over a small
 /// label, no background fill — a soft rounded highlight appears on hover,
@@ -4434,6 +4466,13 @@ fn tab_chip(
                 }
             });
         });
+
+    // Make the whole tab a click target: its padding, dot and label. Only
+    // the text used to react, which made switching tabs feel broken when a
+    // click landed a pixel or two off (e.g. in a maximized window).
+    if tab.response.interact(Sense::click()).clicked() && !closed {
+        clicked = true;
+    }
 
     if active {
         // Saturated top edge marks the active page, MobaXterm style.

@@ -7,12 +7,14 @@ use crate::log::{push_log, LogEntry, LogLevel, SharedLogs};
 use crate::session::SshSession;
 use crate::ssh;
 use crate::theme;
+use crate::theme::tglyph;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Frame, Margin, RichText, Sense, Stroke, Ui,
 };
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -41,6 +43,8 @@ enum FbCmd {
     Up,
     Refresh,
     MkDir(String),
+    /// Create an empty remote file (dock "New file" action).
+    MkFile(String),
     Remove { path: String, is_dir: bool },
     Rename { from: String, to: String },
     Download { remote: String, local: String },
@@ -136,7 +140,11 @@ pub fn load_editors() -> SharedEditors {
     Arc::new(RwLock::new(list))
 }
 
-/// An in-flight "download, open in editor, re-upload on close" job.
+/// An in-flight "download, open in editor, sync back" job. The local copy is
+/// watched while the editor runs: every save re-uploads immediately, and the
+/// editor exiting pushes the final state (WinSCP-style). Editors that detach
+/// via a short-lived launcher (.cmd/.bat wrappers like the VS Code alias) are
+/// detected and simply keep being watched without the process handle.
 struct EditJob {
     /// Base file name, for the status note.
     file: String,
@@ -144,7 +152,17 @@ struct EditJob {
     /// Remote absolute path to re-upload to.
     remote: String,
     local: std::path::PathBuf,
-    child: std::process::Child,
+    child: Option<std::process::Child>,
+    /// Local copy fingerprint when the job started: a save shows up as a
+    /// differing (len, mtime). Re-snapshotted after each upload.
+    snap_len: u64,
+    snap_mtime: Option<std::time::SystemTime>,
+    /// Throttle for the metadata checks (poll every ~700 ms).
+    next_check: std::time::Instant,
+    /// When the job started, to tell real editors from quick wrappers apart.
+    started: std::time::Instant,
+    /// Last detected save (wrapper mode: stop watching after 30 idle minutes).
+    last_change_seen: std::time::Instant,
 }
 
 // ---------------------------------------------------------------------------
@@ -157,13 +175,21 @@ pub struct FileBrowser {
     entries: Vec<FbEntry>,
     cwd: String,
     path_edit: String,
-    selected: Option<String>,
+    /// Selected listing entries (Ctrl/Shift+click multi-select); the anchor
+    /// is where shift-ranges start from.
+    selected: BTreeSet<String>,
+    anchor: Option<String>,
+    /// Reveal dot-files that the listing normally hides.
+    show_hidden: bool,
     /// Operation in flight; shows a busy note and gates repeat actions.
     busy: Option<String>,
     last_status: Option<(bool, String)>,
     /// "New folder" modal open + typed name.
     folder_modal: bool,
     folder_name: String,
+    /// "New file" modal open + typed name.
+    file_modal: bool,
+    file_name: String,
     /// (cwd, old name); the rename text lives in `rename_value`.
     rename_modal: Option<(String, String)>,
     rename_value: String,
@@ -203,11 +229,15 @@ impl FileBrowser {
             entries: Vec::new(),
             cwd: "/".to_string(),
             path_edit: String::new(),
-            selected: None,
+            selected: BTreeSet::new(),
+            anchor: None,
+            show_hidden: false,
             busy: None,
             last_status: None,
             folder_modal: false,
             folder_name: String::new(),
+            file_modal: false,
+            file_name: String::new(),
             rename_modal: None,
             rename_value: String::new(),
             want_close: false,
@@ -244,7 +274,8 @@ impl FileBrowser {
     pub fn reconnect(&mut self) {
         self.status = FbStatus::Connecting;
         self.entries.clear();
-        self.selected = None;
+        self.selected.clear();
+        self.anchor = None;
         self.path_edit.clear();
         self.last_status = None;
         self.want_close = false;
@@ -269,14 +300,16 @@ impl FileBrowser {
                     self.cwd = cwd.clone();
                     self.path_edit = cwd;
                     self.entries = entries;
-                    self.selected = None;
+                    self.selected.clear();
+                    self.anchor = None;
                     changed = true;
                 }
                 FbEvent::Listing { cwd, entries } => {
                     self.cwd = cwd.clone();
                     self.path_edit = cwd;
                     self.entries = entries;
-                    self.selected = None;
+                    self.selected.clear();
+                    self.anchor = None;
                     changed = true;
                 }
                 FbEvent::Done(msg) => {
@@ -302,21 +335,97 @@ impl FileBrowser {
                 }
             }
         }
-        // Editor process ended → push the local copy back to the server
-        // (WinSCP-style "edit and upload on close").
+        // Watching an open edit job: every save re-uploads right away, and
+        // the editor's exit pushes the final state (WinSCP-style). Actions
+        // that touch `self` are collected into flags and run after the job
+        // borrow ends.
+        let mut save_upload: Option<(String, String)> = None;
+        let mut exit_upload: Option<(String, String, String, String)> = None;
+        let mut stop_watching: Option<String> = None;
+        let mut end_edit_note: Option<(String, String)> = None;
+        let mut job_alive = false;
         if let Some(job) = &mut self.edit_job {
-            if let Ok(Some(_)) = job.child.try_wait() {
-                let (file, editor, remote, local) = (
-                    job.file.clone(),
-                    job.editor.clone(),
-                    job.remote.clone(),
-                    job.local.display().to_string(),
-                );
-                self.edit_job = None;
-                self.send(FbCmd::Upload { remote, local });
-                self.busy = Some(format!("Editing of {file} closed ({editor}) — re-uploading…"));
-                changed = true;
+            let now = std::time::Instant::now();
+            if now >= job.next_check {
+                if let Ok(md) = std::fs::metadata(&job.local) {
+                    let mtime = md.modified().ok();
+                    if md.len() != job.snap_len || mtime != job.snap_mtime {
+                        // The user saved: push a fresh copy to the server.
+                        save_upload = Some((
+                            job.remote.clone(),
+                            job.local.display().to_string(),
+                        ));
+                        job.snap_len = md.len();
+                        job.snap_mtime = mtime;
+                        // Give the SFTP write a moment before the next probe.
+                        job.next_check = now + std::time::Duration::from_secs(2);
+                        job.last_change_seen = now;
+                        changed = true;
+                    } else {
+                        job.next_check = now + std::time::Duration::from_millis(700);
+                    }
+                } else {
+                    job.next_check = now + std::time::Duration::from_millis(700);
+                }
             }
+            if let Some(child) = job.child.as_mut() {
+                if let Ok(Some(_)) = child.try_wait() {
+                    if job.started.elapsed() < std::time::Duration::from_secs(5) {
+                        // A .cmd/.bat launcher that spawned a detached editor
+                        // (VS Code alias, …): the process exited immediately,
+                        // so keep watching the file for saves and stop only
+                        // after a long idle window.
+                        job.child = None;
+                        job_alive = true;
+                    } else {
+                        exit_upload = Some((
+                            job.file.clone(),
+                            job.editor.clone(),
+                            job.remote.clone(),
+                            job.local.display().to_string(),
+                        ));
+                    }
+                } else {
+                    job_alive = true;
+                }
+            }
+            if job.child.is_none() && stop_watching.is_none() {
+                // Wrapper-launched editor: stop watching after a long idle
+                // window so dead watchers don't linger forever.
+                if job.last_change_seen.elapsed() > std::time::Duration::from_secs(30 * 60) {
+                    stop_watching = Some(job.file.clone());
+                } else {
+                    job_alive = true;
+                }
+            }
+        }
+        if exit_upload.is_some() || stop_watching.is_some() {
+            self.edit_job = None;
+        }
+        if let Some((file, editor, remote, local)) = exit_upload {
+            self.edit_job = None;
+            self.send(FbCmd::Upload { remote, local });
+            end_edit_note = Some((file, editor));
+            changed = true;
+        }
+        if let Some((remote, local)) = save_upload {
+            self.send(FbCmd::Upload { remote, local });
+            changed = true;
+        }
+        if let Some(file) = stop_watching {
+            self.edit_job = None;
+            self.last_status = Some((true, format!("Stopped watching {file}")));
+            changed = true;
+        }
+        if end_edit_note.is_some() {
+            let (file, editor) = end_edit_note.clone().unwrap();
+            self.busy =
+                Some(format!("Editing of {file} closed ({editor}) — re-uploading…"));
+        }
+        if job_alive {
+            // Keep ticking while the editor is open even when the app is
+            // otherwise idle (no repaints scheduled by the input).
+            self.ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
         changed
     }
@@ -332,100 +441,241 @@ impl FileBrowser {
         }
 
         // --- Toolbar -------------------------------------------------------
+        // One row of proper icon tools: parent, refresh, upload, download,
+        // copy path, delete, show-hidden toggle, new file, new folder and the
+        // editors manager. Tiles shrink to the available dock width so the
+        // whole set stays on the single row (no wrapping, no scroll bar).
+        let tools_avail = ui.available_width();
+        // needed width = 10 tiles + 9 one-px gaps
+        let tile_w = ((tools_avail - 9.0) / 10.0).floor().clamp(13.0, 17.0);
         Frame::NONE
             .fill(theme::BG_CARD())
             .corner_radius(CornerRadius::same(10))
             .stroke(Stroke::new(1.0_f32, theme::BORDER()))
-            .inner_margin(Margin::symmetric(8, 5))
+            .inner_margin(Margin::symmetric(6, 4))
             .show(ui, |ui| {
-                // horizontal_wrapped: in the narrow sidebar the trailing
-                // buttons wrap to a second row instead of inflating the
-                // panel's min-rect (which used to smear the layout).
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    if ui
-                        .button(RichText::new("↑").size(12.0))
-                        .on_hover_text("Parent folder")
-                        .clicked()
-                    {
-                        self.send(FbCmd::Up);
-                    }
-                    if ui
-                        .button(RichText::new("↻").size(12.0))
-                        .on_hover_text("Refresh")
-                        .clicked()
-                    {
-                        self.send(FbCmd::Refresh);
-                    }
-                    let path_resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.path_edit)
-                            .desired_width(96.0f32.max(ui.available_width() - 250.0))
-                            .font(FontId::monospace(11.5))
-                            .margin(egui::vec2(6.0, 4.0)),
-                    );
-                    if path_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        let p = self.path_edit.trim().to_string();
-                        if !p.is_empty() {
-                            self.send(FbCmd::Navigate(p));
-                        }
-                    }
-                    if ui
-                        .button(RichText::new("+ Folder").size(10.5))
-                        .on_hover_text("Create folder in the current directory")
-                        .clicked()
-                    {
-                        self.folder_modal = true;
-                        self.folder_name.clear();
-                    }
-                    if ui
-                        .button(RichText::new("✎").size(12.0))
-                        .on_hover_text("Local editors…")
-                        .clicked()
-                    {
-                        self.editors_modal = true;
-                    }
-                    if ui
-                        .button(RichText::new("Upload").size(10.5))
-                        .on_hover_text("Upload a local file into this directory")
-                        .clicked()
-                    {
-                        if let Some(p) = rfd::FileDialog::new().pick_file() {
-                            let name = p
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "file.bin".to_string());
-                            self.send(FbCmd::Upload {
-                                remote: path_join(&self.cwd, &name),
-                                local: p.display().to_string(),
-                            });
-                            self.busy = Some("Uploading…".to_string());
-                        }
-                    }
-                    if self.selected.is_some() {
-                        if ui
-                            .button(RichText::new("Delete").size(10.5).color(theme::DANGER()))
-                            .on_hover_text("Delete the selected entry")
+                // The row always fits by construction; keep the BeltSafe
+                // hidden so a stray rounding pixel can't summon the fat
+                // floating thumb over the address bar.
+                egui::ScrollArea::horizontal()
+                    .id_salt("fb_tool_strip")
+                    .auto_shrink([false, true])
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                    )
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 1.0;
+
+                            if dock_button(
+                                ui,
+                                tglyph::CHEVRON_UP,
+                                theme::TEXT_DIM(),
+                                "Parent folder",
+                                tile_w,
+                                true,
+                            )
                             .clicked()
-                        {
-                            if let Some(e) = self
-                                .entries
-                                .iter()
-                                .find(|e| Some(&e.name) == self.selected.as_ref())
-                                .cloned()
                             {
-                                self.send(FbCmd::Remove {
-                                    path: path_join(&self.cwd, &e.name),
-                                    is_dir: e.is_dir,
-                                });
-                                self.busy = Some("Deleting…".to_string());
-                                self.selected = None;
+                                self.send(FbCmd::Up);
                             }
-                        }
+                            if dock_button(
+                                ui,
+                                tglyph::REFRESH,
+                                theme::TEXT_DIM(),
+                                "Refresh",
+                                tile_w,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                self.send(FbCmd::Refresh);
+                            }
+                            let busy = self.busy.is_some();
+                            if dock_button(
+                                ui,
+                                tglyph::UPLOAD,
+                                theme::INFO(),
+                                "Upload files… (multi-select)",
+                                tile_w,
+                                !busy,
+                            )
+                            .clicked()
+                            {
+                                self.upload_many();
+                            }
+                            let has_files = !self.selected_files().is_empty();
+                            if dock_button(
+                                ui,
+                                tglyph::DOWNLOAD,
+                                theme::INFO(),
+                                "Download selected files… (multi-select)",
+                                tile_w,
+                                !busy && has_files,
+                            )
+                            .clicked()
+                            {
+                                self.download_many();
+                            }
+                            let has_sel = !self.selected.is_empty();
+                            if dock_button(
+                                ui,
+                                tglyph::COPY,
+                                theme::TEXT_DIM(),
+                                "Copy path of selection",
+                                tile_w,
+                                has_sel,
+                            )
+                            .clicked()
+                            {
+                                let paths: Vec<String> = self
+                                    .selected
+                                    .iter()
+                                    .map(|n| path_join(&self.cwd, n))
+                                    .collect();
+                                ui.ctx().copy_text(paths.join("\r\n"));
+                                self.ctx.request_repaint();
+                                let n = paths.len();
+                                self.last_status = Some((true, {
+                                    if n == 1 {
+                                        "Path copied to clipboard".to_string()
+                                    } else {
+                                        format!("{n} paths copied to clipboard")
+                                    }
+                                }));
+                            }
+                            if dock_button(
+                                ui,
+                                tglyph::TRASH,
+                                theme::DANGER(),
+                                "Delete selection",
+                                tile_w,
+                                has_sel,
+                            )
+                            .clicked()
+                            {
+                                self.delete_selected();
+                            }
+                            if dock_button(
+                                ui,
+                                if self.show_hidden {
+                                    tglyph::EYE
+                                } else {
+                                    tglyph::EYE_OFF
+                                },
+                                if self.show_hidden {
+                                    theme::ACCENT()
+                                } else {
+                                    theme::TEXT_DIM()
+                                },
+                                if self.show_hidden {
+                                    "Hide dot-files"
+                                } else {
+                                    "Show hidden (dot) files"
+                                },
+                                tile_w,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                self.show_hidden = !self.show_hidden;
+                                self.selected.clear();
+                                self.anchor = None;
+                                ui.ctx().request_repaint();
+                            }
+                            if dock_button(
+                                ui,
+                                tglyph::FILE_PLUS,
+                                theme::TEXT_DIM(),
+                                "Create new file",
+                                tile_w,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                self.file_modal = true;
+                                self.file_name.clear();
+                            }
+                            if dock_button(
+                                ui,
+                                tglyph::FOLDER_PLUS,
+                                theme::TEXT_DIM(),
+                                "Create new folder",
+                                tile_w,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                self.folder_modal = true;
+                                self.folder_name.clear();
+                            }
+                            if dock_button(
+                                ui,
+                                tglyph::PENCIL,
+                                theme::TEXT_DIM(),
+                                "Local editors…",
+                                tile_w,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                self.editors_modal = true;
+                            }
+                        });
+                    });
+
+                ui.add_space(3.0);
+                // Address bar under the dock: shows the current path; edit it
+                // and press Enter to switch directories.
+                let path_resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.path_edit)
+                        .desired_width(ui.available_width())
+                        .font(FontId::monospace(11.0))
+                        .margin(egui::vec2(6.0, 4.0)),
+                );
+                if path_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let p = self.path_edit.trim().to_string();
+                    if !p.is_empty() {
+                        self.send(FbCmd::Navigate(p));
                     }
-                });
+                } else if path_resp.gained_focus() && self.path_edit.trim().is_empty() {
+                    self.path_edit = self.cwd.clone();
+                }
             });
         ui.add_space(6.0);
+
+        // --- Status strip ------------------------------------------------------
+        // Kept above the list so busy/error bubbles are never clipped by the
+        // sidebar's bottom edge when the listing is tall.
+        let (icon, color, text) = if self.busy.is_some() {
+            ("○", theme::TEXT_DIM(), self.busy.clone().unwrap_or_default())
+        } else {
+            match &self.last_status {
+                Some((ok, m)) => (
+                    if *ok { "✓" } else { "!" },
+                    if *ok { theme::SUCCESS() } else { theme::DANGER() },
+                    m.clone(),
+                ),
+                None => ("", theme::TEXT_FAINT(), String::new()),
+            }
+        };
+        if !text.is_empty() {
+            ui.label(
+                RichText::new(format!("{icon} {text}"))
+                    .size(10.5)
+                    .color(color),
+            );
+        } else {
+            ui.label(
+                RichText::new(
+                    "Double-click opens a folder or the file in your editor (temp\
+                     copy, re-uploaded when the editor closes). Ctrl+click selects\
+                     extra items, Shift+click a range; right-click for more.",
+                )
+                .size(10.0)
+                .color(theme::TEXT_FAINT()),
+            );
+        }
 
         // --- Column header ---------------------------------------------------
         let hdr_rect = ui.available_rect_before_wrap();
@@ -454,23 +704,90 @@ impl FileBrowser {
 
         // --- Rows ------------------------------------------------------------
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let entries = self.entries.clone();
+            // Dot-files stay hidden unless the eye tool is on; "." and ".."
+            // are never shown.
+            let visible: Vec<FbEntry> = self
+                .entries
+                .iter()
+                .filter(|e| {
+                    (self.show_hidden || !e.name.starts_with('.'))
+                        && e.name != "."
+                        && e.name != ".."
+                })
+                .cloned()
+                .collect();
             let cwd = self.cwd.clone();
             let editors = self
                 .editors
                 .read()
                 .map(|v| v.clone())
                 .unwrap_or_default();
-            for entry in entries {
-                let sel = self.selected.as_deref() == Some(entry.name.as_str());
-                let action = file_row(ui, &entry, sel, &editors);
+            for entry in &visible {
+                let sel = self.selected.contains(&entry.name);
+                let action = file_row(ui, entry, sel, &editors);
                 match action {
-                    Some(RowAction::Select) => self.selected = Some(entry.name.clone()),
+                    Some(RowAction::Select(kind)) => {
+                        let name = entry.name.clone();
+                        match kind {
+                            SelectMod::Plain => {
+                                self.selected.clear();
+                                self.selected.insert(name.clone());
+                                self.anchor = Some(name);
+                            }
+                            SelectMod::Toggle => {
+                                if !self.selected.remove(&name) {
+                                    self.selected.insert(name.clone());
+                                }
+                                self.anchor = Some(name);
+                            }
+                            SelectMod::Range => {
+                                let a = self.anchor.clone();
+                                let end = visible.iter().position(|e| e.name == name);
+                                let start = a
+                                    .as_ref()
+                                    .and_then(|a| visible.iter().position(|e| &e.name == a));
+                                if let (Some(s), Some(t)) = (start, end) {
+                                    self.selected.clear();
+                                    for e in &visible[s.min(t)..=s.max(t)] {
+                                        self.selected.insert(e.name.clone());
+                                    }
+                                    // Keep the anchor so further shifts pivot around it.
+                                } else {
+                                    self.selected.insert(name.clone());
+                                    self.anchor = Some(name);
+                                }
+                            }
+                        }
+                    }
                     Some(RowAction::Open) if entry.is_dir => {
                         self.send(FbCmd::Navigate(path_join(&cwd, &entry.name)));
                     }
                     Some(RowAction::Open) => {
-                        self.start_download(&cwd, &entry.name, "Downloading…");
+                        // Double-click opens the file in the local editor
+                        // (WinSCP-style: temp copy + re-upload on close).
+                        // Plain downloads stay on the menu / download button.
+                        let editors = self
+                            .editors
+                            .read()
+                            .map(|v| v.clone())
+                            .unwrap_or_default();
+                        if let Some(e) = editors.first() {
+                            self.start_edit_with(
+                                &cwd,
+                                &entry.name,
+                                e.name.clone(),
+                                e.path.clone(),
+                            );
+                        } else {
+                            // No editor configured yet: Notepad keeps the
+                            // double-click opens-an-editor contract.
+                            self.start_edit_with(
+                                &cwd,
+                                &entry.name,
+                                "Notepad".to_string(),
+                                "notepad.exe".to_string(),
+                            );
+                        }
                     }
                     Some(RowAction::Download) => {
                         self.start_download(&cwd, &entry.name, "Downloading…");
@@ -480,7 +797,7 @@ impl FileBrowser {
                         self.rename_value = entry.name.clone();
                     }
                     Some(RowAction::Delete) => {
-                        self.selected = None;
+                        self.selected.remove(&entry.name);
                         self.send(FbCmd::Remove {
                             path: path_join(&cwd, &entry.name),
                             is_dir: entry.is_dir,
@@ -495,35 +812,6 @@ impl FileBrowser {
             }
             ui.add_space(14.0);
         });
-
-        // --- Status strip ------------------------------------------------------
-        let (icon, color, text) = if self.busy.is_some() {
-            ("○", theme::TEXT_DIM(), self.busy.clone().unwrap_or_default())
-        } else {
-            match &self.last_status {
-                Some((ok, m)) => (
-                    if *ok { "✓" } else { "!" },
-                    if *ok { theme::SUCCESS() } else { theme::DANGER() },
-                    m.clone(),
-                ),
-                None => ("", theme::TEXT_FAINT(), String::new()),
-            }
-        };
-        if !text.is_empty() {
-            ui.label(
-                RichText::new(format!("{icon} {text}"))
-                    .size(10.5)
-                    .color(color),
-            );
-        } else {
-            ui.label(
-                RichText::new(
-                    "Double-click a folder to open it, a file to download; right-click for more.",
-                )
-                .size(10.0)
-                .color(theme::TEXT_FAINT()),
-            );
-        }
 
         // --- Modals ------------------------------------------------------------
         if self.folder_modal {
@@ -554,6 +842,37 @@ impl FileBrowser {
                 if !name.is_empty() {
                     self.send(FbCmd::MkDir(path_join(&self.cwd, &name)));
                     self.busy = Some("Creating folder…".to_string());
+                }
+            }
+        }
+        if self.file_modal {
+            let mut clicked: Option<String> = None;
+            egui::Modal::new(egui::Id::new("fb_newfile")).show(&self.ctx, |m| {
+                m.label(RichText::new("New file").size(14.0).strong());
+                let resp = m.add(
+                    egui::TextEdit::singleline(&mut self.file_name)
+                        .hint_text("notes.txt")
+                        .desired_width(260.0)
+                        .margin(egui::vec2(8.0, 6.0)),
+                );
+                let submitted =
+                    resp.lost_focus() && m.input(|i| i.key_pressed(egui::Key::Enter));
+                m.add_space(8.0);
+                let esc = m.input(|i| i.key_pressed(egui::Key::Escape));
+                m.horizontal(|ui| {
+                    if ui.button("Create").clicked() || submitted {
+                        clicked = Some(self.file_name.trim().to_string());
+                    }
+                    if ui.button("Cancel").clicked() || esc {
+                        clicked = Some(String::new());
+                    }
+                });
+            });
+            if let Some(name) = clicked {
+                self.file_modal = false;
+                if !name.is_empty() {
+                    self.send(FbCmd::MkFile(path_join(&self.cwd, &name)));
+                    self.busy = Some("Creating file…".to_string());
                 }
             }
         }
@@ -714,6 +1033,98 @@ impl FileBrowser {
         }
     }
 
+    /// Names of selected entries that are regular files (downloadable).
+    fn selected_files(&self) -> Vec<String> {
+        self.selected
+            .iter()
+            .filter(|n| {
+                self.entries
+                    .iter()
+                    .any(|e| &e.name == *n && !e.is_dir)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Multi-file upload: pick a whole batch of local files at once, every
+    /// one is queued into this directory.
+    fn upload_many(&mut self) {
+        let paths = rfd::FileDialog::new().pick_files();
+        let Some(paths) = paths.filter(|p| !p.is_empty()) else {
+            return;
+        };
+        let n = paths.len();
+        for p in &paths {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file.bin".to_string());
+            self.send(FbCmd::Upload {
+                remote: path_join(&self.cwd, &name),
+                local: p.display().to_string(),
+            });
+        }
+        self.busy = Some(if n == 1 {
+            "Uploading…".to_string()
+        } else {
+            format!("Uploading {n} files…")
+        });
+    }
+
+    /// Multi-file download: every selected regular file lands in one chosen
+    /// local folder. Selected folders are skipped (SFTP has no FAST-dir copy).
+    fn download_many(&mut self) {
+        let files = self.selected_files();
+        if files.is_empty() {
+            return;
+        }
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title("Choose a folder for the downloads")
+            .pick_folder()
+        else {
+            return;
+        };
+        let skipped = self.selected.len() - files.len();
+        let n = files.len();
+        for name in &files {
+            self.send(FbCmd::Download {
+                remote: path_join(&self.cwd, name),
+                local: dir.join(name).display().to_string(),
+            });
+        }
+        self.busy = Some(match (n, skipped) {
+            (1, 0) => "Downloading…".to_string(),
+            (1, _) => "Downloading 1 file (folders unsupported)…".to_string(),
+            (n, 0) => format!("Downloading {n} files…"),
+            (n, _) => format!("Downloading {n} files (folders unsupported)…"),
+        });
+    }
+
+    /// Delete every selected entry (files and folders).
+    fn delete_selected(&mut self) {
+        let names: Vec<String> = self.selected.iter().cloned().collect();
+        let mut queue: Vec<(String, bool)> = Vec::new();
+        for n in &names {
+            if let Some(e) = self.entries.iter().find(|e| &e.name == n).cloned() {
+                queue.push((path_join(&self.cwd, &e.name), e.is_dir));
+            }
+        }
+        if queue.is_empty() {
+            return;
+        }
+        let n = queue.len();
+        for (path, is_dir) in queue {
+            self.send(FbCmd::Remove { path, is_dir });
+        }
+        self.busy = Some(if n == 1 {
+            "Deleting…".to_string()
+        } else {
+            format!("Deleting {n} items…")
+        });
+        self.selected.clear();
+        self.anchor = None;
+    }
+
     /// WinSCP-style local edit: download to a temp copy, open it in the
     /// selected local editor, and re-upload automatically when that
     /// editor process exits.
@@ -726,7 +1137,11 @@ impl FileBrowser {
         let Some(e) = editors.get(editor_idx) else {
             return;
         };
-        let (ed_name, ed_path) = (e.name.clone(), e.path.clone());
+        self.start_edit_with(cwd, file_name, e.name.clone(), e.path.clone());
+    }
+
+    /// Same as `start_edit` but with the editor resolved by the caller.
+    fn start_edit_with(&mut self, cwd: &str, file_name: &str, ed_name: String, ed_path: String) {
         let remote = path_join(cwd, file_name);
         let mut local = std::env::temp_dir();
         local.push(format!(
@@ -760,6 +1175,12 @@ impl FileBrowser {
             std::process::Command::new(&ed_path)
         };
         cmd.arg(&local);
+        // Snapshot the downloaded copy so the save-watcher can tell an editor
+        // save apart from the initial state.
+        let (snap_len, snap_mtime) = match std::fs::metadata(&local) {
+            Ok(m) => (m.len(), m.modified().ok()),
+            Err(_) => (0, None),
+        };
         match cmd.spawn() {
             Ok(child) => {
                 let file = base_name(&remote);
@@ -768,7 +1189,12 @@ impl FileBrowser {
                     editor: ed_name.clone(),
                     remote,
                     local,
-                    child,
+                    child: Some(child),
+                    snap_len,
+                    snap_mtime,
+                    next_check: std::time::Instant::now() + std::time::Duration::from_millis(500),
+                    started: std::time::Instant::now(),
+                    last_change_seen: std::time::Instant::now(),
                 });
                 push_log(
                     &self.logs,
@@ -851,9 +1277,20 @@ impl FileBrowser {
 // Row
 // ---------------------------------------------------------------------------
 
+/// How a row click should mutate the multi-selection.
+#[derive(Clone, Copy)]
+enum SelectMod {
+    /// Plain click: select only this entry.
+    Plain,
+    /// Ctrl+click: add/remove this entry (also moves the range anchor).
+    Toggle,
+    /// Shift+click: extend the range from the anchor to this entry.
+    Range,
+}
+
 #[derive(Clone, Copy)]
 enum RowAction {
-    Select,
+    Select(SelectMod),
     Open,
     Download,
     Rename,
@@ -887,8 +1324,12 @@ fn file_row(
                 ui.painter().text(
                     tile.center(),
                     Align2::CENTER_CENTER,
-                    if entry.is_dir { "▸" } else { "·" },
-                    FontId::proportional(11.0),
+                    if entry.is_dir {
+                        tglyph::FOLDER_ROW
+                    } else {
+                        tglyph::FILE_ROW
+                    },
+                    theme::icon(11.0),
                     if entry.is_dir { theme::INFO() } else { theme::TEXT_FAINT() },
                 );
                 ui.add(egui::Label::new(RichText::new(&entry.name).size(12.0)).truncate());
@@ -918,8 +1359,17 @@ fn file_row(
     }
 
     let resp = fr.response.interact(Sense::click());
+    // Ctrl+click toggles, Shift+click extends the range (WinSCP behaviour).
+    let mods = ui.input(|i| i.modifiers);
     if resp.clicked() {
-        action = Some(RowAction::Select);
+        let kind = if mods.ctrl {
+            SelectMod::Toggle
+        } else if mods.shift {
+            SelectMod::Range
+        } else {
+            SelectMod::Plain
+        };
+        action = Some(RowAction::Select(kind));
     }
     if resp.double_clicked() {
         action = Some(RowAction::Open);
@@ -1049,6 +1499,17 @@ async fn sftp_task(
                     relist(&sftp, &cur, &evt_tx, &ctx, "Folder created").await;
                 }
                 Err(e) => op_failed(&evt_tx, &ctx, format!("mkdir failed: {e}")),
+            },
+            FbCmd::MkFile(path) => match sftp
+                .open_with_flags(&path, OpenFlags::CREATE | OpenFlags::WRITE)
+                .await
+            {
+                Ok(file) => {
+                    // Close (releases the handle) then re-list.
+                    let _ = file.close().await;
+                    relist(&sftp, &cur, &evt_tx, &ctx, "File created").await;
+                }
+                Err(e) => op_failed(&evt_tx, &ctx, format!("Create file failed: {e}")),
             },
             FbCmd::Remove { path, is_dir } => {
                 let res = if is_dir {
@@ -1230,6 +1691,43 @@ fn mtime_label(secs: u32) -> String {
     chrono::DateTime::from_timestamp(secs as i64, 0)
         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Tool button
+// ---------------------------------------------------------------------------
+
+/// Flat dock tool: an adaptive square with a Tabler glyph; borderless until
+/// hovered (soft accent wash), dimmed and inert when disabled, optional
+/// accent tint for toggles (show-hidden) and the danger tint for Delete.
+fn dock_button(
+    ui: &mut Ui,
+    glyph: char,
+    tint: Color32,
+    tip: &str,
+    width: f32,
+    enabled: bool,
+) -> egui::Response {
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 24.0), sense);
+    let p = ui.painter();
+    let hovered = resp.hovered();
+    if hovered {
+        p.rect_filled(rect.shrink(1.0), 5.0, theme::ACCENT_SOFT());
+    }
+    p.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        glyph,
+        theme::icon(13.0),
+        if enabled { tint } else { theme::TEXT_FAINT() },
+    );
+    let resp = resp.on_hover_text(if enabled {
+        tip.to_string()
+    } else {
+        format!("{tip} — nothing selected yet, right-click rows to select")
+    });
+    resp
 }
 
 // ---------------------------------------------------------------------------
