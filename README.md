@@ -168,9 +168,28 @@ model.
    for full, fast output; state-changing commands (installs, service changes)
    are typed into a real shell tab with start/exit markers, so you can watch
    progress and answer `sudo`/password prompts right in the terminal. The model
-   can choose either mode per call with `in_terminal`.
+   can choose either mode per call with `in_terminal`. Full-screen programs
+   (`htop`, `vim`, `less`, `watch`, `tail -f`) are handed to the tab instead of
+   being mangled by a channel that has no terminal.
 5. Results are filtered by the security layer and fed back so the model can
    summarise or take the next step (multi-step workflows, up to 8 rounds).
+
+**Reliability** — the Copilot is built to be accurate about the machine it is
+talking to, not to guess:
+
+- **It learns what each host runs.** When a probe reveals the OS or package
+  manager (`Alpine`/`apk`, `Debian`/`apt`, …) Culvert remembers it per host and
+  puts it in the next conversation's context, so a fresh chat proposes
+  `sudo apk add …` on Alpine instead of an `apt-get` that cannot exist there.
+- **A failed command comes back with the next step.** A missing package manager
+  is probed and named (`Detected package manager(s): apk (Alpine)`); a program
+  that needs a terminal, or one that refused for lack of root, says so — and
+  the model is told to verify installs with `command -v` / `--version` rather
+  than running the program itself.
+- **`sudo` prompts don't stall a run.** With a saved password, `sudo -S` is fed
+  on the hidden channel and the prompt in a shell tab is answered for you — the
+  password never appears on a command line, on screen, in the audit log or in
+  anything sent to the model.
 
 **Tools it can use** — connect/disconnect sessions, run commands, start/stop
 tunnels, list tunnels and profiles, list/read/download/upload files over SFTP,
