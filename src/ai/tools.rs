@@ -957,7 +957,10 @@ impl Executor {
             }
         };
         let text = out?;
-        let hinted = terminal_needed_hint(&sudo_hint(&text, sudo_pw.is_some()));
+        let hinted = needs_root_hint(
+            &terminal_needed_hint(&sudo_hint(&text, sudo_pw.is_some())),
+            command,
+        );
         // If the shell complained about a missing package manager, probe once
         // and tell the model what this host actually has — local models
         // otherwise guess apt → yum → "try" forever.
@@ -1127,6 +1130,11 @@ impl Executor {
 /// to the channel's stdin — the same thing `ssh -t` plus typing does. The
 /// password never appears on the command line, in the audit log or to the
 /// model. Returns the (possibly rewritten) command plus the stdin data.
+pub(crate) fn sudo_password(profile: &SshSession) -> Option<String> {
+    (profile.auth_type == AuthType::Password && !profile.password.is_empty())
+        .then(|| profile.password.clone())
+}
+
 fn prepare_exec(profile: &SshSession, command: &str) -> (String, Option<String>) {
     if profile.auth_type != AuthType::Password || profile.password.is_empty() {
         return (command.to_string(), None);
@@ -1341,6 +1349,36 @@ pub(crate) fn interactive_program(command: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Next-step note when a command failed because it needs root: apk says
+/// "Unable to open log: Permission denied", apt "Could not open lock file",
+/// yum "you cannot perform this operation unless you are root", and so on. The
+/// model that forgot `sudo` otherwise reads this as "the package failed to
+/// install" and gives up (or worse, claims success).
+pub(crate) fn needs_root_hint(out: &str, command: &str) -> String {
+    if command.contains("sudo") {
+        return out.to_string();
+    }
+    let low = out.to_lowercase();
+    let refused = [
+        "must be run as root",
+        "you must be root",
+        "are you root?",                              // emerge
+        "has to be run with superuser privileges",    // zypper
+        "unless you are root",                        // yum/dnf
+        "unable to open log",                         // apk
+        "could not open lock file",                   // apt
+    ]
+    .iter()
+    .any(|sig| low.contains(sig));
+    if refused {
+        format!(
+            "{out}\n[hint] this needed root and failed for that reason (nothing was installed). Retry the same command prefixed with `sudo` — Culvert feeds the saved profile password, so no prompt is needed."
+        )
+    } else {
+        out.to_string()
+    }
 }
 
 /// Next-step note when a program failed because the exec channel has no PTY.

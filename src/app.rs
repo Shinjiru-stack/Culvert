@@ -97,6 +97,12 @@ struct AiTermRun {
     /// Interactive programs are handed over to the user: the run completes as
     /// soon as the command is typed, instead of waiting for an exit marker.
     wait_for_exit: bool,
+    /// How many times `sudo`'s password prompt has been answered for this run.
+    sudo_fed: u8,
+    /// When the prompt was first seen. `sudo` can still have terminal echo on
+    /// for the instant between printing the prompt and turning it off, so the
+    /// password is typed a beat later instead of the moment the prompt shows.
+    sudo_prompt_at: Option<std::time::Instant>,
     armed_at: std::time::Instant,
     sent_at: std::time::Instant,
 }
@@ -129,6 +135,26 @@ impl AiTermRun {
     }
 }
 
+/// Remove a secret from text captured off the screen.
+fn scrub_secret(text: String, secret: Option<&str>) -> String {
+    match secret {
+        Some(s) if !s.is_empty() => text.replace(s, "[REDACTED]"),
+        _ => text,
+    }
+}
+
+/// Is the shell waiting at `sudo`'s password prompt? That prompt is always the
+/// last thing on screen — nothing else prints until it is answered.
+fn at_sudo_prompt(screen: &str) -> bool {
+    let last = screen
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    last.starts_with("[sudo] password for") && last.ends_with(':')
+}
+
 /// Pull `(exit status, output)` out of the screen once the exit marker is in
 /// it. `None` while the marker has not appeared yet.
 fn ai_term_result(screen: &str, run: &AiTermRun) -> Option<String> {
@@ -155,6 +181,9 @@ fn ai_term_result(screen: &str, run: &AiTermRun) -> Option<String> {
     };
     let body = body
         .lines()
+        // The prompt is answered for the user; the model does not need it (and
+        // it must never carry anything typed into it).
+        .filter(|l| !l.trim_start().starts_with("[sudo] password for"))
         .map(|l| l.trim_end())
         .collect::<Vec<_>>()
         .join("\n");
@@ -162,7 +191,7 @@ fn ai_term_result(screen: &str, run: &AiTermRun) -> Option<String> {
     let mut body = if body.is_empty() {
         "(no output)".to_string()
     } else {
-        body.to_string()
+        crate::ai::tools::needs_root_hint(body, &run.command)
     };
     if let Some(hint) = crate::ai::tools::terminal_pm_hint(&body, probe) {
         body.push('\n');
@@ -627,6 +656,8 @@ impl TunnelApp {
                 opened: false,
                 sent: false,
                 wait_for_exit: crate::ai::tools::interactive_program(command).is_none(),
+                sudo_fed: 0,
+                sudo_prompt_at: None,
                 armed_at: std::time::Instant::now(),
                 sent_at: std::time::Instant::now(),
             });
@@ -642,6 +673,14 @@ impl TunnelApp {
         let Some(mut run) = self.ai_term.take() else {
             return;
         };
+        // A `sudo` prompt blocks a command typed into the tab; the saved login
+        // password answers it (through the PTY, so it is never echoed, never on
+        // the command line, never in the audit log and never sent to the model).
+        let sudo_pw = self
+            .sessions
+            .iter()
+            .find(|s| s.id == run.session_id)
+            .and_then(crate::ai::tools::sudo_password);
         // A cancelled turn no longer wants the answer: stop waiting. The
         // command, if it was already typed, keeps running in its tab.
         if !self.ai.busy {
@@ -701,8 +740,35 @@ impl TunnelApp {
             self.ai_term = Some(run);
             return;
         }
+        // Answer `sudo`'s password prompt while the command waits for it. The
+        // prompt is the last line on screen and nothing else prints until it is
+        // answered, so matching it is unambiguous; two attempts let a rejected
+        // password fail visibly instead of looping.
+        if run.sudo_fed < 2 {
+            if let Some(pw) = sudo_pw.as_deref() {
+                if at_sudo_prompt(&term.visible_text()) {
+                    match run.sudo_prompt_at {
+                        // First sighting: wait for `sudo` to switch echo off.
+                        None => run.sudo_prompt_at = Some(std::time::Instant::now()),
+                        Some(seen)
+                            if seen.elapsed() >= Duration::from_millis(400) =>
+                        {
+                            term.send_bytes(format!("{pw}\n").into_bytes());
+                            run.sudo_fed += 1;
+                            run.sudo_prompt_at = None;
+                            ctx.request_repaint();
+                        }
+                        _ => {}
+                    }
+                } else {
+                    run.sudo_prompt_at = None;
+                }
+            }
+        }
         if let Some(result) = ai_term_result(&term.visible_text(), &run) {
-            self.ai.complete_action(run.id, result);
+            // Belt and braces: if the password ever reached the screen it must
+            // not travel on to the model or the audit log.
+            self.ai.complete_action(run.id, scrub_secret(result, sudo_pw.as_deref()));
             ctx.request_repaint();
             return;
         }
@@ -5635,6 +5701,8 @@ mod tests {
             opened: false,
             sent: false,
             wait_for_exit: true,
+            sudo_fed: 0,
+            sudo_prompt_at: None,
             armed_at: std::time::Instant::now(),
             sent_at: std::time::Instant::now(),
         }
@@ -5679,6 +5747,77 @@ mod tests {
 
         // Still running: no marker on screen yet.
         assert!(ai_term_result("user@host:~$ df -h\n", &run).is_none());
+    }
+
+    /// A package manager run without root fails with a permission error; the
+    /// hint says what to do instead of letting the model call it "installed".
+    #[test]
+    fn root_refusal_gets_a_sudo_hint() {
+        let refused = "ERROR: Unable to open log: Permission denied";
+        let hinted = crate::ai::tools::needs_root_hint(refused, "apk add ncdu");
+        assert!(hinted.contains("prefixed with `sudo`"), "{hinted}");
+        // Already running under sudo: nothing to add.
+        assert_eq!(
+            crate::ai::tools::needs_root_hint(refused, "sudo apk add ncdu"),
+            refused
+        );
+        // Unrelated failures are untouched.
+        assert_eq!(
+            crate::ai::tools::needs_root_hint("cat: nope: No such file", "cat nope"),
+            "cat: nope: No such file"
+        );
+
+        let run = sample_term_run("apk add ncdu");
+        let screen = format!(
+            "{}\nERROR: Unable to open log: Permission denied\n{}99>>>\nuser@host:~$ ",
+            run.start_tag(),
+            run.exit_tag()
+        );
+        let out = ai_term_result(&screen, &run).expect("marker present");
+        assert!(out.starts_with("[exit 99]"), "{out}");
+        assert!(out.contains("prefixed with `sudo`"), "{out}");
+    }
+
+    /// The saved password answers `sudo`'s prompt while a terminal run waits,
+    /// and the prompt line never reaches the model.
+    #[test]
+    fn sudo_prompt_is_detected_and_hidden_from_the_output() {
+        assert!(at_sudo_prompt(
+            "some output\n[sudo] password for linuxio: "
+        ));
+        assert!(!at_sudo_prompt("[sudo] password for linuxio: \n$ "));
+        assert!(!at_sudo_prompt("this log line mentions [sudo] password for bob"));
+        assert!(!at_sudo_prompt(""));
+
+        let run = sample_term_run("sudo apk add htop");
+        let screen = format!(
+            "{}\n[sudo] password for linuxio:\nOK: 45 MiB\n{}0>>>\nuser@host:~$ ",
+            run.start_tag(),
+            run.exit_tag()
+        );
+        let out = ai_term_result(&screen, &run).expect("marker present");
+        assert!(!out.contains("password for"), "{out}");
+        assert!(out.contains("OK: 45 MiB"), "{out}");
+    }
+
+    /// A password that reached the screen (echo race with sudo) must not travel
+    /// on to the model, the card or the audit log.
+    #[test]
+    fn echoed_password_is_scrubbed_from_the_result() {
+        let run = sample_term_run("sudo apk add ncdu");
+        let screen = format!(
+            "{}\n[sudo] password for linuxio:\nhunter2\n(1/1) Installing ncdu\n{}0>>>\n",
+            run.start_tag(),
+            run.exit_tag()
+        );
+        let out = ai_term_result(&screen, &run).expect("marker present");
+        assert!(out.contains("hunter2"), "the screen itself still has it: {out}");
+        let scrubbed = scrub_secret(out, Some("hunter2"));
+        assert!(!scrubbed.contains("hunter2"), "{scrubbed}");
+        assert!(scrubbed.contains("[REDACTED]"), "{scrubbed}");
+        assert!(scrubbed.contains("Installing ncdu"), "{scrubbed}");
+        // No secret configured → text is untouched.
+        assert_eq!(scrub_secret("plain".into(), None), "plain");
     }
 
     /// A failed install gets the host's real package manager appended, and the
