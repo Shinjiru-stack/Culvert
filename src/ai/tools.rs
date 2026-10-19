@@ -1278,18 +1278,20 @@ mod tests {
     }
 
     /// Live probe: the exact production path (prepare_exec + stdin feed)
-    /// against the docker test server. Run with:
+    /// against the demo server. Prefers the real saved profile (host
+    /// 127.0.0.1:2222 or a name containing "linux test"), falling back to
+    /// the repo's throwaway test credentials. Run with:
     /// `cargo test -- --ignored --nocapture sudo_exec`
-    ///
-    /// The demo container's `linuxio` is intentionally not a sudoer, so the
-    /// assertion checks the mechanism (the password is fed — sudo no longer
-    /// reports a missing terminal) rather than root access.
     #[test]
     #[ignore = "needs the local docker ssh test server on 127.0.0.1:2222"]
     fn sudo_exec_feeds_saved_password() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let session = SshSession {
+            let saved = crate::session::load_sessions().into_iter().find(|s| {
+                s.name.to_lowercase().contains("linux test")
+                    || (s.host == "127.0.0.1" && s.port == 2222)
+            });
+            let session = saved.unwrap_or_else(|| SshSession {
                 name: "probe".into(),
                 host: "127.0.0.1".into(),
                 port: 2222,
@@ -1297,7 +1299,15 @@ mod tests {
                 auth_type: AuthType::Password,
                 password: "test123".into(),
                 ..SshSession::default()
-            };
+            });
+            println!(
+                "profile: {} ({}@{}, auth {:?}, password saved: {})",
+                session.name,
+                session.username,
+                session.host,
+                session.auth_type,
+                !session.password.is_empty()
+            );
             let logs: SharedLogs = Arc::new(Mutex::new(Vec::new()));
             let mut ex = Executor::new();
             let out = ex
@@ -1310,9 +1320,14 @@ mod tests {
                 "the saved password must reach sudo's stdin: {out}"
             );
             if out.contains("is not in the sudoers file") {
-                println!("note: linuxio is not a sudoer on this container (expected)");
+                println!("finding: sudo policy denies this account (not a sudoer) on this host");
+            } else if out.contains("Sorry, try again") || out.contains("incorrect password attempt") {
+                println!(
+                    "finding: sudo rejected the saved password — it differs from the login password"
+                );
             } else {
                 assert!(out.contains("root"), "sudo must authenticate: {out}");
+                println!("finding: sudo authenticated with the saved password");
             }
         });
     }

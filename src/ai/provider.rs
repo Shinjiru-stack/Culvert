@@ -1,7 +1,7 @@
 //! Provider-agnostic LLM layer.
 //!
 //! One [`Provider`] value wraps any backend: the OpenAI-compatible family
-//! (OpenRouter, OpenAI, Ollama, custom endpoints) speaks `/chat/completions`
+//! (OpenRouter, OpenAI, Groq, Ollama, custom endpoints) speaks `/chat/completions`
 //! with SSE streaming; Gemini and Anthropic get native wire formats. All
 //! callers (engine, settings UI) use [`Provider::chat`] and
 //! [`Provider::list_models`] and never touch provider differences.
@@ -89,7 +89,7 @@ pub struct ChatReply {
 pub enum Flavor {
     OpenRouter,
     OpenAi,
-    Grok,
+    Groq,
     Ollama,
     Gemini,
     Anthropic,
@@ -100,7 +100,7 @@ impl Flavor {
     pub const ALL: [Flavor; 7] = [
         Flavor::OpenRouter,
         Flavor::OpenAi,
-        Flavor::Grok,
+        Flavor::Groq,
         Flavor::Ollama,
         Flavor::Gemini,
         Flavor::Anthropic,
@@ -111,7 +111,7 @@ impl Flavor {
         match self {
             Flavor::OpenRouter => "openrouter",
             Flavor::OpenAi => "openai",
-            Flavor::Grok => "grok",
+            Flavor::Groq => "groq",
             Flavor::Ollama => "ollama",
             Flavor::Gemini => "gemini",
             Flavor::Anthropic => "anthropic",
@@ -122,7 +122,7 @@ impl Flavor {
     pub fn from_id(id: &str) -> Flavor {
         match id {
             "openai" => Flavor::OpenAi,
-            "grok" => Flavor::Grok,
+            "groq" => Flavor::Groq,
             "ollama" => Flavor::Ollama,
             "gemini" => Flavor::Gemini,
             "anthropic" => Flavor::Anthropic,
@@ -135,7 +135,7 @@ impl Flavor {
         match self {
             Flavor::OpenRouter => "OpenRouter",
             Flavor::OpenAi => "OpenAI",
-            Flavor::Grok => "Grok (xAI)",
+            Flavor::Groq => "Groq",
             Flavor::Ollama => "Ollama (local)",
             Flavor::Gemini => "Google Gemini",
             Flavor::Anthropic => "Anthropic",
@@ -147,7 +147,7 @@ impl Flavor {
         match self {
             Flavor::OpenRouter => "https://openrouter.ai/api/v1",
             Flavor::OpenAi => "https://api.openai.com/v1",
-            Flavor::Grok => "https://api.x.ai/v1",
+            Flavor::Groq => "https://api.groq.com/openai/v1",
             Flavor::Ollama => "http://localhost:11434/v1",
             Flavor::Gemini => "https://generativelanguage.googleapis.com/v1beta",
             Flavor::Anthropic => "https://api.anthropic.com",
@@ -159,7 +159,7 @@ impl Flavor {
         match self {
             Flavor::OpenRouter => "sk-or-…",
             Flavor::OpenAi => "sk-…",
-            Flavor::Grok => "xai-…",
+            Flavor::Groq => "gsk_…",
             Flavor::Ollama => "not required for a local Ollama",
             Flavor::Gemini => "AIza…",
             Flavor::Anthropic => "sk-ant-…",
