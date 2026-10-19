@@ -29,6 +29,11 @@ russh-sftp = "2"
 # pulls arboard for its own TextEdit paste handling, so this adds no new
 # native dependencies).
 arboard = "3"
+# AI Copilot: HTTP to OpenAI-compatible / Gemini / Anthropic endpoints
+# (native-tls = schannel on Windows) and SSE stream decoding.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls"] }
+futures-util = "0.3"
+regex = "1"
 
 [build-dependencies]
 winresource = "0.1"

@@ -4,6 +4,7 @@
 //! tab), a tabbed workspace whose first tab is the tunnel manager, and a
 //! one-line status bar. Everything is UI-driven — no commands anywhere.
 
+use crate::ai::{AiPanel, UiAction};
 use crate::log::{push_log, LogEntry, LogLevel, SharedLogs};
 use crate::session::{
     load_groups, load_sessions, load_tunnels, save_groups, save_sessions, save_tunnels, AuthType,
@@ -73,6 +74,8 @@ pub struct TunnelApp {
     split_ratio: f32,
     /// Quick-connect target input: user@host:port.
     quick_connect: String,
+    /// AI Copilot: right-hand chat panel + engine channels + settings.
+    ai: AiPanel,
 }
 
 enum Tab {
@@ -365,6 +368,7 @@ impl TunnelApp {
         let groups = load_groups();
         let standalone_tunnels = load_tunnels();
         let selected = sessions.first().map(|s| s.id.clone());
+        let ai = AiPanel::new(rt.clone(), logs.clone());
         Self {
             sessions,
             groups,
@@ -395,6 +399,7 @@ impl TunnelApp {
             snippets_backup: Vec::new(),
             split_ratio: 0.5,
             quick_connect: String::new(),
+            ai,
         }
     }
 
@@ -428,6 +433,180 @@ impl TunnelApp {
         if let Some((_, fb)) = self.docked.take() {
             fb.close();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // AI Copilot glue
+    // -----------------------------------------------------------------------
+
+    /// Build the context snapshot the Copilot engine sees each frame. Prompt
+    /// text is built only from the summary fields — `profiles` carries
+    /// credentials for the executors and never reaches a model.
+    fn ai_snapshot(&self) -> crate::ai::UiContext {
+        let dock = self.docked.as_ref().map(|(sid, fb)| crate::ai::CtxDock {
+            session_id: sid.clone(),
+            cwd: fb.cwd().to_string(),
+            selected: fb.selected_file().map(|s| s.to_string()),
+        });
+        let open_session_ids: Vec<String> = self
+            .tabs
+            .iter()
+            .filter_map(|t| match t {
+                Tab::Terminal(term) => Some(term.session_id.clone()),
+                Tab::Tunnels => None,
+            })
+            .collect();
+        let profiles_summary = self
+            .sessions
+            .iter()
+            .map(|s| crate::ai::CtxSession {
+                id: s.id.clone(),
+                name: session_display_name(s),
+                host: s.host.clone(),
+                username: s.username.clone(),
+                protocol: match s.protocol {
+                    Protocol::Ssh => "ssh".to_string(),
+                    Protocol::Rdp => "rdp".to_string(),
+                },
+                group: s.group.clone(),
+            })
+            .collect();
+        let mut tunnels = Vec::new();
+        for s in &self.sessions {
+            for f in &s.forwards {
+                let key = forward_key(&s.id, &f.id);
+                tunnels.push(crate::ai::CtxTunnel {
+                    key: key.clone(),
+                    session_label: session_display_name(s),
+                    summary: forward_desc(f),
+                    running: self.tunnels.is_running(&key),
+                    auto_reconnect: f.auto_reconnect,
+                });
+            }
+        }
+        for t in &self.standalone_tunnels {
+            for f in &t.forwards {
+                let key = forward_key(&t.id, &f.id);
+                tunnels.push(crate::ai::CtxTunnel {
+                    key: key.clone(),
+                    session_label: t.label(),
+                    summary: forward_desc(f),
+                    running: self.tunnels.is_running(&key),
+                    auto_reconnect: f.auto_reconnect,
+                });
+            }
+        }
+        crate::ai::UiContext {
+            active_session_id: self.focused_file_session_id(),
+            open_session_ids,
+            dock,
+            profiles_summary,
+            tunnels,
+            profiles: self.sessions.clone(),
+        }
+    }
+
+    /// Execute a Copilot UI action with the app's own code paths and answer
+    /// the engine with a human-readable result.
+    fn ai_apply_action(&mut self, ctx: &egui::Context, action: &UiAction) -> String {
+        match action {
+            UiAction::OpenSession { session_id } => {
+                let name = self
+                    .sessions
+                    .iter()
+                    .find(|s| &s.id == session_id)
+                    .map(session_display_name)
+                    .unwrap_or_else(|| session_id.clone());
+                self.open_session(ctx, session_id);
+                format!("Opened the session '{name}'.")
+            }
+            UiAction::CloseSession { session_id } => match self.find_tab_for_session(session_id) {
+                Some(i) => {
+                    self.close_tab(i);
+                    "Closed the session window.".to_string()
+                }
+                None => "That session has no open window right now.".to_string(),
+            },
+            UiAction::StartTunnel { key } => {
+                if self.tunnels.is_running(key) {
+                    return "That tunnel is already running.".to_string();
+                }
+                let Some((session, forward)) = self.locate_tunnel(key) else {
+                    return "That tunnel no longer exists.".to_string();
+                };
+                match self.tunnels.start(&session, &forward) {
+                    Ok(()) => {
+                        push_log(
+                            &self.logs,
+                            LogEntry::new(
+                                LogLevel::Info,
+                                "AI",
+                                &format!("tunnel started · {}", forward_desc(&forward)),
+                            ),
+                        );
+                        format!("Tunnel started: {}.", forward_desc(&forward))
+                    }
+                    Err(e) => format!("Could not start the tunnel: {e}"),
+                }
+            }
+            UiAction::StopTunnel { key } => {
+                if !self.tunnels.is_running(key) {
+                    return "That tunnel is not running.".to_string();
+                }
+                self.tunnels.stop(key);
+                "Tunnel stopped.".to_string()
+            }
+            UiAction::DockNavigate { session_id, path } => {
+                self.sidebar_collapsed = false;
+                self.side_mode = SideMode::Files;
+                match &self.docked {
+                    Some((sid, fb)) if sid == session_id => {
+                        fb.navigate(path);
+                        format!("File browser navigated to {path}.")
+                    }
+                    _ => {
+                        "The file browser is not showing that session right now — open its shell window first, then ask again."
+                            .to_string()
+                    }
+                }
+            }
+            UiAction::OpenFile { session_id, path } => {
+                self.sidebar_collapsed = false;
+                self.side_mode = SideMode::Files;
+                match &mut self.docked {
+                    Some((sid, fb)) if sid == session_id => {
+                        fb.open_path_in_editor(path);
+                        format!(
+                            "Opened {path} in the local editor; saves re-upload automatically."
+                        )
+                    }
+                    _ => {
+                        "The file browser is not showing that session right now — open its shell window first, then ask again."
+                            .to_string()
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve a forward key back to the owning session + forward (saved
+    /// sessions first, then standalone tunnels).
+    fn locate_tunnel(&self, key: &str) -> Option<(SshSession, PortForward)> {
+        for s in &self.sessions {
+            for f in &s.forwards {
+                if forward_key(&s.id, &f.id) == key {
+                    return Some((s.clone(), f.clone()));
+                }
+            }
+        }
+        for t in &self.standalone_tunnels {
+            for f in &t.forwards {
+                if forward_key(&t.id, &f.id) == key {
+                    return Some((t.to_ssh_session(), f.clone()));
+                }
+            }
+        }
+        None
     }
 
     /// Swap the docked browser when the focused (connected) session changes:
@@ -1313,6 +1492,17 @@ impl TunnelApp {
                     self.sidebar_collapsed = true;
                     menu.close();
                 }
+                menu.separator();
+                if menu.checkbox(&mut self.ai.open, "AI Copilot").changed() {
+                    if self.ai.open && self.ai.needs_setup() {
+                        self.ai.open_settings();
+                    }
+                    menu.close();
+                }
+                if menu.button("AI Copilot settings…").clicked() {
+                    self.ai.open_settings();
+                    menu.close();
+                }
             });
 
             // -- Tools ---------------------------------------------------------
@@ -1459,6 +1649,28 @@ impl TunnelApp {
             self.close_tab(i);
         }
 
+        // AI Copilot: start the engine on first frame, publish this frame's
+        // context snapshot, drain engine events and execute any UI action it
+        // asked for (the engine itself never touches app state).
+        self.ai.ensure_engine(ctx);
+        {
+            let snap = self.ai_snapshot();
+            if let Ok(mut w) = self.ai.snapshot.write() {
+                *w = snap;
+            }
+        }
+        if self.ai.poll() {
+            ctx.request_repaint();
+        }
+        if let Some((id, action, _label)) = self.ai.take_action() {
+            let result = self.ai_apply_action(ctx, &action);
+            self.ai.complete_action(id, result);
+            ctx.request_repaint();
+        }
+        if self.ai.settings_modal(ctx) {
+            self.toast(ToastKind::Success, "AI Copilot settings saved");
+        }
+
         // Global shortcuts (never while a shell has the keyboard).
         if !self.terminal_focused(ctx) {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
@@ -1547,6 +1759,27 @@ impl TunnelApp {
                         .inner_margin(Margin::symmetric(2, 6)),
                 )
                 .show(ctx, |ui| self.right_rail(ui, ctx));
+
+            // AI Copilot sits between the rail and the workspace; resizable
+            // and collapsible like the session sidebar.
+            if self.ai.open {
+                egui::SidePanel::right("ai_copilot")
+                    .resizable(true)
+                    .default_width(370.0)
+                    .width_range(300.0..=560.0)
+                    .frame(
+                        Frame::NONE
+                            .fill(theme::BG_PANEL())
+                            .stroke(Stroke::new(1.0_f32, theme::BORDER()))
+                            .inner_margin(Margin {
+                                left: 10,
+                                right: 10,
+                                top: 10,
+                                bottom: 8,
+                            }),
+                    )
+                    .show(ctx, |ui| self.ai.panel_ui(ui, ctx));
+            }
 
             egui::CentralPanel::default()
                 .frame(Frame::NONE.fill(theme::BG_WINDOW()).inner_margin(Margin::symmetric(12, 8)))
@@ -2084,6 +2317,21 @@ impl TunnelApp {
             {
                 self.show_logs = !self.show_logs;
             }
+            if tool_button(
+                ui,
+                tglyph::COPILOT,
+                theme::VIOLET(),
+                "Copilot",
+                self.ai.open,
+                "AI Copilot — control your servers in natural language",
+            )
+            .clicked()
+            {
+                self.ai.open = !self.ai.open;
+                if self.ai.open && self.ai.needs_setup() {
+                    self.ai.open_settings();
+                }
+            }
         });
     }
 
@@ -2445,6 +2693,11 @@ impl TunnelApp {
             let (title_bar, _) = ui.allocate_exact_size(egui::vec2(4.0, 30.0), Sense::hover());
             ui.painter().rect_filled(title_bar, 2.0, theme::ACCENT());
             ui.vertical(|ui| {
+                // Reserve room for the action first: on a narrow canvas (e.g.
+                // with the AI Copilot panel open) the description must wrap
+                // before the button, never run underneath it.
+                let reserve = 118.0;
+                ui.set_max_width((ui.available_width() - reserve).max(160.0));
                 ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(
                     RichText::new("Port forwarding")
@@ -4972,6 +5225,15 @@ fn forward_desc(f: &PortForward) -> String {
             f.listen_host, f.listen_port, f.dest_host, f.dest_port
         ),
         ForwardType::Dynamic => format!("SOCKS5 proxy on {}:{}", f.listen_host, f.listen_port),
+    }
+}
+
+/// Display name for a session: its label, falling back to user@host:port.
+fn session_display_name(s: &SshSession) -> String {
+    if s.name.trim().is_empty() {
+        s.connection_label()
+    } else {
+        s.name.trim().to_string()
     }
 }
 

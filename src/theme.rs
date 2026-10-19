@@ -70,6 +70,18 @@ pub mod tglyph {
     /// Directory / file row glyphs for the SFTP listing.
     pub const FOLDER_ROW: char = '\u{eaad}';
     pub const FILE_ROW: char = '\u{eaa4}';
+
+    /// AI Copilot: sparkles on the toolbar tile, robot + bolt in the panel,
+    /// shield on approval/security cards, gear/history/send in the chrome.
+    pub const COPILOT: char = '\u{f6d7}';
+    pub const BOT: char = '\u{f00b}';
+    pub const BOLT: char = '\u{ea38}';
+    pub const SHIELD: char = '\u{eb24}';
+    pub const SEND: char = '\u{eb1e}';
+    pub const GEAR: char = '\u{eb20}';
+    pub const HISTORY: char = '\u{ebea}';
+    /// x (close)
+    pub const CLOSE: char = '\u{78}';
 }
 
 // ---------------------------------------------------------------------------

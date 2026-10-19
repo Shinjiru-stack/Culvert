@@ -27,7 +27,7 @@ small, self-contained tool, out of sight and out of the way.
   any session to open a shell tab (right-click for edit/duplicate/delete).
 - **Full menu bar** — Terminal / Sessions / View / Tools / Macros / Help above
   a flat tile toolbar (Session · Tunnel · Sessions · Files · Split ·
-  Activity), all wired to real actions.
+  Activity · Copilot), all wired to real actions.
 - **Windows RDP pass-through** — double-click an RDP session to launch the
   system RDP client with saved credentials seeded into Windows Credential
   Manager; loopback targets (WSL/docker relays at `127.0.0.1`) are remapped to
@@ -71,6 +71,12 @@ small, self-contained tool, out of sight and out of the way.
   retrying). The switch can be flipped live even while the tunnel is running.
 - **Tab management** — right-click any terminal tab: close it, close others,
   close tabs to the right or all of them, browser-style.
+- **AI Copilot** — a natural-language control layer on top of everything
+  above: ask “check disk space on the demo host”, “tail the nginx errors” or
+  “start the database tunnel” in the right-hand chat panel. The model only
+  *proposes* structured tool calls; Culvert validates and runs them, and every
+  state-changing or destructive action waits behind an approval card. Read-only
+  commands run straight away. See [AI Copilot](#ai-copilot).
 - **Classic desktop chrome** — clean light-gray Windows-style chrome with a
   `#0078D7` blue accent, Segoe UI for the interface and Consolas in the
   terminal, like the terminal suites you already know.
@@ -111,6 +117,13 @@ palette (chrome, cards and terminal canvas); the choice persists:
 
 ![Dark theme](docs/screenshots/theme-dark.png)
 
+**AI Copilot** — ask in plain language; the model proposes tool calls, Culvert
+runs them after risk classification, and anything sensitive is gated or
+redacted before it ever reaches the provider (the `[REDACTED]` result below is
+what the model actually received):
+
+![AI Copilot](docs/screenshots/ai-copilot.png)
+
 ## Download
 
 Grab `culvert-<version>-windows-x64.zip` from the
@@ -139,6 +152,59 @@ fresh release automatically (see [Release automation](#release-automation)).
 The tunnel editor explains the selected type in one line and validates every
 field before saving.
 
+## AI Copilot
+
+The Copilot is a first-class panel (toolbar tile **Copilot**, or *View → AI
+Copilot*) — not a separate app. It drives the same SSH connections, tunnels and
+file transfers the rest of Culvert uses.
+
+**How it works**
+
+1. You describe what you want in plain language.
+2. The model replies with structured **tool calls** (e.g. `execute_command`,
+   `read_file`, `start_tunnel`) — it never runs anything itself.
+3. Culvert validates each call, classifies its risk, and either runs it
+   immediately (read-only commands like `ls`, `cat`, `grep`, `df`, `docker ps`,
+   `journalctl`) or shows an **approval card** with the exact planned action —
+   *Execute · Edit · Cancel*. Destructive commands (`rm`, `reboot`, `mkfs`,
+   `userdel`, `drop database`, …) always ask, shown in red.
+4. Results are filtered by the security layer and fed back so the model can
+   summarise or take the next step (multi-step workflows, up to 8 rounds).
+
+**Tools it can use** — connect/disconnect sessions, run commands, start/stop
+tunnels, list tunnels and profiles, list/read/download/upload files over SFTP,
+search files by name/size/age, server health (CPU, memory, disk, uptime), and
+open files in your local editor. Context — active session, file-browser
+directory, selected file, running tunnels, saved profiles — is attached
+automatically, so `/var/log/nginx` in the file browser plus *“Show the latest
+errors”* just works.
+
+**Providers** — OpenRouter, OpenAI, Ollama (fully local), Google Gemini,
+Anthropic, or any custom OpenAI-compatible endpoint. The settings panel has
+provider, API key, base URL, model (with a *Fetch models* helper), temperature,
+a streaming toggle and a *Test connection* button.
+
+**Security layer** — nothing sensitive leaves the machine unchecked. Culvert
+detects private keys, certificates, passwords, tokens, API keys, connection
+strings, JWTs, Vault/AWS/Azure credentials and sensitive files (`*.pem`,
+`*.key`, `.env*`, `kubeconfig`, `id_rsa`, …) in anything a tool returns:
+
+- **STRICT** — the model only ever sees (redacted) command output; file
+  contents are blocked outright.
+- **BALANCED** (default) — file contents are allowed but auto-redacted;
+  sensitive sources stop at a gate first.
+- **FULL ACCESS** — everything may be sent, with one explicit confirmation per
+  sensitive finding.
+- Local models (Ollama / loopback URLs) skip redaction — nothing leaves the
+  machine.
+
+At a gate you choose **Send original / Send redacted / Cancel** per payload,
+and redacted values appear as `[REDACTED]` markers.
+
+**Audit trail** — every request, tool call, approval, file access and security
+decision is listed in the panel's *History* tab and appended to
+`%APPDATA%\culvert\ai-audit.log`.
+
 ## Keyboard shortcuts
 
 | Shortcut | Action |
@@ -156,6 +222,9 @@ Sessions (including credentials) are stored as JSON:
   next to it in `groups.json`, `snippets.json` and `tunnels.json`)
 - Linux/macOS: `~/.config/culvert/sessions.json`
 
+The AI Copilot keeps its settings (provider, model, security mode) in
+`ai.json` next to those, with the audit trail in `ai-audit.log`.
+
 Upgrading from an earlier build? Your sessions are imported automatically from
 the old `ssh-tunnel-manager` folder the first time Culvert runs.
 
@@ -164,7 +233,10 @@ the old `ssh-tunnel-manager` folder the first time Culvert runs.
 - Passwords and key passphrases are kept in plain JSON on your machine for reuse
   convenience (the same trade-off desktop SSH clients traditionally make).
   Protect your user profile; consider a dedicated key without a passphrase
-  otherwise.
+  otherwise. The AI provider API key lives in `ai.json` under the same rules.
+- The Copilot never sends raw tool output to a cloud provider without passing
+  the redaction layer, and remote actions only ever run through Culvert's own
+  SSH/SFTP stack (the same code paths as the UI) after risk classification.
 - Unknown server host keys are currently accepted automatically. Pin
   `known_hosts` in `src/ssh.rs` (`check_server_key`) before using this in an
   environment where MITM protection matters.
@@ -210,6 +282,7 @@ workflow tags and publishes that version automatically.
 | `src/tunnel.rs` | Per-tunnel forward engine: `-L`/`-R`/`-D`, SOCKS5, manager |
 | `src/session.rs` | Session/forward models, validation, JSON persistence |
 | `src/log.rs` | Activity log types |
+| `src/ai/` | AI Copilot: provider layer, agent engine, tool registry, security/redaction, panel UI |
 | `build.rs` | Embeds the icon + metadata into the Windows `.exe` |
 | `assets/` | Brand icon and bundled UI fonts (Inter, JetBrains Mono) |
 | `tests/docker/` | Test servers: SSH container and an xrdp 0.10 RDP container for verifying RDP hand-off (`refresh-rdp.sh`) |

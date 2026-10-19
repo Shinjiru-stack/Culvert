@@ -286,6 +286,37 @@ impl FileBrowser {
         let _ = self.cmd_tx.send(FbCmd::Close);
     }
 
+    /// Current directory (for the AI context snapshot).
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    /// First selected entry, if any (for the AI context snapshot).
+    pub fn selected_file(&self) -> Option<&str> {
+        self.selected.iter().next().map(|s| s.as_str())
+    }
+
+    /// Navigate to a directory (used by AI Copilot actions).
+    pub fn navigate(&self, path: &str) {
+        self.send(FbCmd::Navigate(path.to_string()));
+    }
+
+    /// Open a remote file in the configured editor (first entry, Notepad
+    /// fallback) — the same path a double-click takes.
+    pub fn open_path_in_editor(&mut self, path: &str) {
+        let dir = path_parent(path);
+        let name = base_name(path);
+        let editors = self
+            .editors
+            .read()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        match editors.first() {
+            Some(e) => self.start_edit_with(&dir, &name, e.name.clone(), e.path.clone()),
+            None => self.start_edit_with(&dir, &name, "Notepad".into(), "notepad.exe".into()),
+        }
+    }
+
     fn send(&self, cmd: FbCmd) {
         let _ = self.cmd_tx.send(cmd);
     }
