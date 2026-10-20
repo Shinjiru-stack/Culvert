@@ -1386,6 +1386,11 @@ pub(crate) fn needs_root_hint(out: &str, command: &str) -> String {
 /// trying every variant of the same idea (systemctl → init.d → rc-service → …).
 pub(crate) fn diagnostic_hint(out: &str) -> String {
     let low = out.to_lowercase();
+    if low.contains("permission denied while trying to connect to the docker daemon") {
+        return format!(
+            "{out}\n[hint] the Docker daemon is running, but this user may not use its socket. Either run the command with sudo, or add the user to the docker group (`sudo usermod -aG docker $USER`) and reconnect — group membership only applies to a new login."
+        );
+    }
     if low.contains("failed to connect to the docker api")
         || low.contains("cannot connect to the docker daemon")
         || low.contains("is the docker daemon running")
@@ -1685,6 +1690,12 @@ mod tests {
         );
         assert!(docker.contains("command -v dockerd"), "{docker}");
         assert!(docker.contains("cannot run containers"), "{docker}");
+
+        // Daemon up, socket not accessible to this user.
+        let denied = diagnostic_hint(
+            "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock",
+        );
+        assert!(denied.contains("usermod -aG docker"), "{denied}");
 
         // No systemd on this host.
         let systemd = diagnostic_hint("sh: systemctl: not found");
