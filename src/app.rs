@@ -52,6 +52,9 @@ pub struct TunnelApp {
     show_logs: bool,
     /// Split view: show every open shell side-by-side in a grid.
     split_view: bool,
+    /// Terminal focus mode: the shell fills the window (F11 toggles), the
+    /// MobaXterm-style "full screen" for one terminal.
+    term_fullscreen: bool,
     now: f64,
     mark_texture: Option<egui::TextureHandle>,
     /// User-configured local editors shared by every files pane.
@@ -191,7 +194,10 @@ fn ai_term_result(screen: &str, run: &AiTermRun) -> Option<String> {
     let mut body = if body.is_empty() {
         "(no output)".to_string()
     } else {
-        crate::ai::tools::needs_root_hint(body, &run.command)
+        crate::ai::tools::diagnostic_hint(&crate::ai::tools::needs_root_hint(
+            body,
+            &run.command,
+        ))
     };
     if let Some(hint) = crate::ai::tools::terminal_pm_hint(&body, probe) {
         body.push('\n');
@@ -509,6 +515,7 @@ impl TunnelApp {
             toast: None,
             show_logs: false,
             split_view: false,
+            term_fullscreen: false,
             group_editor: None,
             now: 0.0,
             mark_texture: None,
@@ -1963,6 +1970,20 @@ impl TunnelApp {
             }
         }
 
+        // F11: give the terminal the whole window (MobaXterm's full screen),
+        // F11 again to restore. Consumed before the terminal draws so a shell
+        // application never sees the key.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+            if matches!(self.tabs.get(self.active), Some(Tab::Terminal(_))) {
+                self.term_fullscreen = !self.term_fullscreen;
+            }
+        }
+        let focus_term = self.term_fullscreen
+            && matches!(self.tabs.get(self.active), Some(Tab::Terminal(_)));
+        if !focus_term {
+            self.term_fullscreen = false;
+        }
+
         // Custom title bar (the window is undecorated — see main.rs). Drawn
         // first so it sits above the menu strip; owns window drag + the
         // minimize / maximize / close controls.
@@ -1971,66 +1992,107 @@ impl TunnelApp {
             .frame(Frame::NONE.fill(theme::BG_PANEL()))
             .show(ctx, |ui| self.titlebar(ui, ctx));
 
-        egui::TopBottomPanel::top("menubar")
-            .exact_height(22.0)
-            .frame(
-                Frame::NONE
-                    .fill(theme::BG_PANEL())
-                    .stroke(Stroke::new(1.0_f32, theme::BORDER())),
-            )
-            .show(ctx, |ui| self.menu_bar(ui, ctx));
-
-        // Full-width icon toolbar, exactly like MobaXterm's: it sits above the
-        // sidebar and the work area rather than inside the content pane.
-        egui::TopBottomPanel::top("toolbar")
-            .exact_height(58.0)
-            .frame(
-                Frame::NONE
-                    .fill(theme::BG_PANEL())
-                    .stroke(Stroke::new(1.0_f32, theme::BORDER()))
-                    .inner_margin(Margin::symmetric(6, 2)),
-            )
-            .show(ctx, |ui| self.toolbar(ui));
-
-        egui::TopBottomPanel::bottom("statusbar")
-            .exact_height(22.0)
-            .frame(
-                Frame::NONE
-                    .fill(theme::SB_BG())
-                    .stroke(Stroke::new(1.0_f32, theme::SB_BG())),
-            )
-            .show(ctx, |ui| self.statusbar(ui));
-
-        if self.sidebar_collapsed {
-            // Compact MobaXterm-style icon rail. Its own panel id, so
-            // collapsing never overwrites the width the user dragged the
-            // expanded panel to (egui stores width per panel id).
-            egui::SidePanel::left("sessions_rail")
-                .exact_width(56.0)
-                .resizable(false)
+        if focus_term {
+            // Slim strip: what is full-screen, and how to get out.
+            egui::TopBottomPanel::top("term_focus_bar")
+                .exact_height(26.0)
                 .frame(
                     Frame::NONE
                         .fill(theme::BG_PANEL())
-                        .inner_margin(Margin::symmetric(7, 8)),
+                        .stroke(Stroke::new(1.0_f32, theme::BORDER())),
                 )
-                .show(ctx, |ui| self.sidebar_rail(ui, ctx));
-        } else {
-            egui::SidePanel::left("sessions")
-                .resizable(true)
-                .default_width(220.0)
-                .width_range(180.0..=380.0)
-                .frame(
-                    Frame::NONE
-                        .fill(theme::BG_PANEL())
-                        .inner_margin(Margin {
-                            left: 10,
-                            right: 10,
-                            top: 12,
-                            bottom: 8,
-                        }),
-                )
-                .show(ctx, |ui| self.sidebar(ui, ctx));
+                .show(ctx, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.add_space(8.0);
+                        let title = match self.tabs.get(self.active) {
+                            Some(Tab::Terminal(t)) => t.title.clone(),
+                            _ => String::new(),
+                        };
+                        ui.label(
+                            RichText::new(format!("{title} — full screen terminal"))
+                                .size(11.0)
+                                .color(theme::TEXT_DIM()),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_space(8.0);
+                            if ui
+                                .button(RichText::new("Restore").size(11.0))
+                                .on_hover_text("Back to the normal window (F11)")
+                                .clicked()
+                            {
+                                self.term_fullscreen = false;
+                            }
+                            ui.label(
+                                RichText::new("F11")
+                                    .size(10.0)
+                                    .color(theme::TEXT_FAINT()),
+                            );
+                        });
+                    });
+                });
         }
+
+        if !focus_term {
+            egui::TopBottomPanel::top("menubar")
+                .exact_height(22.0)
+                .frame(
+                    Frame::NONE
+                        .fill(theme::BG_PANEL())
+                        .stroke(Stroke::new(1.0_f32, theme::BORDER())),
+                )
+                .show(ctx, |ui| self.menu_bar(ui, ctx));
+
+            // Full-width icon toolbar, exactly like MobaXterm's: it sits above the
+            // sidebar and the work area rather than inside the content pane.
+            egui::TopBottomPanel::top("toolbar")
+                .exact_height(58.0)
+                .frame(
+                    Frame::NONE
+                        .fill(theme::BG_PANEL())
+                        .stroke(Stroke::new(1.0_f32, theme::BORDER()))
+                        .inner_margin(Margin::symmetric(6, 2)),
+                )
+                .show(ctx, |ui| self.toolbar(ui));
+
+            egui::TopBottomPanel::bottom("statusbar")
+                .exact_height(22.0)
+                .frame(
+                    Frame::NONE
+                        .fill(theme::SB_BG())
+                        .stroke(Stroke::new(1.0_f32, theme::SB_BG())),
+                )
+                .show(ctx, |ui| self.statusbar(ui));
+
+            if self.sidebar_collapsed {
+                // Compact MobaXterm-style icon rail. Its own panel id, so
+                // collapsing never overwrites the width the user dragged the
+                // expanded panel to (egui stores width per panel id).
+                egui::SidePanel::left("sessions_rail")
+                    .exact_width(56.0)
+                    .resizable(false)
+                    .frame(
+                        Frame::NONE
+                            .fill(theme::BG_PANEL())
+                            .inner_margin(Margin::symmetric(7, 8)),
+                    )
+                    .show(ctx, |ui| self.sidebar_rail(ui, ctx));
+            } else {
+                egui::SidePanel::left("sessions")
+                    .resizable(true)
+                    .default_width(220.0)
+                    .width_range(180.0..=380.0)
+                    .frame(
+                        Frame::NONE
+                            .fill(theme::BG_PANEL())
+                            .inner_margin(Margin {
+                                left: 10,
+                                right: 10,
+                                top: 12,
+                                bottom: 8,
+                            }),
+                    )
+                    .show(ctx, |ui| self.sidebar(ui, ctx));
+            }
 
             // Far-right icon rail (MobaXterm's narrow tool strip).
             egui::SidePanel::right("right_rail")
@@ -2064,20 +2126,23 @@ impl TunnelApp {
                     )
                     .show(ctx, |ui| self.ai.panel_ui(ui, ctx));
             }
+        }
 
-            egui::CentralPanel::default()
-                .frame(Frame::NONE.fill(theme::BG_WINDOW()).inner_margin(Margin::symmetric(12, 8)))
-                .show(ctx, |ui| {
-                    // While split view is showing a grid of shells, the tab
-                    // strip hides — terminals fill the workspace (panes have
-                    // their own title bars with close buttons).
-                    let hide_strip = self.split_view && self.terminal_tab_count() >= 2;
-                    if !hide_strip {
-                        self.tab_strip(ui, ctx);
-                        ui.add_space(6.0);
-                    }
-                    self.workspace(ui, ctx);
-                });
+        egui::CentralPanel::default()
+            .frame(Frame::NONE.fill(theme::BG_WINDOW()).inner_margin(Margin::symmetric(12, 8)))
+            .show(ctx, |ui| {
+                // While split view is showing a grid of shells, the tab
+                // strip hides — terminals fill the workspace (panes have
+                // their own title bars with close buttons). Full-screen
+                // terminal mode hides it too: just the shell.
+                let hide_strip =
+                    focus_term || (self.split_view && self.terminal_tab_count() >= 2);
+                if !hide_strip {
+                    self.tab_strip(ui, ctx);
+                    ui.add_space(6.0);
+                }
+                self.workspace(ui, ctx);
+            });
 
         self.session_editor_modal(ctx);
         self.tunnel_editor_modal(ctx);
@@ -2751,7 +2816,9 @@ impl TunnelApp {
             Some(Tab::Terminal(term)) => {
                 let snippets = self.snippets.clone();
                 let mut manage = false;
-                let action = terminal_quick_bar(ui, term, &snippets, &mut manage);
+                let fullscreen = self.term_fullscreen;
+                let action =
+                    terminal_quick_bar(ui, term, &snippets, &mut manage, fullscreen);
                 term.ui(ui);
                 if manage {
                     self.snippets_backup = self.snippets.clone();
@@ -2767,6 +2834,9 @@ impl TunnelApp {
                     }
                     QuickAction::Cleared => self.toast(ToastKind::Success, "Screen cleared"),
                     QuickAction::Reconnect => self.toast(ToastKind::Info, "Reconnecting…"),
+                    QuickAction::ToggleFullscreen => {
+                        self.term_fullscreen = !self.term_fullscreen;
+                    }
                 }
                 return;
             }
@@ -4542,6 +4612,7 @@ enum QuickAction {
     ClipboardEmpty,
     Cleared,
     Reconnect,
+    ToggleFullscreen,
 }
 
 /// MobaXterm-style session toolbar above the shell: copy/paste/clear/
@@ -4553,6 +4624,7 @@ fn terminal_quick_bar(
     term: &mut TerminalSession,
     snippets: &[crate::snippets::Snippet],
     want_manage: &mut bool,
+    fullscreen: bool,
 ) -> QuickAction {
     let avail = ui.available_rect_before_wrap();
     let bar = egui::Rect::from_min_size(avail.min, egui::vec2(avail.width(), 30.0));
@@ -4616,7 +4688,8 @@ fn terminal_quick_bar(
             }
         });
 
-        // Right edge: macros menu — one click fires a snippet into the shell.
+        // Right edge: full-screen toggle + macros menu — one click fires a
+        // snippet into the shell.
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(6.0);
             ui.menu_button(
@@ -4657,9 +4730,55 @@ fn terminal_quick_bar(
                     }
                 },
             );
+            // Full-screen this terminal (F11); the same button restores it.
+            let tip = if fullscreen {
+                "Leave full screen (F11)"
+            } else {
+                "Full screen terminal (F11)"
+            };
+            ui.add_space(2.0);
+            if fullscreen_button(ui, fullscreen)
+                .on_hover_text(tip)
+                .clicked()
+            {
+                action = QuickAction::ToggleFullscreen;
+            }
         });
     });
     action
+}
+
+/// Full-screen toggle drawn by hand (four corner brackets): no icon-font
+/// glyph needed, and it flips its shape when the terminal is full-screen.
+fn fullscreen_button(ui: &mut Ui, on: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 22.0), Sense::click());
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(rect, 3.0, theme::ACCENT_SOFT());
+    }
+    let c = rect.center();
+    let r = if on { 4.0 } else { 7.0 };
+    let arm = 4.0;
+    // Brackets point inward to expand; outward to collapse.
+    let dir = if on { -1.0_f32 } else { 1.0_f32 };
+    let stroke = Stroke::new(1.4_f32, theme::TEXT_DIM());
+    for (sx, sy) in [
+        (-1.0_f32, -1.0_f32),
+        (1.0, -1.0),
+        (-1.0, 1.0),
+        (1.0, 1.0),
+    ] {
+        let corner = egui::pos2(c.x + sx * r, c.y + sy * r);
+        p.line_segment(
+            [corner, egui::pos2(corner.x + dir * sx * arm, corner.y)],
+            stroke,
+        );
+        p.line_segment(
+            [corner, egui::pos2(corner.x, corner.y + dir * sy * arm)],
+            stroke,
+        );
+    }
+    resp
 }
 
 /// Terminal-style tab chip; right-click opens the Chrome-style tab menu.

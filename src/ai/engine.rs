@@ -109,6 +109,9 @@ pub struct Engine {
     in_turn: bool,
     /// Monotonic ids for approval/gate/action round-trips.
     next_rt_id: u64,
+    /// Failed tool calls in a row this turn — the engine nudges the model to
+    /// stop guessing variants once it is clearly stuck.
+    fail_streak: u32,
 }
 
 impl Engine {
@@ -138,6 +141,7 @@ impl Engine {
             ctx,
             in_turn: false,
             next_rt_id: 1,
+            fail_streak: 0,
         }
     }
 
@@ -212,6 +216,7 @@ impl Engine {
             return;
         }
         self.in_turn = true;
+        self.fail_streak = 0;
         self.emit(AiEvent::TurnStart);
         push_audit(
             &self.audit,
@@ -532,7 +537,21 @@ impl Engine {
             ok,
             text: card_text,
         });
-        Ok(processed)
+        // Model-facing nudge, not shown on the card: after three failures in a
+        // row, guessing another variant is the wrong move.
+        let mut for_model = processed;
+        if ok {
+            self.fail_streak = 0;
+        } else {
+            self.fail_streak += 1;
+        }
+        if self.fail_streak >= 3 {
+            for_model.push_str(&format!(
+                "\n[hint] {} commands in a row have failed. Stop trying variants now. Say what you attempted and what the evidence shows, then either ask the user or run one diagnostic (`command -v <thing>`, `ps -p 1 -o comm=`, `cat /etc/os-release`) before anything else.",
+                self.fail_streak
+            ));
+        }
+        Ok(for_model)
     }
 
     /// Remember the OS / package manager a tool result revealed about a host.
@@ -740,6 +759,8 @@ impl Engine {
              - Prefer the active session and current directory when the user is vague.\n\
              - Use bounded, non-interactive commands (grep ... | tail -n 200). Never use top/tail -f/watch/less.\n\
              - Keep answers short: what you found, the exact command(s) used in `backticks`, and the next useful step.\n\
+             - Only claim that something was installed, started or changed when a tool result proves it (exit 0, the daemon reachable, the service active). If the evidence shows a failure, say so plainly and name the cause — never call a failed command a success.\n\
+             - When a service manager or daemon is missing (\"systemctl: not found\", \"rc-service: not found\", Docker socket unreachable), do not try every alternative: inspect the host once (`ps -p 1 -o comm=`, `command -v <daemon>`, `cat /etc/os-release`) and then report what is missing. After three failed commands in a row, stop and tell the user instead of retrying.\n\
              - Mention when output was truncated or values were [REDACTED] by Culvert's security layer.\n\
              - For state-changing work, call the tool once — the user will see an approval card.\n\
              - sudo is usable: run it normally when a task needs root (Culvert pipes the saved profile password into sudo -S when required; passwordless sudo works too). Never ask the user for a password.\n\

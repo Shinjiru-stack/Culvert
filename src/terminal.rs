@@ -23,6 +23,18 @@ fn TERM_FG() -> Color32 {
     Color32::from_rgb(229, 229, 229) // #E5E5E5
 }
 
+/// Turn an accumulated wheel delta into whole scrollback lines, keeping the
+/// remainder for the next frame. A touchpad sends a few pixels per frame;
+/// rounding each delta on its own gave zero lines and the terminal felt
+/// unscrollable.
+fn wheel_lines(accum: &mut f32, dy: f32, step: f32) -> i32 {
+    *accum += dy;
+    let step = step.max(1.0);
+    let lines = (*accum / step).trunc() as i32;
+    *accum -= lines as f32 * step;
+    lines
+}
+
 // ---------------------------------------------------------------------------
 // Messages between UI thread and the async shell task
 // ---------------------------------------------------------------------------
@@ -149,6 +161,10 @@ pub struct TerminalSession {
     mon_tx: Option<UnboundedSender<MonCmd>>,
     /// Latest monitor snapshot for the strip under the shell.
     mon: Option<ServerData>,
+    /// Wheel distance not yet turned into whole scrollback lines. Touchpads
+    /// send many tiny deltas; rounding each one alone made the terminal feel
+    /// unscrollable.
+    scroll_accum: f32,
 }
 
 impl TerminalSession {
@@ -178,6 +194,7 @@ impl TerminalSession {
             rows: 30,
             mon_tx: None,
             mon: None,
+            scroll_accum: 0.0,
         };
         me.start_task();
         me
@@ -600,14 +617,17 @@ impl TerminalSession {
             self.send(TermCmd::Resize { cols, rows });
         }
 
-        // Wheel = scrollback.
+        // Wheel = scrollback. Deltas accumulate: a touchpad's few pixels per
+        // frame used to round to zero lines, so the screen never moved.
         if resp.hovered() || focused {
             let dy = ui.input(|i| i.smooth_scroll_delta.y);
-            if dy.abs() > 0.5 {
-                let current = self.parser.screen().scrollback() as i32;
-                let lines = (dy / (cell_h * 3.0)).round() as i32;
-                let target = (current + lines).max(0) as usize;
-                self.parser.screen_mut().set_scrollback(target);
+            if dy.abs() > 0.01 {
+                let lines = wheel_lines(&mut self.scroll_accum, dy, cell_h * 2.0);
+                if lines != 0 {
+                    let current = self.parser.screen().scrollback() as i32;
+                    let target = (current + lines).max(0) as usize;
+                    self.parser.screen_mut().set_scrollback(target);
+                }
             }
         }
 
@@ -635,6 +655,25 @@ impl TerminalSession {
                         modifiers,
                         ..
                     } => {
+                        // Shift+PageUp/PageDown walk the scrollback, as in every
+                        // other terminal. Keep them away from the shell.
+                        if modifiers.shift {
+                            let page = (self.rows as usize).saturating_sub(2).max(1);
+                            let cur = self.parser.screen().scrollback();
+                            match key {
+                                egui::Key::PageUp => {
+                                    self.parser.screen_mut().set_scrollback(cur + page);
+                                    continue;
+                                }
+                                egui::Key::PageDown => {
+                                    self.parser
+                                        .screen_mut()
+                                        .set_scrollback(cur.saturating_sub(page));
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
                         // Ctrl+V is delivered as Event::Paste by the
                         // backend; don't also send 0x16.
                         if (modifiers.ctrl || modifiers.command)
@@ -1357,6 +1396,29 @@ mod tests {
 
     fn no_mods() -> Modifiers {
         Modifiers::default()
+    }
+
+    /// A touchpad dribbles a few pixels per frame; the terminal must still
+    /// scroll. Each notch of a wheel is ~50 px, a cell is ~16 px.
+    #[test]
+    fn wheel_deltas_accumulate_into_lines() {
+        let mut accum = 0.0_f32;
+        let step = 32.0_f32; // two text lines
+        // Tiny deltas alone never reach a line, but they add up.
+        assert_eq!(wheel_lines(&mut accum, 10.0, step), 0);
+        assert_eq!(wheel_lines(&mut accum, 10.0, step), 0);
+        assert_eq!(wheel_lines(&mut accum, 10.0, step), 0);
+        assert_eq!(wheel_lines(&mut accum, 10.0, step), 1);
+        // The remainder is kept, not discarded.
+        assert!((accum - 8.0).abs() < 0.01, "remainder {accum}");
+        // One real wheel notch scrolls immediately.
+        assert_eq!(wheel_lines(&mut accum, 50.0, step), 1);
+        // Direction is preserved: negative = towards the live screen.
+        assert_eq!(wheel_lines(&mut accum, -100.0, step), -2);
+        assert!((accum + 10.0).abs() < 0.01, "remainder {accum}");
+        // A degenerate cell size must not divide by zero.
+        let mut z = 0.0;
+        assert_eq!(wheel_lines(&mut z, 5.0, 0.0), 5);
     }
 
     #[test]

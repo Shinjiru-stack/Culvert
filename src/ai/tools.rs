@@ -957,10 +957,10 @@ impl Executor {
             }
         };
         let text = out?;
-        let hinted = needs_root_hint(
+        let hinted = diagnostic_hint(&needs_root_hint(
             &terminal_needed_hint(&sudo_hint(&text, sudo_pw.is_some())),
             command,
-        );
+        ));
         // If the shell complained about a missing package manager, probe once
         // and tell the model what this host actually has — local models
         // otherwise guess apt → yum → "try" forever.
@@ -1381,6 +1381,40 @@ pub(crate) fn needs_root_hint(out: &str, command: &str) -> String {
     }
 }
 
+/// Next-step notes for the classic Linux dead ends — no service manager, no
+/// init script, an unreachable Docker daemon. Each one stops a model from
+/// trying every variant of the same idea (systemctl → init.d → rc-service → …).
+pub(crate) fn diagnostic_hint(out: &str) -> String {
+    let low = out.to_lowercase();
+    if low.contains("failed to connect to the docker api")
+        || low.contains("cannot connect to the docker daemon")
+        || low.contains("is the docker daemon running")
+    {
+        return format!(
+            "{out}\n[hint] the Docker CLI is installed but the daemon is not reachable, so no container can start or be inspected. Check `command -v dockerd` and `ls -l /var/run/docker.sock`. If dockerd is missing, this host cannot run containers — say exactly that instead of retrying."
+        );
+    }
+    if low.contains("systemctl: not found")
+        || low.contains("systemctl: command not found")
+        || low.contains("command not found: systemctl")
+    {
+        return format!(
+            "{out}\n[hint] this host has no systemd. Find the init system once (`ps -p 1 -o comm=`, `cat /etc/os-release`): Alpine uses OpenRC (`rc-service`, `rc-update`), many containers run no init at all — then start the daemon binary directly or report that it cannot be started."
+        );
+    }
+    if low.contains("rc-service: not found")
+        || low.contains("rc-service: command not found")
+        || low.contains("rc-update: not found")
+        || low.contains("command not found: rc-service")
+        || (low.contains("/etc/init.d/") && low.contains("not found"))
+    {
+        return format!(
+            "{out}\n[hint] this host has no OpenRC and no init script either — the service is most likely not installed at all. Check the binary (`command -v <daemon>`) and report what is missing instead of trying another init system."
+        );
+    }
+    out.to_string()
+}
+
 /// Next-step note when a program failed because the exec channel has no PTY.
 fn terminal_needed_hint(out: &str) -> String {
     let needs_tty = out.contains("terminal type is unknown")
@@ -1641,6 +1675,29 @@ mod tests {
             _ => panic!("expected an ssh call"),
         }
         assert!(call.reason.contains("full-screen"), "{}", call.reason);
+    }
+
+    #[test]
+    fn dead_ends_get_actionable_hints() {
+        // Docker CLI without a daemon: say so, don't try init systems.
+        let docker = diagnostic_hint(
+            "failed to connect to the docker API at unix:///var/run/docker.sock: connect: no such file or directory",
+        );
+        assert!(docker.contains("command -v dockerd"), "{docker}");
+        assert!(docker.contains("cannot run containers"), "{docker}");
+
+        // No systemd on this host.
+        let systemd = diagnostic_hint("sh: systemctl: not found");
+        assert!(systemd.contains("no systemd"), "{systemd}");
+        assert!(systemd.contains("rc-service"), "{systemd}");
+
+        // Nor OpenRC.
+        let openrc = diagnostic_hint("sh: rc-service: not found");
+        assert!(openrc.contains("no OpenRC"), "{openrc}");
+        assert!(openrc.contains("command -v <daemon>"), "{openrc}");
+
+        // Ordinary output is untouched.
+        assert_eq!(diagnostic_hint("total 4\ndrwxr-xr-x 2 root"), "total 4\ndrwxr-xr-x 2 root");
     }
 
     #[test]
