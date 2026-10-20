@@ -51,6 +51,10 @@ for your approval at every fork in the road.
   the WSL address so mstsc actually dials them.
 - **Built-in terminal tabs** — real PTY SSH sessions with 256-colour support,
   scrollback, resize, paste and proper key encoding (Ctrl codes, arrows, F-keys).
+  Wheel and touchpad deltas both scroll the 4 000-line buffer (Shift+PageUp /
+  Shift+PageDown page it), and **F11** — or the corner-bracket button on the
+  terminal bar — gives the shell the whole window MobaXterm-style, with a slim
+  Restore strip to pop it back.
   If a session drops you get a reconnect card instead of a dead tab.
 - **Session quick-bar** — Copy / Paste / Clear / Reconnect one row above the
   shell, plus a **Macros** menu that fires saved command snippets into it.
@@ -263,6 +267,8 @@ field before saving.
 | `Ctrl+T` | New tunnel |
 | `Ctrl+V` | Paste into the focused terminal |
 | `Ctrl+C` | Interrupt (SIGINT) in the focused terminal — like a real terminal |
+| `Shift+PageUp` / `Shift+PageDown` | Page the terminal scrollback |
+| `F11` | Full-screen the focused terminal, again to restore |
 
 ## Where your data lives
 
