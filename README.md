@@ -6,10 +6,10 @@
 that actually operates them.** Save your hosts, open shell tabs, run local
 (`-L`), remote (`-R`) and dynamic SOCKS5 (`-D`) forwards by point-and-click —
 or describe the job in plain English (“check disk space on the demo host”,
-“tail the nginx errors”, “start the database tunnel”) and let the Copilot run
-it. The model only *proposes* actions: Culvert classifies every one of them,
-gates anything risky behind an approval card, and redacts secrets before they
-reach a provider. One self-contained `.exe`: no webview, no external SSH
+“add an SSH server called staging”, “add a tunnel to staging”, “start the
+database tunnel”) and let the Copilot run it. The model only *proposes*
+actions: Culvert classifies every one of them, gates anything risky behind an
+approval card, and redacts secrets before they reach a provider. One self-contained `.exe`: no webview, no external SSH
 binaries, no cloud account required — point it at a local Ollama and nothing
 ever leaves your machine.
 
@@ -32,14 +32,17 @@ for your approval at every fork in the road.
 ## Features
 
 - **AI Copilot** — a chat panel beside the workspace that drives the same
-  sessions, tunnels and files as the UI: “show the running containers”, “start
-  the database tunnel”, “find last week's logs on prod-web-01”. The model only
-  *proposes* structured tool calls; Culvert classifies each one — read-only
-  commands run straight away, state changes and destructive commands wait on an
-  approval card showing the exact command, and secrets found in output stop at
-  a redaction gate before they reach a provider. Works with OpenRouter, OpenAI,
-  Groq, Gemini, Anthropic, a local Ollama (fully offline) or any OpenAI-compatible
-  endpoint. See [AI Copilot](#ai-copilot).
+  sessions, tunnels and files as the UI: “show the running containers”, “add an
+  SSH server called staging for deploy@10.0.0.9”, “add a tunnel to staging from
+  15433 to 10.0.0.20:5432”, “start the database tunnel”, “find last week's logs
+  on prod-web-01”. The model only *proposes* structured tool calls; Culvert
+  classifies each one — read-only commands run straight away, state changes
+  wait on an approval card showing the exact effect, and secrets found in
+  output stop at a redaction gate before they reach a provider. Passwords and
+  passphrases for new servers/tunnels are typed into a local masked field on
+  the approval card and never enter the model conversation. Works with
+  OpenRouter, OpenAI, Groq, Gemini, Anthropic, a local Ollama (fully offline) or
+  any OpenAI-compatible endpoint. See [AI Copilot](#ai-copilot).
 - **Sessions sidebar** — save host, port, username and auth once; double-click
   any session to open a shell tab (right-click for edit/duplicate/delete).
 - **Full menu bar** — Terminal / Sessions / View / Tools / Macros / Help above
@@ -83,8 +86,9 @@ for your approval at every fork in the road.
   to reset).
 - **UI-only tunnel window** — the first tab is a tunnel manager: add Local,
   Remote or Dynamic forwards with plain fields (no `ssh -L` commands anywhere),
-  then **Start/Stop each tunnel individually**. Every tunnel runs on its own SSH
-  connection, and port conflicts are reported before anything starts.
+  then **Start/Stop each tunnel individually** or use **Start all / Stop all**
+  for the whole list. Every tunnel runs on its own SSH connection, and port
+  conflicts are reported before anything starts.
 - **Password or private-key auth** — file picker for keys and optional
   passphrase support.
 - **Activity log** — a colour-coded log of connections, forwards and errors,
@@ -143,7 +147,8 @@ its detail card — load averages per core, raw `free -h`, `df -h` and
 ![Server monitor bar](docs/screenshots/monitor-bar.png)
 
 **Tunnel manager** — Local, Remote and Dynamic forwards as rows with
-per-tunnel Start/Stop, auto-reconnect and port-collision guard:
+per-tunnel Start/Stop, **Start all / Stop all**, auto-reconnect and a
+port-collision guard:
 
 ![Tunnel manager](docs/screenshots/tunnels-dark.png)
 
@@ -182,6 +187,32 @@ model.
 5. Results are filtered by the security layer and fed back so the model can
    summarise or take the next step (multi-step workflows, up to 8 rounds).
 
+**Create servers and tunnels in chat**
+
+Ask in plain language and the Copilot saves the same records as the editors —
+one tool call, one approval card:
+
+```text
+add an SSH server called staging for deploy@10.0.0.9
+add a tunnel to staging from local 15433 to 10.0.0.20:5432
+add a SOCKS tunnel to staging on port 1080
+create a standalone tunnel called prod-db to deploy@prod.example.com,
+  forwarding 127.0.0.1:15432 to db.internal:5432
+```
+
+- `create_server` saves a new SSH or RDP server.
+- `add_forward` adds a local, remote or SOCKS forward to an existing SSH server.
+- `create_tunnel` saves a standalone tunnel that carries its own SSH login.
+
+The approval card shows the target and, for tunnels, the forward summary. The
+tool schemas have **no password or passphrase fields**: when a credential is needed,
+the card renders a masked local field with an eye button. That value is injected
+into the prepared server/tunnel only after you press Execute — it never goes to
+the provider, the chat transcript, the audit log or MCP output. Creation only
+saves; nothing is started until you ask (or press Start). The app refreshes its
+Copilot state after each write, so “add a server, then add a tunnel to it” works
+in one turn.
+
 **Reliability** — the Copilot is built to be accurate about the machine it is
 talking to, not to guess:
 
@@ -199,13 +230,13 @@ talking to, not to guess:
   password never appears on a command line, on screen, in the audit log or in
   anything sent to the model.
 
-**Tools it can use** — connect/disconnect sessions, run commands, start/stop
-tunnels, list tunnels and profiles, list/read/download/upload files over SFTP,
-search files by name/size/age, server health (CPU, memory, disk, uptime), and
-open files in your local editor. Context — active session, file-browser
-directory, selected file, running tunnels, saved profiles — is attached
-automatically, so `/var/log/nginx` in the file browser plus *“Show the latest
-errors”* just works.
+**Tools it can use** — create servers, standalone tunnels and session forwards;
+connect/disconnect sessions; run commands; start/stop tunnels; list tunnels and
+profiles; list/read/download/upload files over SFTP; search files by
+name/size/age; server health (CPU, memory, disk, uptime); and open files in your
+local editor. Context — active session, file-browser directory, selected file,
+running tunnels, saved profiles — is attached automatically, so
+`/var/log/nginx` in the file browser plus *“Show the latest errors”* just works.
 
 **Providers** — OpenRouter, OpenAI, Groq, Ollama (fully local), Google Gemini,
 Anthropic, or any custom OpenAI-compatible endpoint. The settings panel has
@@ -237,17 +268,19 @@ decision is listed in the panel's *History* tab and appended to
 
 ## MCP server (drive Culvert from an agent)
 
-Culvert exposes its saved SSH sessions and tunnels over the
-[Model Context Protocol](https://modelcontextprotocol.io), so an MCP-capable
-agent (Claude Desktop, Cursor, a custom client) can do the clicking from a
-prompt.
+The in-app **Copilot** above is the chat path: no MCP setup, no external agent.
+MCP is the separate, optional path for tools that already speak the
+[Model Context Protocol](https://modelcontextprotocol.io) — Claude Desktop,
+Cursor, or a custom client — and want to drive Culvert's saved sessions and
+tunnels from their own chat. Both paths use the same UI actions, validation and
+DPAPI-sealed storage.
 
 Open **Tools → MCP server…**, press **Start**, then copy the generated client
 config into your MCP client — or point an HTTP client at the endpoint with the
-bearer token. The stdio shim `culvert-mcp.exe` is installed next to
-`culvert.exe`; it reads the port and token from `%APPDATA%\culvert\mcp.json`,
-so rotating the token in the UI is enough and no secret goes into the client
-config.
+bearer token. The server is built into `culvert.exe`; the separate
+`culvert-mcp.exe` is an optional stdio-to-HTTP shim installed next to it. The
+shim reads the port and token from `%APPDATA%\culvert\mcp.json`, so rotating the
+token in the UI is enough and no secret goes into the client config.
 
 Tools: `culvert_list_sessions`, `culvert_get_session`,
 `culvert_create_session`, `culvert_update_session`,
@@ -286,7 +319,11 @@ fresh release automatically (see [Release automation](#release-automation)).
    on the remote machine.
 5. Switch to the **Tunnels** tab, press **New tunnel**, pick the session, choose
    Local / Remote / Dynamic and fill in the ports.
-6. Press **Start** on the tunnel row — traffic flows. **Stop** any time.
+6. Press **Start** on the tunnel row — traffic flows. **Stop** any time, or use
+   **Start all / Stop all** for the whole list.
+7. Prefer typing? Open **Copilot** and say “add an SSH server called staging” or
+   “add a tunnel to staging from 15433 to 10.0.0.20:5432”. Approve the card,
+   type any credential into the masked local field, then press Start when ready.
 
 ## Understanding the forwards
 
@@ -342,6 +379,11 @@ the old `ssh-tunnel-manager` folder the first time Culvert runs.
 - The Copilot never sends raw tool output to a cloud provider without passing
   the redaction layer, and remote actions only ever run through Culvert's own
   SSH/SFTP stack (the same code paths as the UI) after risk classification.
+- Server/tunnel creation never accepts a password or passphrase as a tool
+  argument. The model sees only the non-secret fields; the approval card collects
+  the credential locally, and the engine injects it into the prepared action
+  immediately before saving. Audit entries and tool results carry the summary,
+  never the secret.
 - Unknown server host keys are currently accepted automatically. Pin
   `known_hosts` in `src/ssh.rs` (`check_server_key`) before using this in an
   environment where MITM protection matters.

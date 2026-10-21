@@ -261,6 +261,7 @@ struct SessionEditor {
     password: String,
     key_path: String,
     key_passphrase: String,
+    show_password: bool,
     error: Option<String>,
 }
 
@@ -278,6 +279,7 @@ impl SessionEditor {
             password: String::new(),
             key_path: String::new(),
             key_passphrase: String::new(),
+            show_password: false,
             error: None,
         }
     }
@@ -295,6 +297,7 @@ impl SessionEditor {
             password: s.password.clone(),
             key_path: s.key_path.clone(),
             key_passphrase: s.key_passphrase.clone(),
+            show_password: false,
             error: None,
         }
     }
@@ -317,6 +320,7 @@ struct TunnelEditor {
     auth_type: AuthType,
     password: String,
     key_path: String,
+    show_password: bool,
     forward_id: Option<String>,
     session_id: String,
     fwd_type: ForwardType,
@@ -340,6 +344,7 @@ impl TunnelEditor {
             auth_type: AuthType::Password,
             password: String::new(),
             key_path: String::new(),
+            show_password: false,
             forward_id: None,
             session_id,
             fwd_type: ForwardType::Local,
@@ -604,6 +609,16 @@ impl TunnelApp {
     // -----------------------------------------------------------------------
     // AI Copilot glue
     // -----------------------------------------------------------------------
+
+    /// Publish the context immediately after an AI action mutates app state, so
+    /// a follow-up tool call in the same turn (create server → add tunnel) sees
+    /// the new data instead of last frame's snapshot.
+    fn publish_ai_snapshot(&self) {
+        let snap = self.ai_snapshot();
+        if let Ok(mut w) = self.ai.snapshot.write() {
+            *w = snap;
+        }
+    }
 
     /// Build the context snapshot the Copilot engine sees each frame. Prompt
     /// text is built only from the summary fields — `profiles` carries
@@ -874,6 +889,137 @@ impl TunnelApp {
                 }
                 self.tunnels.stop(key);
                 "Tunnel stopped.".to_string()
+            }
+            UiAction::CreateSession { session } => {
+                let name = session.name.trim().to_string();
+                if self
+                    .sessions
+                    .iter()
+                    .any(|s| s.name.eq_ignore_ascii_case(&name))
+                {
+                    return format!(
+                        "Could not save the server: a server named '{name}' already exists."
+                    );
+                }
+                if let Err(e) = session.validate() {
+                    return format!("Could not save the server: {e}");
+                }
+                let label = session.connection_label();
+                let id = session.id.clone();
+                self.sessions.push(session.clone());
+                if let Err(e) = save_sessions(&self.sessions) {
+                    self.sessions.retain(|s| s.id != id);
+                    self.toast(ToastKind::Error, format!("Could not save sessions: {e}"));
+                    return format!("Could not save the server: {e}");
+                }
+                self.selected = Some(id);
+                push_log(
+                    &self.logs,
+                    LogEntry::new(
+                        LogLevel::Info,
+                        "AI",
+                        &format!("server saved · {name} ({label})"),
+                    ),
+                );
+                self.toast(
+                    ToastKind::Success,
+                    format!("AI: server '{name}' saved"),
+                );
+                format!(
+                    "Saved server '{name}' ({label}). It is saved and ready to connect; nothing was opened."
+                )
+            }
+            UiAction::CreateTunnel { tunnel } => {
+                let name = tunnel.label();
+                if self
+                    .standalone_tunnels
+                    .iter()
+                    .any(|t| t.name.eq_ignore_ascii_case(&name))
+                {
+                    return format!(
+                        "Could not save the tunnel: a tunnel named '{name}' already exists."
+                    );
+                }
+                if let Err(e) = tunnel.validate() {
+                    return format!("Could not save the tunnel: {e}");
+                }
+                let desc = tunnel
+                    .forwards
+                    .first()
+                    .map(forward_desc)
+                    .unwrap_or_else(|| "no forward".to_string());
+                let id = tunnel.id.clone();
+                self.standalone_tunnels.push(tunnel.clone());
+                if let Err(e) = save_tunnels(&self.standalone_tunnels) {
+                    self.standalone_tunnels.retain(|t| t.id != id);
+                    self.toast(ToastKind::Error, format!("Could not save tunnels: {e}"));
+                    return format!("Could not save the tunnel: {e}");
+                }
+                push_log(
+                    &self.logs,
+                    LogEntry::new(
+                        LogLevel::Info,
+                        "AI",
+                        &format!("tunnel saved · {name} ({desc})"),
+                    ),
+                );
+                self.toast(
+                    ToastKind::Success,
+                    format!("AI: tunnel '{name}' saved"),
+                );
+                format!(
+                    "Saved standalone tunnel '{name}' ({desc}). It is not started yet — ask me to start it when you are ready."
+                )
+            }
+            UiAction::AddForward {
+                session_id,
+                forward,
+            } => {
+                let Some(idx) = self.sessions.iter().position(|s| &s.id == session_id) else {
+                    return "Could not add the tunnel: that saved server no longer exists."
+                        .to_string();
+                };
+                if self.sessions[idx].protocol != Protocol::Ssh {
+                    return "Could not add the tunnel: it needs an SSH server, not RDP."
+                        .to_string();
+                }
+                if self.sessions[idx].forwards.iter().any(|f| {
+                    f.listen_host.eq_ignore_ascii_case(&forward.listen_host)
+                        && f.listen_port == forward.listen_port
+                }) {
+                    return format!(
+                        "Could not add the tunnel: '{}' already has one listening on {}:{}.",
+                        session_display_name(&self.sessions[idx]),
+                        forward.listen_host,
+                        forward.listen_port
+                    );
+                }
+                if let Err(e) = forward.validate() {
+                    return format!("Could not add the tunnel: {e}");
+                }
+                let name = session_display_name(&self.sessions[idx]);
+                let desc = forward_desc(forward);
+                self.sessions[idx].forwards.push(forward.clone());
+                if let Err(e) = save_sessions(&self.sessions) {
+                    self.sessions[idx].forwards.pop();
+                    self.toast(ToastKind::Error, format!("Could not save sessions: {e}"));
+                    return format!("Could not add the tunnel: {e}");
+                }
+                push_log(
+                    &self.logs,
+                    LogEntry::new(
+                        LogLevel::Info,
+                        "AI",
+                        &format!("tunnel added · {desc} via {name}"),
+                    ),
+                );
+                self.toast(
+                    ToastKind::Success,
+                    format!("AI: tunnel added to '{name}'"),
+                );
+                format!(
+                    "Added tunnel {desc} to '{name}'. It is saved but not started yet."
+                )
             }
             UiAction::DockNavigate { session_id, path } => {
                 self.sidebar_collapsed = false;
@@ -1247,6 +1393,135 @@ impl TunnelApp {
             Some(group_id.to_string())
         };
         self.persist(format!("Session moved to {moved_to}"));
+    }
+
+    /// (running, total) across saved-session and standalone tunnels.
+    fn tunnel_run_counts(&self) -> (usize, usize) {
+        let mut total = 0usize;
+        let mut running = 0usize;
+        for s in &self.sessions {
+            for f in &s.forwards {
+                total += 1;
+                if self.tunnels.is_running(&forward_key(&s.id, &f.id)) {
+                    running += 1;
+                }
+            }
+        }
+        for t in &self.standalone_tunnels {
+            for f in &t.forwards {
+                total += 1;
+                if self.tunnels.is_running(&standalone_key(&t.id, &f.id)) {
+                    running += 1;
+                }
+            }
+        }
+        (running, total)
+    }
+
+    /// Start every tunnel that is not already running. `start` only binds the
+    /// listener and spawns the worker, so report what was kicked off — the
+    /// rows still show connecting/running/failed as each SSH session settles.
+    fn start_all_tunnels(&mut self) {
+        let mut started = 0usize;
+        let mut failed: Vec<(String, String)> = Vec::new();
+
+        for s in &self.sessions {
+            for f in &s.forwards {
+                if self.tunnels.is_running(&forward_key(&s.id, &f.id)) {
+                    continue;
+                }
+                match self.tunnels.start(s, f) {
+                    Ok(()) => started += 1,
+                    Err(e) => failed.push((forward_desc(f), e)),
+                }
+            }
+        }
+        for t in &self.standalone_tunnels {
+            for f in &t.forwards {
+                if self.tunnels.is_running(&standalone_key(&t.id, &f.id)) {
+                    continue;
+                }
+                match self.tunnels.start(&t.to_ssh_session(), f) {
+                    Ok(()) => started += 1,
+                    Err(e) => failed.push((forward_desc(f), e)),
+                }
+            }
+        }
+
+        if started == 0 && failed.is_empty() {
+            self.toast(ToastKind::Info, "All tunnels are already running");
+            return;
+        }
+        if failed.is_empty() {
+            self.toast(
+                ToastKind::Info,
+                format!(
+                    "Starting {started} tunnel{}…",
+                    if started == 1 { "" } else { "s" }
+                ),
+            );
+            return;
+        }
+        let detail = failed
+            .first()
+            .map(|(desc, err)| format!("{desc}: {err}"))
+            .unwrap_or_default();
+        let more = if failed.len() > 1 {
+            format!(" (+{} more)", failed.len() - 1)
+        } else {
+            String::new()
+        };
+        push_log(
+            &self.logs,
+            LogEntry::new(
+                LogLevel::Error,
+                "Tunnels",
+                &format!("{started} started, {} failed · {detail}{more}", failed.len()),
+            ),
+        );
+        self.toast(
+            ToastKind::Error,
+            format!(
+                "{} tunnel{} could not start — {detail}{more}",
+                failed.len(),
+                if failed.len() == 1 { "" } else { "s" }
+            ),
+        );
+    }
+
+    /// Stop every running tunnel. Stopping is synchronous, so the count is
+    /// final when the toast appears.
+    fn stop_all_tunnels(&mut self) {
+        let mut stopped = 0usize;
+        for s in &self.sessions {
+            for f in &s.forwards {
+                let key = forward_key(&s.id, &f.id);
+                if self.tunnels.is_running(&key) {
+                    self.tunnels.stop(&key);
+                    stopped += 1;
+                }
+            }
+        }
+        for t in &self.standalone_tunnels {
+            for f in &t.forwards {
+                let key = standalone_key(&t.id, &f.id);
+                if self.tunnels.is_running(&key) {
+                    self.tunnels.stop(&key);
+                    stopped += 1;
+                }
+            }
+        }
+        if stopped == 0 {
+            self.toast(ToastKind::Info, "No tunnels are running");
+        } else {
+            self.toast(
+                ToastKind::Info,
+                format!(
+                    "Stopped {stopped} tunnel{}",
+                    if stopped == 1 { "" } else { "s" }
+                ),
+            );
+        }
     }
 
     fn toggle_tunnel(&mut self, session_id: &str, forward_id: &str) {
@@ -2767,17 +3042,13 @@ impl TunnelApp {
         // context snapshot, drain engine events and execute any UI action it
         // asked for (the engine itself never touches app state).
         self.ai.ensure_engine(ctx);
-        {
-            let snap = self.ai_snapshot();
-            if let Ok(mut w) = self.ai.snapshot.write() {
-                *w = snap;
-            }
-        }
+        self.publish_ai_snapshot();
         if self.ai.poll() {
             ctx.request_repaint();
         }
         if let Some((id, action, _label)) = self.ai.take_action() {
             if let Some(result) = self.ai_apply_action(ctx, id, &action) {
+                self.publish_ai_snapshot();
                 self.ai.complete_action(id, result);
             }
             ctx.request_repaint();
@@ -4095,22 +4366,19 @@ impl TunnelApp {
         }
     }
 
-    fn tunnels_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        // MobaXterm-style home hero: brand, quick actions and a theme
-        // picker, shown while no shells are open. Once sessions are running
-        // the tunnel list takes the whole page back.
-        if self.terminal_tab_count() == 0 {
-            welcome_hero(self, ui, ctx);
-        }
+    fn tunnels_page(&mut self, ui: &mut Ui, _ctx: &egui::Context) {
+        let (running, total) = self.tunnel_run_counts();
+        let any_running = running > 0;
+        let any_stopped = running < total;
         ui.horizontal(|ui| {
             // A deliberate color bar anchoring the page title.
             let (title_bar, _) = ui.allocate_exact_size(egui::vec2(4.0, 30.0), Sense::hover());
             ui.painter().rect_filled(title_bar, 2.0, theme::ACCENT());
             ui.vertical(|ui| {
-                // Reserve room for the action first: on a narrow canvas (e.g.
+                // Reserve room for the actions first: on a narrow canvas (e.g.
                 // with the AI Copilot panel open) the description must wrap
-                // before the button, never run underneath it.
-                let reserve = 118.0;
+                // before the buttons, never run underneath them.
+                let reserve = 292.0;
                 ui.set_max_width((ui.available_width() - reserve).max(160.0));
                 ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(
@@ -4136,6 +4404,30 @@ impl TunnelApp {
                 );
                 if new_tunnel.clicked() {
                     self.tunnel_editor = Some(TunnelEditor::new_standalone());
+                }
+                ui.add_space(4.0);
+                let start_all = styled_button(
+                    ui,
+                    RichText::new("Start all").size(11.5),
+                    any_stopped,
+                    false,
+                    None,
+                )
+                .on_hover_text("Start every tunnel that is not running");
+                if start_all.clicked() {
+                    self.start_all_tunnels();
+                }
+                ui.add_space(4.0);
+                let stop_all = styled_button(
+                    ui,
+                    RichText::new("Stop all").size(11.5),
+                    any_running,
+                    true,
+                    None,
+                )
+                .on_hover_text("Stop every running tunnel");
+                if stop_all.clicked() {
+                    self.stop_all_tunnels();
                 }
             });
         });
@@ -4480,14 +4772,15 @@ impl TunnelApp {
                         });
                         ui.add_space(6.0);
 
-            match ed.auth_type {
+                        match ed.auth_type {
                             AuthType::Password => {
                                 form_row(ui, "Password", |ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut ed.password)
-                                            .password(true)
-                                            .desired_width(260.0)
-                                            .margin(egui::vec2(6.0, 3.0)),
+                                    password_input(
+                                        ui,
+                                        &mut ed.password,
+                                        &mut ed.show_password,
+                                        220.0,
+                                        "",
                                     );
                                 });
                             }
@@ -4495,9 +4788,9 @@ impl TunnelApp {
                                 form_row(ui, "Private key", |ui| {
                                     ui.add(
                                         egui::TextEdit::singleline(&mut ed.key_path)
-                                        .hint_text("C:\\Users\\me\\.ssh\\id_ed25519")
-                                        .desired_width(200.0)
-                                        .margin(egui::vec2(6.0, 3.0)),
+                                            .hint_text("C:\\Users\\me\\.ssh\\id_ed25519")
+                                            .desired_width(200.0)
+                                            .margin(egui::vec2(6.0, 3.0)),
                                     );
                                     ui.add_space(4.0);
                                     if ui.button("Browse...").clicked() {
@@ -4508,11 +4801,12 @@ impl TunnelApp {
                                 });
                                 ui.add_space(3.0);
                                 form_row(ui, "Passphrase", |ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut ed.key_passphrase)
-                                            .password(true)
-                                            .desired_width(260.0)
-                                            .margin(egui::vec2(6.0, 3.0)),
+                                    password_input(
+                                        ui,
+                                        &mut ed.key_passphrase,
+                                        &mut ed.show_password,
+                                        220.0,
+                                        "optional",
                                     );
                                 });
                             }
@@ -4671,11 +4965,12 @@ impl TunnelApp {
                 match ed.auth_type {
                     AuthType::Password => {
                         field(ui, "Password", |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut ed.password)
-                                    .password(true)
-                                    .desired_width(ui.available_width())
-                                    .margin(egui::vec2(8.0, 6.0)),
+                            password_input(
+                                ui,
+                                &mut ed.password,
+                                &mut ed.show_password,
+                                (ui.available_width() - 30.0).max(80.0),
+                                "",
                             );
                         });
                     }
@@ -6191,9 +6486,6 @@ fn view_control_group(ui: &mut Ui, fullscreen: bool) -> (bool, bool) {
     (fs.clicked(), pop.clicked())
 }
 
-/// Terminal-style tab chip; right-click opens the Chrome-style tab menu.
-/// Returns (clicked-activate, clicked-close, context-menu command).
-
 /// Flat MobaXterm-style toolbar tile: colored Tabler glyph over a small
 /// label, no background fill — a soft rounded highlight appears on hover,
 /// accent wash when active. Professional, quiet, and light on the eyes.
@@ -6269,191 +6561,8 @@ fn rail_button(ui: &mut Ui, glyph: char, tint: Color32, tip: &str) -> egui::Resp
     resp.on_hover_text(tip)
 }
 
-/// Big welcome-screen action button: Tabler glyph in its color + label.
-fn hero_button(
-    ui: &mut Ui,
-    glyph: char,
-    tint: Color32,
-    label: &str,
-    filled: bool,
-) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(160.0, 34.0), Sense::click());
-    let p = ui.painter();
-    if filled {
-        p.rect_filled(rect, 8.0, theme::ACCENT());
-        let w = egui::FontId::proportional(12.5);
-        p.text(
-            egui::pos2(rect.left() + 24.0, rect.center().y),
-            egui::Align2::CENTER_CENTER,
-            glyph,
-            theme::icon(14.0),
-            Color32::WHITE,
-        );
-        p.text(
-            egui::pos2(rect.left() + 42.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            label,
-            w,
-            Color32::WHITE,
-        );
-    } else {
-        p.rect_filled(rect, 8.0, theme::BG_BTN());
-        p.rect_stroke(rect, 8.0, Stroke::new(1.0_f32, theme::BORDER_STRONG()), egui::StrokeKind::Inside);
-        p.text(
-            egui::pos2(rect.left() + 24.0, rect.center().y),
-            egui::Align2::CENTER_CENTER,
-            glyph,
-            theme::icon(14.0),
-            tint,
-        );
-        p.text(
-            egui::pos2(rect.left() + 42.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            label,
-            egui::FontId::proportional(12.5),
-            theme::TEXT(),
-        );
-    }
-    resp
-}
-
-/// Centered home hero: brand mark, version, quick-action buttons and a
-/// Light/Dark theme picker with live mini previews.
-fn welcome_hero(
-    app: &mut TunnelApp,
-    ui: &mut Ui,
-    ctx: &egui::Context,
-) {
-    let mark = app
-        .mark_texture
-        .get_or_insert_with(|| theme::brand_texture(ctx, 128))
-        .clone();
-    ui.vertical_centered(|ui| {
-        ui.add_space(16.0);
-        ui.horizontal(|ui| {
-            ui.add_space((ui.available_width() - 210.0) / 2.0);
-            paint_mark(ui, &mark, 46.0);
-            ui.add_space(12.0);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(RichText::new("Culvert").size(30.0).strong());
-                ui.label(
-                    RichText::new(format!("{} · SSH client · AI Copilot", version::tag()))
-                        .size(11.0)
-                        .color(theme::TEXT_FAINT()),
-                );
-            });
-        });
-        ui.add_space(18.0);
-        ui.horizontal(|ui| {
-            ui.add_space((ui.available_width() - 330.0) / 2.0);
-            if hero_button(ui, tglyph::SESSION, theme::SUCCESS(), "New session", true).clicked() {
-                app.session_editor = Some(SessionEditor::new());
-            }
-            ui.add_space(10.0);
-            if hero_button(ui, tglyph::TUNNEL, theme::INFO(), "New tunnel", false).clicked() {
-                app.tunnel_editor = Some(TunnelEditor::new_standalone());
-            }
-        });
-        ui.add_space(16.0);
-
-        // Theme picker: two mini previews of the shell chrome.
-        ui.label(
-            RichText::new("Select your favorite theme")
-                .size(11.0)
-                .color(theme::TEXT_DIM()),
-        );
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.add_space((ui.available_width() - 470.0) / 2.0);
-            let (light_active, dark_active) =
-                (!theme::is_dark(), theme::is_dark());
-            if theme_card(ui, "Light", false, light_active).clicked() {
-                if theme::is_dark() {
-                    theme::set_dark(false);
-                    theme::apply(ctx);
-                }
-            }
-            ui.add_space(14.0);
-            if theme_card(ui, "Dark", true, dark_active).clicked() {
-                if !theme::is_dark() {
-                    theme::set_dark(true);
-                    theme::apply(ctx);
-                }
-            }
-        });
-        ui.add_space(10.0);
-    });
-}
-
-/// Rounded theme preview card: a small mock of the shell chrome in the
-/// palette it selects, with the palette name beneath.
-fn theme_card(ui: &mut Ui, name: &str, dark: bool, active: bool) -> egui::Response {
-    let (bg, panel, dot, fg) = if dark {
-        (
-            Color32::from_rgb(13, 17, 23),
-            Color32::from_rgb(22, 27, 34),
-            Color32::from_rgb(63, 185, 80),
-            Color32::from_rgb(110, 118, 129),
-        )
-    } else {
-        (
-            Color32::from_rgb(255, 255, 255),
-            Color32::from_rgb(246, 248, 250),
-            Color32::from_rgb(26, 127, 55),
-            Color32::from_rgb(140, 150, 160),
-        )
-    };
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(228.0, 108.0), Sense::click());
-    let p = ui.painter();
-    let stroke = if active {
-        Stroke::new(2.0_f32, theme::ACCENT())
-    } else {
-        Stroke::new(1.0_f32, theme::BORDER())
-    };
-    p.rect_filled(rect, 2.0, bg);
-    p.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
-    // Sidebar hint
-    p.rect_filled(
-        egui::Rect::from_min_size(rect.min, egui::vec2(46.0, rect.height())),
-        0.0,
-        panel,
-    );
-    // Title-bar dots + a prompt line
-    let cy = rect.top() + 12.0;
-    for (i, c) in [(0.0, theme::DANGER()), (10.0, theme::WARNING()), (20.0, theme::SUCCESS())] {
-        p.circle_filled(egui::pos2(rect.left() + 56.0 + i, cy), 3.0, c);
-    }
-    p.rect_filled(
-        egui::Rect::from_min_size(egui::pos2(rect.left() + 12.0, rect.top() + 42.0), egui::vec2(64.0, 5.0)),
-        2.5,
-        fg,
-    );
-    p.rect_filled(
-        egui::Rect::from_min_size(
-            egui::pos2(rect.left() + 58.0, rect.top() + 54.0),
-            egui::vec2(56.0, 5.0),
-        ),
-        2.5,
-        dot,
-    );
-    p.rect_filled(
-        egui::Rect::from_min_size(
-            egui::pos2(rect.left() + 12.0, rect.top() + 66.0),
-            egui::vec2(90.0, 5.0),
-        ),
-        2.5,
-        fg.gamma_multiply(0.7),
-    );
-    // Name below.
-    let label = egui::Rect::from_min_size(
-        egui::pos2(rect.left(), rect.bottom()),
-        egui::vec2(rect.width(), 20.0),
-    );
-    p.text(label.center(), egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(11.0), theme::TEXT());
-    resp
-}
-
+/// Terminal-style tab chip; right-click opens the Chrome-style tab menu.
+/// Returns (clicked-activate, clicked-close, context-menu command).
 fn tab_chip(
     ui: &mut Ui,
     title: &str,
@@ -6464,6 +6573,7 @@ fn tab_chip(
     let mut clicked = false;
     let mut closed = false;
     let mut menu = None;
+    let mut close_rect: Option<egui::Rect> = None;
     // MobaXterm-style tab: a rectangular page tab on the strip. The active
     // tab uses the work-area surface with a saturated strip along its top
     // edge; inactive tabs sit on the chrome colour.
@@ -6527,6 +6637,7 @@ fn tab_chip(
                             .corner_radius(CornerRadius::same(2)),
                         )
                         .on_hover_text("Close tab");
+                    close_rect = Some(x.rect);
                     if x.clicked() {
                         closed = true;
                     }
@@ -6534,11 +6645,23 @@ fn tab_chip(
             });
         });
 
-    // Make the whole tab a click target: its padding, dot and label. Only
-    // the text used to react, which made switching tabs feel broken when a
-    // click landed a pixel or two off (e.g. in a maximized window).
+    // Make the whole tab a click target: its padding, dot and label. The
+    // full-tab interaction is registered after the close button, so egui
+    // gives it the click even over the ×; route clicks inside the × rect to
+    // close instead of select. Without this the close button never fired.
     if tab.response.interact(Sense::click()).clicked() && !closed {
-        clicked = true;
+        let on_close = close_rect.is_some_and(|r| {
+            ui.input(|i| {
+                i.pointer
+                    .interact_pos()
+                    .is_some_and(|pos| r.contains(pos))
+            })
+        });
+        if on_close {
+            closed = true;
+        } else {
+            clicked = true;
+        }
     }
 
     if active {
@@ -6719,6 +6842,46 @@ fn form_row(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
         );
         ui.add_space(6.0);
         add(ui);
+    });
+}
+
+/// Password/secret input with a show/hide eye button. The value stays in the
+/// editor until saved; toggling only changes whether it is painted as dots.
+fn password_input(
+    ui: &mut Ui,
+    value: &mut String,
+    visible: &mut bool,
+    width: f32,
+    hint: &str,
+) {
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .password(!*visible)
+                .hint_text(hint)
+                .desired_width(width)
+                .margin(egui::vec2(6.0, 3.0)),
+        );
+        let (glyph, tip) = if *visible {
+            (tglyph::EYE_OFF, "Hide password")
+        } else {
+            (tglyph::EYE, "Show password")
+        };
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new(glyph)
+                        .font(theme::icon(13.0))
+                        .color(theme::TEXT_DIM()),
+                )
+                .frame(false)
+                .min_size(egui::vec2(24.0, 20.0)),
+            )
+            .on_hover_text(tip)
+            .clicked()
+        {
+            *visible = !*visible;
+        }
     });
 }
 

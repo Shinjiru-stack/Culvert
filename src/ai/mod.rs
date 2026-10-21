@@ -22,7 +22,7 @@ pub mod tools;
 
 pub use panel::AiPanel;
 
-use crate::session::SshSession;
+use crate::session::{PortForward, SshSession, StandaloneTunnel};
 use std::sync::{Arc, Mutex, RwLock};
 
 // ---------------------------------------------------------------------------
@@ -80,6 +80,18 @@ pub struct CtxTunnel {
 // UI actions (the engine asks, the app does)
 // ---------------------------------------------------------------------------
 
+/// A credential the approval card must collect locally. The value is never
+/// part of a tool call, a prompt, a tool result or an audit entry.
+#[derive(Clone, Debug)]
+pub struct SecretPrompt {
+    /// Field label, e.g. "SSH password".
+    pub label: String,
+    /// Placeholder shown when the field is empty.
+    pub hint: String,
+    /// True when Execute/Save stays disabled until something is entered.
+    pub required: bool,
+}
+
 /// Work that must run on the UI thread with the app's existing code paths.
 /// The engine emits [`engine::AiEvent::Action`] and waits for
 /// [`engine::AiCmd::ActionDone`].
@@ -93,6 +105,16 @@ pub enum UiAction {
     StartTunnel { key: String },
     /// Stop a tunnel by `forward_key`.
     StopTunnel { key: String },
+    /// Save a new SSH/RDP server. Any password/passphrase is added by the
+    /// engine from the approval card immediately before this action runs.
+    CreateSession { session: SshSession },
+    /// Save a standalone tunnel with its own SSH endpoint.
+    CreateTunnel { tunnel: StandaloneTunnel },
+    /// Add a forward to an already-saved SSH session.
+    AddForward {
+        session_id: String,
+        forward: PortForward,
+    },
     /// Point the docked file browser at a path (its session must be shown).
     DockNavigate { session_id: String, path: String },
     /// Type a command into the visible shell tab for `session_id` (opening the

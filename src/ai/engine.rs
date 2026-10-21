@@ -22,8 +22,12 @@ pub enum AiCmd {
     /// A new user message (starts a turn).
     UserMessage(String),
     /// Approval card: execute the pending call (optionally with an edited
-    /// command line).
-    Approve { id: u64, edited: Option<String> },
+    /// command line, plus a credential typed into the local masked field).
+    Approve {
+        id: u64,
+        edited: Option<String>,
+        secret: Option<String>,
+    },
     /// Approval card: decline — the model is told and may continue.
     Reject { id: u64 },
     /// Stop the current turn entirely.
@@ -65,6 +69,8 @@ pub enum AiEvent {
         command: Option<String>,
         risk: Risk,
         reason: String,
+        /// When set, the panel shows a masked field that stays local.
+        secret: Option<crate::ai::SecretPrompt>,
     },
     /// Sensitive content found — choose how to send it.
     SensitiveGate {
@@ -368,10 +374,15 @@ impl Engine {
                 command: prepared.command.clone(),
                 risk: prepared.risk,
                 reason: prepared.reason.clone(),
+                secret: prepared.secret.clone(),
             });
             loop {
                 match self.cmd_rx.recv().await {
-                    Some(AiCmd::Approve { id: got, edited }) => {
+                    Some(AiCmd::Approve {
+                        id: got,
+                        edited,
+                        secret,
+                    }) => {
                         if got != id {
                             continue;
                         }
@@ -379,6 +390,9 @@ impl Engine {
                             if let Prepared::Ssh { command, .. } = &mut prepared.prepared {
                                 *command = cmd;
                             }
+                        }
+                        if let Some(secret) = secret {
+                            tools::apply_secret(&mut prepared.prepared, &secret);
                         }
                         push_audit(
                             &self.audit,
@@ -706,7 +720,9 @@ impl Engine {
         });
         loop {
             match self.cmd_rx.recv().await {
-                Some(AiCmd::Approve { id: got, edited }) => {
+                Some(AiCmd::Approve {
+                    id: got, edited, ..
+                }) => {
                     if got != id {
                         continue;
                     }
@@ -766,7 +782,10 @@ impl Engine {
              - sudo is usable: run it normally when a task needs root (Culvert pipes the saved profile password into sudo -S when required; passwordless sudo works too). Never ask the user for a password.\n\
              - Package managers vary: apt (Debian/Ubuntu), dnf/yum (Fedora/RHEL), apk (Alpine), zypper (openSUSE), pacman (Arch). When a profile below carries a \"last seen\" note, trust it first — that is what the host really has. If one is missing, do not guess another — run `command -v apt-get dnf yum apk zypper pacman` or `cat /etc/os-release` once, then use what exists. Tool results already include a [hint] with the detected manager after such a failure.\n\
              - Full-screen programs (htop, top, vim, less, tmux, watch, tail -f, journalctl -f) never run on the hidden channel: Culvert routes them to the visible terminal automatically and returns as soon as they start, so the user drives them. To confirm something is installed, use `command -v <name>` or `<name> --version` — never run the program itself as a test.\n\
-             - For installs and other interactive work (package managers, prompts, anything needing root where sudo may ask), call execute_command with in_terminal=true: the command is typed into the visible terminal tab, the user can answer prompts there, and the app returns what the screen showed. Output may be only the visible tail. State-changing commands do this by default; read-only ones use the hidden channel. Installing packages needs root: always write `sudo apk add …` / `sudo apt-get install …` / `sudo dnf install …` — a package manager run without sudo fails with a permission error.\n\nContext:\n",
+             - For installs and other interactive work (package managers, prompts, anything needing root where sudo may ask), call execute_command with in_terminal=true: the command is typed into the visible terminal tab, the user can answer prompts there, and the app returns what the screen showed. Output may be only the visible tail. State-changing commands do this by default; read-only ones use the hidden channel. Installing packages needs root: always write `sudo apk add …` / `sudo apt-get install …` / `sudo dnf install …` — a package manager run without sudo fails with a permission error.\n\
+             - To add a saved server, call create_server. To add a tunnel to a saved server, call add_forward. Use create_tunnel only for a standalone tunnel that carries its own SSH login. These tools save to disk and show an approval card.\n\
+             - Never ask for, repeat, or put a password or passphrase in chat or in tool arguments. The create_server/create_tunnel approval card has a local masked field; the user types the credential there. If the user pastes a secret in chat, tell them to enter it in that card and do not repeat it.\n\
+             - Creating a server or tunnel does not start anything. Only call start_tunnel when the user asked to start it; otherwise tell them it is saved and ready.\n\nContext:\n",
         );
         match ctx
             .active_session_id

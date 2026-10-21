@@ -11,9 +11,9 @@
 //! [`Executor`] runs the remote work.
 
 use crate::ai::security::{classify_command, sensitive_path, Risk};
-use crate::ai::{CtxTunnel, UiAction, UiContext};
+use crate::ai::{CtxTunnel, SecretPrompt, UiAction, UiContext};
 use crate::log::SharedLogs;
-use crate::session::{AuthType, SshSession};
+use crate::session::{AuthType, ForwardType, PortForward, Protocol, SshSession, StandaloneTunnel};
 use crate::ssh;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
@@ -64,6 +64,62 @@ pub fn defs() -> Vec<crate::ai::provider::ToolDef> {
             name: "list_tunnels",
             description: "List every configured tunnel (local/remote/dynamic) with its running state.",
             parameters: s(json!({ "type": "object", "properties": {} })),
+        },
+        ToolDef {
+            name: "create_server",
+            description: "Create and save a new SSH or RDP server in Culvert (same result as filling the server editor). Requires approval. NEVER ask for, repeat, or pass a password or passphrase: for password auth the approval card shows a masked field that the user fills in locally; for key auth the optional passphrase is collected there too. Use add_forward afterwards if the user also wants a tunnel through this saved server.",
+            parameters: s(json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Unique display name, e.g. 'staging web'." },
+                    "host": { "type": "string", "description": "Hostname or IP address." },
+                    "port": { "type": "number", "description": "SSH port (default 22)." },
+                    "username": { "type": "string", "description": "Login user." },
+                    "protocol": { "type": "string", "enum": ["ssh", "rdp"], "description": "Connection type (default ssh)." },
+                    "auth": { "type": "string", "enum": ["password", "key"], "description": "Authentication method (default password). The password itself is entered on the approval card, not supplied here." },
+                    "key_path": { "type": "string", "description": "Private key file on this computer. Required for key auth." }
+                },
+                "required": ["name", "host", "username"]
+            })),
+        },
+        ToolDef {
+            name: "create_tunnel",
+            description: "Create and save a STANDALONE tunnel that carries its own SSH login. Requires approval. Use this only when the user does not name a saved server. If they do, call add_forward instead. NEVER ask for, repeat, or pass a password/passphrase: the approval card collects it in a masked field.",
+            parameters: s(json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Unique display name, e.g. 'prod database'." },
+                    "host": { "type": "string", "description": "SSH hostname or IP." },
+                    "port": { "type": "number", "description": "SSH port (default 22)." },
+                    "username": { "type": "string", "description": "SSH login user." },
+                    "auth": { "type": "string", "enum": ["password", "key"], "description": "Authentication method (default password). The secret is entered on the approval card." },
+                    "key_path": { "type": "string", "description": "Private key file on this computer. Required for key auth." },
+                    "kind": { "type": "string", "enum": ["local", "remote", "dynamic"], "description": "Forward type (default local)." },
+                    "listen_host": { "type": "string", "description": "Address to listen on (default 127.0.0.1)." },
+                    "listen_port": { "type": "number", "description": "Local/server listen port." },
+                    "dest_host": { "type": "string", "description": "Destination host for local/remote forwards (default 127.0.0.1). Not used for dynamic." },
+                    "dest_port": { "type": "number", "description": "Destination port for local/remote forwards. Not used for dynamic." },
+                    "auto_reconnect": { "type": "boolean", "description": "Reconnect automatically after a drop (default false)." }
+                },
+                "required": ["name", "host", "username", "listen_port"]
+            })),
+        },
+        ToolDef {
+            name: "add_forward",
+            description: "Add a local, remote or SOCKS tunnel to an existing saved SSH server. Requires approval; no password is needed. Use create_tunnel instead only when the tunnel must carry its own SSH login.",
+            parameters: s(json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string", "description": "Saved server name or host (see list_connections)." },
+                    "kind": { "type": "string", "enum": ["local", "remote", "dynamic"], "description": "Forward type (default local)." },
+                    "listen_host": { "type": "string", "description": "Address to listen on (default 127.0.0.1)." },
+                    "listen_port": { "type": "number", "description": "Local/server listen port." },
+                    "dest_host": { "type": "string", "description": "Destination host for local/remote forwards (default 127.0.0.1). Not used for dynamic." },
+                    "dest_port": { "type": "number", "description": "Destination port for local/remote forwards. Not used for dynamic." },
+                    "auto_reconnect": { "type": "boolean", "description": "Reconnect automatically after a drop (default false)." }
+                },
+                "required": ["server", "listen_port"]
+            })),
         },
         ToolDef {
             name: "connect_server",
@@ -241,6 +297,8 @@ pub struct Call {
     pub command: Option<String>,
     /// Set when the *source* is sensitive regardless of content (read_file).
     pub sensitive: Option<String>,
+    /// Credential the approval card must collect before this call can run.
+    pub secret: Option<SecretPrompt>,
     pub prepared: Prepared,
 }
 
@@ -301,6 +359,159 @@ fn arg<'a>(args: &'a Value, key: &str) -> &'a str {
         .and_then(|v| v.as_str())
         .map(|s| s.trim())
         .unwrap_or("")
+}
+
+/// Parse a positive u16 port. A missing value uses `default` (0 means the
+/// argument is required). Both JSON numbers and numeric strings are accepted
+/// because local models sometimes emit quoted ports.
+fn port_arg(args: &Value, key: &str, default: u16) -> Result<u16, String> {
+    let Some(v) = args.get(key).filter(|v| !v.is_null()) else {
+        if default > 0 {
+            return Ok(default);
+        }
+        return Err(format!("missing '{key}'"));
+    };
+    let n = v
+        .as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
+    match n.and_then(|n| u16::try_from(n).ok()).filter(|p| *p > 0) {
+        Some(p) => Ok(p),
+        None => Err(format!("'{key}' must be a number from 1 to 65535")),
+    }
+}
+
+/// Optional port: 0 when absent. Used for dynamic forwards, where the
+/// destination port is intentionally empty.
+fn optional_port_arg(args: &Value, key: &str) -> Result<u16, String> {
+    match args.get(key).filter(|v| !v.is_null()) {
+        None => Ok(0),
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
+            match n.and_then(|n| u16::try_from(n).ok()) {
+                Some(p) => Ok(p),
+                None => Err(format!("'{key}' must be a number from 1 to 65535")),
+            }
+        }
+    }
+}
+
+fn bool_arg(args: &Value, key: &str) -> bool {
+    args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+fn auth_arg(args: &Value) -> Result<AuthType, String> {
+    match arg(args, "auth").to_ascii_lowercase().as_str() {
+        "" | "password" => Ok(AuthType::Password),
+        "key" | "private_key" | "private-key" => Ok(AuthType::Key),
+        other => Err(format!(
+            "unknown auth '{other}' — use 'password' or 'key'"
+        )),
+    }
+}
+
+fn protocol_arg(args: &Value) -> Result<Protocol, String> {
+    match arg(args, "protocol").to_ascii_lowercase().as_str() {
+        "" | "ssh" => Ok(Protocol::Ssh),
+        "rdp" => Ok(Protocol::Rdp),
+        other => Err(format!("unknown protocol '{other}' — use 'ssh' or 'rdp'")),
+    }
+}
+
+fn forward_type_arg(args: &Value) -> Result<ForwardType, String> {
+    match arg(args, "kind").to_ascii_lowercase().as_str() {
+        "" | "local" | "l" => Ok(ForwardType::Local),
+        "remote" | "r" => Ok(ForwardType::Remote),
+        "dynamic" | "socks" | "d" => Ok(ForwardType::Dynamic),
+        other => Err(format!(
+            "unknown tunnel kind '{other}' — use 'local', 'remote' or 'dynamic'"
+        )),
+    }
+}
+
+/// Validate the non-secret half of a login. The credential itself is added
+/// from the approval card after the user approves the call.
+fn check_login(
+    host: &str,
+    port: u16,
+    username: &str,
+    auth: &AuthType,
+    key_path: &str,
+) -> Result<(), String> {
+    if host.is_empty() {
+        return Err("missing 'host'".into());
+    }
+    if port == 0 {
+        return Err("SSH port must be > 0".into());
+    }
+    if username.is_empty() {
+        return Err("missing 'username'".into());
+    }
+    if *auth == AuthType::Key && key_path.is_empty() {
+        return Err("missing 'key_path' for key auth".into());
+    }
+    Ok(())
+}
+
+/// Build the approval-card prompt for a login. RDP has no saved SSH credential
+/// (Windows prompts itself); SSH password/passphrase values are collected only
+/// in the panel, never in a tool argument.
+fn login_secret_prompt(
+    protocol: &Protocol,
+    auth: &AuthType,
+    username: &str,
+    host: &str,
+) -> Option<SecretPrompt> {
+    if *protocol == Protocol::Rdp {
+        return None;
+    }
+    match auth {
+        AuthType::Password => Some(SecretPrompt {
+            label: "SSH password".into(),
+            hint: format!("password for {username}@{host}"),
+            required: true,
+        }),
+        AuthType::Key => Some(SecretPrompt {
+            label: "Private-key passphrase".into(),
+            hint: "leave blank if this key has no passphrase".into(),
+            required: false,
+        }),
+    }
+}
+
+fn forward_summary(f: &PortForward) -> String {
+    match f.fwd_type {
+        ForwardType::Local => format!(
+            "{}:{} → {}:{}",
+            f.listen_host, f.listen_port, f.dest_host, f.dest_port
+        ),
+        ForwardType::Remote => format!(
+            "server {}:{} → {}:{}",
+            f.listen_host, f.listen_port, f.dest_host, f.dest_port
+        ),
+        ForwardType::Dynamic => format!("SOCKS5 on {}:{}", f.listen_host, f.listen_port),
+    }
+}
+
+/// Apply the credential typed into the approval card to the prepared action.
+/// Called by the engine after approval, immediately before the UI action runs.
+/// The secret never enters the model conversation or the tool result.
+pub fn apply_secret(prepared: &mut Prepared, secret: &str) {
+    let Prepared::Action { action, .. } = prepared else {
+        return;
+    };
+    match action {
+        UiAction::CreateSession { session } => match session.auth_type {
+            AuthType::Password => session.password = secret.to_string(),
+            AuthType::Key => session.key_passphrase = secret.to_string(),
+        },
+        UiAction::CreateTunnel { tunnel } => match tunnel.auth_type {
+            AuthType::Password => tunnel.password = secret.to_string(),
+            AuthType::Key => tunnel.key_passphrase = secret.to_string(),
+        },
+        _ => {}
+    }
 }
 
 fn safe_shell(s: &str) -> bool {
@@ -394,6 +605,7 @@ fn state_call(tool: &str, q: StateQuery, summary: &str) -> Call {
         reason: "reads app state".to_string(),
         command: None,
         sensitive: None,
+        secret: None,
         prepared: Prepared::State(q),
     }
 }
@@ -407,6 +619,201 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
         "get_current_directory" => Ok(state_call(tool, StateQuery::CurrentDirectory, "read the current directory")),
         "get_selected_file" => Ok(state_call(tool, StateQuery::SelectedFile, "read the selected file")),
         "list_tunnels" => Ok(state_call(tool, StateQuery::Tunnels, "list tunnels")),
+
+        "create_server" => {
+            let name = arg(args, "name");
+            if name.is_empty() {
+                return Err("missing 'name'".into());
+            }
+            let host = arg(args, "host").to_string();
+            let port = port_arg(args, "port", 22)?;
+            let username = arg(args, "username").to_string();
+            let protocol = protocol_arg(args)?;
+            let auth = auth_arg(args)?;
+            let key_path = arg(args, "key_path").to_string();
+            check_login(&host, port, &username, &auth, &key_path)?;
+            if ctx
+                .profiles
+                .iter()
+                .any(|p| p.name.eq_ignore_ascii_case(name))
+            {
+                return Err(format!(
+                    "a saved server named '{name}' already exists — choose another name"
+                ));
+            }
+
+            let mut session = SshSession::default();
+            session.name = name.to_string();
+            session.protocol = protocol.clone();
+            session.host = host.clone();
+            session.port = port;
+            session.username = username.clone();
+            session.auth_type = auth.clone();
+            session.key_path = key_path;
+
+            let kind = match &protocol {
+                Protocol::Ssh => "SSH",
+                Protocol::Rdp => "RDP",
+            };
+            let auth_label = match &protocol {
+                Protocol::Rdp => "Windows credentials".to_string(),
+                Protocol::Ssh => match auth {
+                    AuthType::Password => "password auth".to_string(),
+                    AuthType::Key => "key auth".to_string(),
+                },
+            };
+            let secret = login_secret_prompt(&protocol, &auth, &username, &host);
+            Ok(Call {
+                tool: tool.to_string(),
+                summary: format!(
+                    "create {kind} server '{name}' — {username}@{host}:{port} ({auth_label})"
+                ),
+                risk: Risk::Approval,
+                reason: "saves a new server to sessions.json".into(),
+                command: None,
+                sensitive: None,
+                secret,
+                prepared: Prepared::Action {
+                    action: UiAction::CreateSession { session },
+                    label: format!("save server '{name}'"),
+                },
+            })
+        }
+
+        "create_tunnel" => {
+            let name = arg(args, "name");
+            if name.is_empty() {
+                return Err("missing 'name'".into());
+            }
+            let host = arg(args, "host").to_string();
+            let port = port_arg(args, "port", 22)?;
+            let username = arg(args, "username").to_string();
+            let auth = auth_arg(args)?;
+            let key_path = arg(args, "key_path").to_string();
+            let kind = forward_type_arg(args)?;
+            check_login(&host, port, &username, &auth, &key_path)?;
+
+            let listen_port = port_arg(args, "listen_port", 0)?;
+            let listen_host = {
+                let h = arg(args, "listen_host");
+                if h.is_empty() { "127.0.0.1" } else { h }.to_string()
+            };
+            let mut forward = PortForward {
+                id: uuid::Uuid::new_v4().to_string(),
+                fwd_type: kind,
+                listen_host,
+                listen_port,
+                dest_host: {
+                    let h = arg(args, "dest_host");
+                    if h.is_empty() { "127.0.0.1" } else { h }.to_string()
+                },
+                dest_port: optional_port_arg(args, "dest_port")?,
+                auto_reconnect: bool_arg(args, "auto_reconnect"),
+            };
+            if forward.fwd_type == ForwardType::Dynamic {
+                forward.dest_host.clear();
+                forward.dest_port = 0;
+            }
+            forward.validate()?;
+
+            let tunnel = StandaloneTunnel {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: name.to_string(),
+                host: host.clone(),
+                port,
+                username: username.clone(),
+                auth_type: auth.clone(),
+                password: String::new(),
+                key_path,
+                key_passphrase: String::new(),
+                forwards: vec![forward.clone()],
+            };
+            let auth_label = match auth {
+                AuthType::Password => "password auth",
+                AuthType::Key => "key auth",
+            };
+            let secret = login_secret_prompt(&Protocol::Ssh, &auth, &username, &host);
+            Ok(Call {
+                tool: tool.to_string(),
+                summary: format!(
+                    "create standalone tunnel '{name}' — {} via {username}@{host}:{port} ({auth_label})",
+                    forward_summary(&forward)
+                ),
+                risk: Risk::Approval,
+                reason: "saves a new standalone tunnel to tunnels.json".into(),
+                command: None,
+                sensitive: None,
+                secret,
+                prepared: Prepared::Action {
+                    action: UiAction::CreateTunnel { tunnel },
+                    label: format!("save tunnel '{name}'"),
+                },
+            })
+        }
+
+        "add_forward" => {
+            let want = arg(args, "server");
+            if want.is_empty() {
+                return Err("missing 'server'".into());
+            }
+            let (id, name) = resolve_server(ctx, &json!({ "server": want }))?;
+            let Some(profile) = ctx.profiles.iter().find(|p| p.id == id) else {
+                return Err(format!("unknown saved server '{name}'"));
+            };
+            if profile.protocol != Protocol::Ssh {
+                return Err(format!(
+                    "'{name}' is an RDP server — tunnels need an SSH connection"
+                ));
+            }
+            let kind = forward_type_arg(args)?;
+            let listen_port = port_arg(args, "listen_port", 0)?;
+            let listen_host = {
+                let h = arg(args, "listen_host");
+                if h.is_empty() { "127.0.0.1" } else { h }.to_string()
+            };
+            let mut forward = PortForward {
+                id: uuid::Uuid::new_v4().to_string(),
+                fwd_type: kind,
+                listen_host: listen_host.clone(),
+                listen_port,
+                dest_host: {
+                    let h = arg(args, "dest_host");
+                    if h.is_empty() { "127.0.0.1" } else { h }.to_string()
+                },
+                dest_port: optional_port_arg(args, "dest_port")?,
+                auto_reconnect: bool_arg(args, "auto_reconnect"),
+            };
+            if forward.fwd_type == ForwardType::Dynamic {
+                forward.dest_host.clear();
+                forward.dest_port = 0;
+            }
+            forward.validate()?;
+            if profile.forwards.iter().any(|f| {
+                f.listen_host.eq_ignore_ascii_case(&listen_host)
+                    && f.listen_port == listen_port
+            }) {
+                return Err(format!(
+                    "'{name}' already has a tunnel listening on {listen_host}:{listen_port}"
+                ));
+            }
+            let desc = forward_summary(&forward);
+            Ok(Call {
+                tool: tool.to_string(),
+                summary: format!("add tunnel to '{name}' — {desc}"),
+                risk: Risk::Approval,
+                reason: "adds a tunnel to a saved server and writes sessions.json".into(),
+                command: None,
+                sensitive: None,
+                secret: None,
+                prepared: Prepared::Action {
+                    action: UiAction::AddForward {
+                        session_id: id,
+                        forward,
+                    },
+                    label: format!("add tunnel to '{name}'"),
+                },
+            })
+        }
 
         "connect_server" | "disconnect_server" => {
             let want = arg(args, "profile");
@@ -426,6 +833,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                 reason: "changes open sessions".into(),
                 command: None,
                 sensitive: None,
+                secret: None,
                 prepared: Prepared::Action {
                     action,
                     label: format!("{verb} {name}"),
@@ -461,6 +869,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                 reason: "changes tunnel state".into(),
                 command: None,
                 sensitive: None,
+                secret: None,
                 prepared: Prepared::Action {
                     action,
                     label: format!("{verb} {}", t.summary),
@@ -524,6 +933,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                 reason,
                 command: Some(command.clone()),
                 sensitive: None,
+                secret: None,
                 prepared: Prepared::Ssh {
                     session_id: id,
                     label,
@@ -542,6 +952,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                 reason: "fixed read-only probe".into(),
                 command: Some(script.to_string()),
                 sensitive: None,
+                secret: None,
                 prepared: Prepared::Ssh {
                     session_id: id,
                     label,
@@ -568,6 +979,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                 reason: "read-only command".into(),
                 command: Some(command.clone()),
                 sensitive: None,
+                secret: None,
                 prepared: Prepared::Ssh {
                     session_id: id,
                     label,
@@ -617,6 +1029,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                 reason: "read-only search".into(),
                 command: Some(cmd),
                 sensitive: None,
+                secret: None,
                 prepared: Prepared::Ssh {
                     session_id: id,
                     label,
@@ -639,6 +1052,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                 reason: "reads a directory listing".into(),
                 command: None,
                 sensitive: None,
+                secret: None,
                 prepared: Prepared::ListDir {
                     session_id: id,
                     label,
@@ -660,6 +1074,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                 reason: "reads a file (content is security-filtered)".into(),
                 command: None,
                 sensitive: sensitive_path(&path),
+                secret: None,
                 prepared: Prepared::ReadFile {
                     session_id: id,
                     label,
@@ -693,6 +1108,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                 reason: "writes a file on this computer".into(),
                 command: None,
                 sensitive: None,
+                secret: None,
                 prepared: Prepared::Download {
                     session_id: id,
                     label,
@@ -719,6 +1135,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                 reason: "writes to the server".into(),
                 command: None,
                 sensitive: None,
+                secret: None,
                 prepared: Prepared::Upload {
                     session_id: id,
                     label,
@@ -741,6 +1158,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                 reason: "moves the file browser".into(),
                 command: None,
                 sensitive: None,
+                secret: None,
                 prepared: Prepared::Action {
                     action: UiAction::DockNavigate {
                         session_id: id,
@@ -764,6 +1182,7 @@ pub fn prepare(tool: &str, args: &Value, ctx: &UiContext) -> Result<Call, String
                 reason: "downloads a copy and opens the editor".into(),
                 command: None,
                 sensitive: None,
+                secret: None,
                 prepared: Prepared::Action {
                     action: UiAction::OpenFile {
                         session_id: id,
@@ -1817,6 +2236,258 @@ mod tests {
                 println!("finding: sudo authenticated with the saved password");
             }
         });
+    }
+
+    fn test_ctx(profiles: Vec<SshSession>) -> crate::ai::UiContext {
+        let profiles_summary = profiles
+            .iter()
+            .map(|p| crate::ai::CtxSession {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                host: p.host.clone(),
+                username: p.username.clone(),
+                protocol: match p.protocol {
+                    Protocol::Ssh => "ssh".into(),
+                    Protocol::Rdp => "rdp".into(),
+                },
+                group: p.group.clone(),
+            })
+            .collect();
+        crate::ai::UiContext {
+            profiles,
+            profiles_summary,
+            ..Default::default()
+        }
+    }
+
+    fn action_of(call: &Call) -> &UiAction {
+        match &call.prepared {
+            Prepared::Action { action, .. } => action,
+            _ => panic!("expected a UI action"),
+        }
+    }
+
+    #[test]
+    fn create_tools_never_accept_secrets_in_their_schemas() {
+        let defs = defs();
+        for name in ["create_server", "create_tunnel", "add_forward"] {
+            let def = defs
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            let props = def.parameters["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} has no properties"));
+            for forbidden in ["password", "passphrase", "secret"] {
+                assert!(
+                    !props.contains_key(forbidden),
+                    "{name} must not accept '{forbidden}' as a tool argument"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn create_server_collects_a_password_locally_and_only_injects_after_approval() {
+        let ctx = test_ctx(Vec::new());
+        let mut call = prepare(
+            "create_server",
+            &serde_json::json!({
+                "name": "staging",
+                "host": "10.0.0.9",
+                "username": "deploy",
+                "auth": "password"
+            }),
+            &ctx,
+        )
+        .expect("create_server should prepare");
+        assert_eq!(call.risk, Risk::Approval);
+        let spec = call.secret.as_ref().expect("password prompt");
+        assert!(spec.required);
+        assert!(!call.summary.contains("hunter2"));
+
+        match action_of(&call) {
+            UiAction::CreateSession { session } => {
+                assert_eq!(session.name, "staging");
+                assert_eq!(session.host, "10.0.0.9");
+                assert_eq!(session.port, 22);
+                assert!(session.password.is_empty());
+            }
+            _ => panic!("expected CreateSession"),
+        }
+
+        // The credential exists only in the local approval buffer until the
+        // engine injects it straight into the prepared action.
+        apply_secret(&mut call.prepared, "hunter2");
+        match action_of(&call) {
+            UiAction::CreateSession { session } => {
+                assert_eq!(session.password, "hunter2");
+                assert_eq!(session.key_passphrase, "");
+            }
+            _ => panic!("expected CreateSession"),
+        }
+        assert!(!call.summary.contains("hunter2"));
+
+        let duplicate = prepare(
+            "create_server",
+            &serde_json::json!({ "name": "Staging", "host": "10.0.0.10", "username": "deploy" }),
+            &test_ctx(vec![SshSession {
+                name: "staging".into(),
+                ..SshSession::default()
+            }]),
+        );
+        assert!(duplicate
+            .err()
+            .is_some_and(|e| e.contains("already exists")));
+    }
+
+    #[test]
+    fn key_auth_collects_an_optional_passphrase_not_a_password() {
+        let ctx = test_ctx(Vec::new());
+        let mut call = prepare(
+            "create_server",
+            &serde_json::json!({
+                "name": "key host",
+                "host": "10.0.0.11",
+                "username": "root",
+                "auth": "key",
+                "key_path": "C:\\keys\\id_ed25519"
+            }),
+            &ctx,
+        )
+        .expect("key auth should prepare");
+        let spec = call.secret.as_ref().expect("passphrase prompt");
+        assert!(!spec.required);
+        apply_secret(&mut call.prepared, "key-pass");
+        match action_of(&call) {
+            UiAction::CreateSession { session } => {
+                assert_eq!(session.auth_type, AuthType::Key);
+                assert_eq!(session.password, "");
+                assert_eq!(session.key_passphrase, "key-pass");
+            }
+            _ => panic!("expected CreateSession"),
+        }
+        assert!(!call.summary.contains("key-pass"));
+
+        // RDP has no saved SSH credential, so there is nothing to collect.
+        let rdp = prepare(
+            "create_server",
+            &serde_json::json!({
+                "name": "windows",
+                "host": "10.0.0.12",
+                "username": "Administrator",
+                "protocol": "rdp"
+            }),
+            &ctx,
+        )
+        .expect("RDP should prepare");
+        assert!(rdp.secret.is_none());
+    }
+
+    #[test]
+    fn create_tunnel_prepares_a_standalone_tunnel_and_injects_its_password() {
+        let mut call = prepare(
+            "create_tunnel",
+            &serde_json::json!({
+                "name": "prod database",
+                "host": "10.0.0.20",
+                "username": "deploy",
+                "listen_port": 15433,
+                "dest_host": "10.0.0.30",
+                "dest_port": 5432
+            }),
+            &test_ctx(Vec::new()),
+        )
+        .expect("create_tunnel should prepare");
+        assert_eq!(call.risk, Risk::Approval);
+        assert!(call.secret.as_ref().is_some_and(|s| s.required));
+        match action_of(&call) {
+            UiAction::CreateTunnel { tunnel } => {
+                assert_eq!(tunnel.name, "prod database");
+                assert_eq!(tunnel.host, "10.0.0.20");
+                assert!(tunnel.password.is_empty());
+                assert_eq!(tunnel.forwards.len(), 1);
+                assert_eq!(tunnel.forwards[0].listen_port, 15433);
+                assert_eq!(tunnel.forwards[0].dest_port, 5432);
+            }
+            _ => panic!("expected CreateTunnel"),
+        }
+
+        apply_secret(&mut call.prepared, "tunnel-pass");
+        match action_of(&call) {
+            UiAction::CreateTunnel { tunnel } => {
+                assert_eq!(tunnel.password, "tunnel-pass");
+            }
+            _ => panic!("expected CreateTunnel"),
+        }
+        assert!(!call.summary.contains("tunnel-pass"));
+
+        let missing_port = prepare(
+            "create_tunnel",
+            &serde_json::json!({
+                "name": "no port", "host": "10.0.0.20", "username": "deploy"
+            }),
+            &test_ctx(Vec::new()),
+        );
+        assert!(missing_port.err().is_some_and(|e| e.contains("listen_port")));
+    }
+
+    #[test]
+    fn add_forward_targets_a_saved_ssh_server_without_a_secret() {
+        let mut ctx = test_ctx(vec![SshSession {
+            id: "srv1".into(),
+            name: "staging".into(),
+            host: "10.0.0.9".into(),
+            username: "deploy".into(),
+            ..SshSession::default()
+        }]);
+        let call = prepare(
+            "add_forward",
+            &serde_json::json!({
+                "server": "staging",
+                "listen_port": 15433,
+                "dest_host": "10.0.0.30",
+                "dest_port": 5432
+            }),
+            &ctx,
+        )
+        .expect("add_forward should prepare");
+        assert_eq!(call.risk, Risk::Approval);
+        assert!(call.secret.is_none());
+        match action_of(&call) {
+            UiAction::AddForward {
+                session_id,
+                forward,
+            } => {
+                assert_eq!(session_id, "srv1");
+                assert_eq!(forward.listen_host, "127.0.0.1");
+                assert_eq!(forward.listen_port, 15433);
+                assert_eq!(forward.dest_host, "10.0.0.30");
+                assert_eq!(forward.dest_port, 5432);
+            }
+            _ => panic!("expected AddForward"),
+        }
+
+        ctx.profiles[0].forwards.push(PortForward {
+            id: "f1".into(),
+            listen_host: "127.0.0.1".into(),
+            listen_port: 15433,
+            dest_host: "10.0.0.30".into(),
+            dest_port: 5432,
+            ..PortForward::default()
+        });
+        let duplicate = prepare(
+            "add_forward",
+            &serde_json::json!({
+                "server": "staging",
+                "listen_port": 15433,
+                "dest_port": 5432
+            }),
+            &ctx,
+        );
+        assert!(duplicate
+            .err()
+            .is_some_and(|e| e.contains("already has a tunnel listening")));
     }
 
     /// Live probe for the package-manager hint, against the same demo server.

@@ -8,7 +8,7 @@ use crate::ai::config::{self, AiConfig, SecMode};
 use crate::ai::engine::{AiCmd, AiEvent};
 use crate::ai::provider::Flavor;
 use crate::ai::security::Risk;
-use crate::ai::{new_context, new_audit, push_audit, AuditEntry, SharedAudit, UiAction, UiContext};
+use crate::ai::{new_context, new_audit, push_audit, AuditEntry, SecretPrompt, SharedAudit, UiAction, UiContext};
 use crate::log::SharedLogs;
 use crate::theme::{self, tglyph};
 use eframe::egui::{self, Align2, Color32, CornerRadius, Frame, Margin, RichText, Ui};
@@ -65,6 +65,7 @@ enum PendingKind {
         command: Option<String>,
         risk: Risk,
         reason: String,
+        secret: Option<SecretPrompt>,
     },
     Gate {
         source: String,
@@ -91,6 +92,7 @@ pub struct AiPanel {
     models: Vec<String>,
     models_note: Option<(bool, String)>,
     test_note: Option<(bool, String)>,
+    api_key_visible: bool,
 
     msgs: Vec<UiMsg>,
     streaming: Option<String>,
@@ -98,6 +100,8 @@ pub struct AiPanel {
     pending: Option<Pending>,
     edit_command: bool,
     edit_buf: String,
+    secret_buf: String,
+    secret_visible: bool,
     tab: Tab,
     records: Vec<ExecRecord>,
     pending_action: Option<(u64, UiAction, String)>,
@@ -124,12 +128,15 @@ impl AiPanel {
             models: Vec::new(),
             models_note: None,
             test_note: None,
+            api_key_visible: false,
             msgs: Vec::new(),
             streaming: None,
             input: String::new(),
             pending: None,
             edit_command: false,
             edit_buf: String::new(),
+            secret_buf: String::new(),
+            secret_visible: false,
             tab: Tab::Chat,
             records: Vec::new(),
             pending_action: None,
@@ -141,7 +148,7 @@ impl AiPanel {
         };
         me.msgs.push(UiMsg {
             role: Role::Info,
-            text: "Ask about your servers in plain language — e.g. “check disk space on the demo host”, “show running containers”, “find log files larger than 1 GB”.\n\nI run read-only commands straight away; anything that changes state asks for your approval first.".into(),
+            text: "Ask about your servers in plain language — e.g. “check disk space on the demo host”, “show running containers”, “add an SSH server called staging for deploy@10.0.0.9”, “add a tunnel to staging from local 15433 to 10.0.0.20:5432”.\n\nI run read-only commands straight away; anything that saves or changes state asks for your approval first. Passwords and passphrases are typed into a masked field on the approval card — they are never sent to the model.".into(),
             card: None,
         });
         me
@@ -154,6 +161,7 @@ impl AiPanel {
 
     pub fn open_settings(&mut self) {
         self.draft = self.cfg.clone();
+        self.api_key_visible = false;
         self.settings_open = true;
     }
 
@@ -233,6 +241,8 @@ impl AiPanel {
                     self.streaming = Some(String::new());
                     self.pending = None;
                     self.edit_command = false;
+                    self.secret_buf.clear();
+                    self.secret_visible = false;
                 }
                 AiEvent::Delta(d) => {
                     self.streaming.get_or_insert_with(String::new).push_str(&d);
@@ -306,9 +316,12 @@ impl AiPanel {
                     command,
                     risk,
                     reason,
+                    secret,
                 } => {
                     self.edit_command = false;
                     self.edit_buf = command.clone().unwrap_or_default();
+                    self.secret_buf.clear();
+                    self.secret_visible = false;
                     self.pending = Some(Pending {
                         id,
                         kind: PendingKind::Approval {
@@ -317,6 +330,7 @@ impl AiPanel {
                             command,
                             risk,
                             reason,
+                            secret,
                         },
                     });
                 }
@@ -357,6 +371,8 @@ impl AiPanel {
                 AiEvent::TurnEnd => {
                     self.busy = false;
                     self.pending = None;
+                    self.secret_buf.clear();
+                    self.secret_visible = false;
                     if let Some(s) = self.streaming.take() {
                         if !s.trim().is_empty() {
                             self.msgs.push(UiMsg {
@@ -558,6 +574,7 @@ impl AiPanel {
                     command,
                     risk,
                     reason,
+                    secret,
                 } => {
                     let colour = match risk {
                         Risk::High => Color32::from_rgb(196, 84, 76),
@@ -609,6 +626,43 @@ impl AiPanel {
                                         });
                                 }
                             }
+                            if let Some(spec) = secret {
+                                ui.add_space(5.0);
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} — stored locally, never sent to the model",
+                                        spec.label
+                                    ))
+                                    .size(10.5)
+                                    .color(theme::TEXT_DIM()),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.secret_buf)
+                                            .password(!self.secret_visible)
+                                            .hint_text(spec.hint.as_str())
+                                            .desired_width((ui.available_width() - 30.0).max(80.0)),
+                                    );
+                                    let (glyph, tip) = if self.secret_visible {
+                                        (tglyph::EYE_OFF, "Hide password")
+                                    } else {
+                                        (tglyph::EYE, "Show password")
+                                    };
+                                    if icon_button(ui, glyph, tip).clicked() {
+                                        self.secret_visible = !self.secret_visible;
+                                    }
+                                });
+                            }
+                            let secret_missing = secret.as_ref().is_some_and(|s| {
+                                s.required && self.secret_buf.trim().is_empty()
+                            });
+                            if secret_missing {
+                                ui.label(
+                                    RichText::new("Enter the credential above to enable Execute.")
+                                        .size(10.0)
+                                        .color(theme::WARNING()),
+                                );
+                            }
                             ui.add_space(5.0);
                             ui.horizontal(|ui| {
                                 let exec = if self.edit_command {
@@ -617,9 +671,13 @@ impl AiPanel {
                                     "Execute"
                                 };
                                 if ui
-                                    .add(egui::Button::new(
-                                        RichText::new(exec).size(11.5).color(Color32::WHITE),
-                                    ).fill(theme::SUCCESS()))
+                                    .add_enabled(
+                                        !secret_missing,
+                                        egui::Button::new(
+                                            RichText::new(exec).size(11.5).color(Color32::WHITE),
+                                        )
+                                        .fill(theme::SUCCESS()),
+                                    )
                                     .clicked()
                                 {
                                     let edited = if self.edit_command
@@ -629,7 +687,10 @@ impl AiPanel {
                                     } else {
                                         None
                                     };
-                                    act = Some(UiCmd::Approve { id: p.id, edited });
+                                    let secret = secret
+                                        .as_ref()
+                                        .map(|_| self.secret_buf.clone());
+                                    act = Some(UiCmd::Approve { id: p.id, edited, secret });
                                 }
                                 if command.is_some()
                                     && ui
@@ -709,6 +770,7 @@ impl AiPanel {
                                     act = Some(UiCmd::Approve {
                                         id: p.id,
                                         edited: None,
+                                        secret: None,
                                     });
                                 }
                                 if ui
@@ -722,6 +784,7 @@ impl AiPanel {
                                     act = Some(UiCmd::Approve {
                                         id: p.id,
                                         edited: Some("redacted".into()),
+                                        secret: None,
                                     });
                                 }
                                 if ui
@@ -747,8 +810,12 @@ impl AiPanel {
 
         if let Some(act) = act {
             self.pending = None;
+            self.secret_buf.clear();
+            self.secret_visible = false;
             match act {
-                UiCmd::Approve { id, edited } => self.send(AiCmd::Approve { id, edited }),
+                UiCmd::Approve { id, edited, secret } => {
+                    self.send(AiCmd::Approve { id, edited, secret })
+                }
                 UiCmd::Reject { id } => self.send(AiCmd::Reject { id }),
                 UiCmd::CancelTurn => self.send(AiCmd::Cancel),
             }
@@ -820,7 +887,7 @@ impl AiPanel {
         let hint = if self.busy {
             "Working… (Stop cancels approvals; wait for commands to finish)"
         } else {
-            "Ask anything — “check disk space”, “tail the nginx errors”, “start the web tunnel”…"
+            "Ask anything — “check disk space”, “add a server”, “add a tunnel to staging”…"
         };
         let resp = ui.add(
             egui::TextEdit::multiline(&mut self.input)
@@ -936,12 +1003,22 @@ impl AiPanel {
                     ui.add_space(4.0);
 
                     ui.label(RichText::new("API key").size(11.5).strong());
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.draft.api_key)
-                            .password(true)
-                            .desired_width(f32::INFINITY)
-                            .hint_text(flavor.key_hint()),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.draft.api_key)
+                                .password(!self.api_key_visible)
+                                .desired_width((ui.available_width() - 30.0).max(80.0))
+                                .hint_text(flavor.key_hint()),
+                        );
+                        let (glyph, tip) = if self.api_key_visible {
+                            (tglyph::EYE_OFF, "Hide API key")
+                        } else {
+                            (tglyph::EYE, "Show API key")
+                        };
+                        if icon_button(ui, glyph, tip).clicked() {
+                            self.api_key_visible = !self.api_key_visible;
+                        }
+                    });
                     ui.label(
                         RichText::new("Encrypted with Windows DPAPI (your Windows account is the key).")
                             .size(9.5)
@@ -1107,7 +1184,11 @@ impl AiPanel {
 }
 
 enum UiCmd {
-    Approve { id: u64, edited: Option<String> },
+    Approve {
+        id: u64,
+        edited: Option<String>,
+        secret: Option<String>,
+    },
     Reject { id: u64 },
     CancelTurn,
 }
