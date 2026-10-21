@@ -80,6 +80,28 @@ struct Pending {
     kind: PendingKind,
 }
 
+/// In-flight GitHub device login. The token only lands in `draft.api_key`
+/// after the user authorizes in the browser; it never enters chat or audit.
+struct GitHubLogin {
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    status: String,
+    error: Option<String>,
+}
+
+enum GitHubLoginEvent {
+    DeviceCode {
+        user_code: String,
+        verification_uri: String,
+        expires_in: u64,
+    },
+    Done {
+        token: String,
+    },
+    Error(String),
+}
+
 pub struct AiPanel {
     pub open: bool,
     pub busy: bool,
@@ -93,6 +115,9 @@ pub struct AiPanel {
     models_note: Option<(bool, String)>,
     test_note: Option<(bool, String)>,
     api_key_visible: bool,
+    github_login: Option<GitHubLogin>,
+    github_rx: Option<UnboundedReceiver<GitHubLoginEvent>>,
+    github_task: Option<tokio::task::JoinHandle<()>>,
 
     msgs: Vec<UiMsg>,
     streaming: Option<String>,
@@ -129,6 +154,9 @@ impl AiPanel {
             models_note: None,
             test_note: None,
             api_key_visible: false,
+            github_login: None,
+            github_rx: None,
+            github_task: None,
             msgs: Vec::new(),
             streaming: None,
             input: String::new(),
@@ -160,7 +188,11 @@ impl AiPanel {
     }
 
     pub fn open_settings(&mut self) {
+        self.cancel_github_login();
         self.draft = self.cfg.clone();
+        if Flavor::from_id(&self.draft.provider) == Flavor::GitHubCopilot {
+            self.draft.base_url.clear();
+        }
         self.api_key_visible = false;
         self.settings_open = true;
     }
@@ -225,6 +257,120 @@ impl AiPanel {
         });
         self.busy = true;
         self.send(AiCmd::UserMessage(text));
+    }
+
+    /// Start GitHub's device flow. The browser opens as soon as GitHub returns
+    /// the one-time code; the token is delivered back through `github_rx`.
+    fn start_github_login(&mut self, ctx: &egui::Context) {
+        self.cancel_github_login();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.github_rx = Some(rx);
+        self.github_login = Some(GitHubLogin {
+            user_code: String::new(),
+            verification_uri: String::new(),
+            expires_in: 900,
+            status: "Requesting a GitHub device code…".into(),
+            error: None,
+        });
+
+        let code_ctx = ctx.clone();
+        let done_ctx = ctx.clone();
+        let handle = self.rt.spawn(async move {
+            let code_tx = tx.clone();
+            let result = crate::ai::provider::github_device_login(move |code, uri, expires| {
+                let _ = code_tx.send(GitHubLoginEvent::DeviceCode {
+                    user_code: code.to_string(),
+                    verification_uri: uri.to_string(),
+                    expires_in: expires,
+                });
+                code_ctx.request_repaint();
+            })
+            .await;
+            match result {
+                Ok(token) => {
+                    let _ = tx.send(GitHubLoginEvent::Done { token });
+                }
+                Err(e) => {
+                    let _ = tx.send(GitHubLoginEvent::Error(e));
+                }
+            }
+            done_ctx.request_repaint();
+        });
+        self.github_task = Some(handle);
+    }
+
+    fn cancel_github_login(&mut self) {
+        if let Some(task) = self.github_task.take() {
+            task.abort();
+        }
+        self.github_rx = None;
+        self.github_login = None;
+    }
+
+    fn poll_github_login(&mut self) -> bool {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = &mut self.github_rx {
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+            disconnected = rx.is_closed();
+        }
+        if events.is_empty() {
+            if !disconnected {
+                return false;
+            }
+            if let Some(login) = &mut self.github_login {
+                login.status = "Sign-in failed".into();
+                login.error =
+                    Some("GitHub sign-in ended unexpectedly. Try again.".to_string());
+            }
+            self.github_task = None;
+            self.github_rx = None;
+            return true;
+        }
+
+        let mut finished = false;
+        for ev in events {
+            match ev {
+                GitHubLoginEvent::DeviceCode {
+                    user_code,
+                    verification_uri,
+                    expires_in,
+                } => {
+                    if is_github_url(&verification_uri) {
+                        open_url(&verification_uri);
+                    }
+                    if let Some(login) = &mut self.github_login {
+                        login.user_code = user_code;
+                        login.verification_uri = verification_uri;
+                        login.expires_in = expires_in;
+                        login.status = "Waiting for authorization in the browser…".into();
+                    }
+                }
+                GitHubLoginEvent::Done { token } => {
+                    self.draft.api_key = token;
+                    self.github_login = None;
+                    self.github_task = None;
+                    finished = true;
+                    self.models_note =
+                        Some((true, "Signed in to GitHub — fetching Copilot models…".into()));
+                    self.send(AiCmd::FetchModels(Box::new(self.draft.clone())));
+                }
+                GitHubLoginEvent::Error(e) => {
+                    if let Some(login) = &mut self.github_login {
+                        login.status = "Sign-in failed".into();
+                        login.error = Some(e);
+                    }
+                    self.github_task = None;
+                    finished = true;
+                }
+            }
+        }
+        if finished {
+            self.github_rx = None;
+        }
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -386,12 +532,21 @@ impl AiPanel {
                 AiEvent::Models(list, note) => {
                     let ok = !list.is_empty();
                     self.models = list;
+                    if ok
+                        && Flavor::from_id(&self.draft.provider) == Flavor::GitHubCopilot
+                        && self.draft.model.trim().is_empty()
+                    {
+                        self.draft.model = self.models[0].clone();
+                    }
                     self.models_note = Some((ok, note));
                 }
                 AiEvent::TestResult(ok, msg) => {
                     self.test_note = Some((ok, msg));
                 }
             }
+        }
+        if self.poll_github_login() {
+            changed = true;
         }
         changed
     }
@@ -935,6 +1090,135 @@ impl AiPanel {
         });
     }
 
+    /// GitHub Copilot is a subscription, not an API key: the primary path is
+    /// GitHub's device login. The token field stays available for automation.
+    fn github_provider_ui(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        ui.label(RichText::new("GitHub Copilot subscription").size(11.5).strong());
+        let signed_in = !self.draft.api_key.trim().is_empty();
+        let pending = self.github_login.is_some();
+
+        if signed_in {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Signed in — Save keeps the token encrypted with Windows DPAPI.")
+                        .size(10.0)
+                        .color(theme::SUCCESS()),
+                );
+                if ui
+                    .small_button("Sign out")
+                    .on_hover_text("Save to apply")
+                    .clicked()
+                {
+                    self.draft.api_key.clear();
+                    self.cancel_github_login();
+                    self.models.clear();
+                    self.models_note = None;
+                }
+                if ui.small_button("Sign in again").clicked() {
+                    self.draft.api_key.clear();
+                    self.start_github_login(ctx);
+                }
+            });
+        } else if !pending {
+            ui.label(
+                RichText::new(
+                    "Sign in with the GitHub account that has a Copilot Pro, Pro+, Business or Enterprise plan.",
+                )
+                .size(9.5)
+                .color(theme::TEXT_FAINT()),
+            );
+            if ui.button(RichText::new("Sign in with GitHub").size(11.0)).clicked() {
+                self.start_github_login(ctx);
+            }
+        }
+
+        let mut cancel_login = false;
+        let mut retry_login = false;
+        if let Some(login) = &self.github_login {
+            ui.add_space(3.0);
+            if let Some(err) = &login.error {
+                ui.label(
+                    RichText::new(err)
+                        .size(10.0)
+                        .color(Color32::from_rgb(210, 96, 88)),
+                );
+            } else if login.user_code.is_empty() {
+                ui.label(
+                    RichText::new(&login.status)
+                        .size(10.0)
+                        .color(theme::TEXT_DIM()),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Code").size(10.0).strong());
+                    ui.label(
+                        RichText::new(&login.user_code)
+                            .monospace()
+                            .size(14.0)
+                            .strong(),
+                    );
+                    if ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(login.user_code.clone());
+                    }
+                });
+                ui.hyperlink_to("Open github.com/login/device", &login.verification_uri);
+                let mins = (login.expires_in + 59) / 60;
+                ui.label(
+                    RichText::new(format!(
+                        "Waiting for authorization in the browser… code expires in about {mins} min."
+                    ))
+                    .size(9.5)
+                    .color(theme::TEXT_FAINT()),
+                );
+            }
+            if login.error.is_some() {
+                ui.horizontal(|ui| {
+                    if ui.small_button("Try again").clicked() {
+                        retry_login = true;
+                    }
+                    if ui.small_button("Dismiss").clicked() {
+                        cancel_login = true;
+                    }
+                });
+            } else if ui.small_button("Cancel sign-in").clicked() {
+                cancel_login = true;
+            }
+        }
+        if cancel_login {
+            self.cancel_github_login();
+        }
+        if retry_login {
+            self.draft.api_key.clear();
+            self.start_github_login(ctx);
+        }
+
+        ui.collapsing("Advanced: use an existing GitHub token", |ui| {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.draft.api_key)
+                        .password(!self.api_key_visible)
+                        .desired_width((ui.available_width() - 30.0).max(80.0))
+                        .hint_text("gho_…, ghu_… or a Copilot token"),
+                );
+                let (glyph, tip) = if self.api_key_visible {
+                    (tglyph::EYE_OFF, "Hide GitHub token")
+                } else {
+                    (tglyph::EYE, "Show GitHub token")
+                };
+                if icon_button(ui, glyph, tip).clicked() {
+                    self.api_key_visible = !self.api_key_visible;
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "Only for automation. The normal path is Sign in with GitHub; a token entered here is sealed with DPAPI when you press Save.",
+                )
+                .size(9.5)
+                .color(theme::TEXT_FAINT()),
+            );
+        });
+    }
+
     // -----------------------------------------------------------------------
     // Settings modal
     // -----------------------------------------------------------------------
@@ -996,42 +1280,65 @@ impl AiPanel {
                                         self.draft.model = prefs.model;
                                         self.models.clear();
                                         self.models_note = None;
+                                        self.test_note = None;
+                                        self.api_key_visible = false;
+                                        if f == Flavor::GitHubCopilot {
+                                            // The endpoint comes from the
+                                            // Copilot token exchange.
+                                            self.draft.base_url.clear();
+                                        } else {
+                                            self.cancel_github_login();
+                                        }
                                     }
                                 }
                             });
                     });
                     ui.add_space(4.0);
 
-                    ui.label(RichText::new("API key").size(11.5).strong());
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.draft.api_key)
-                                .password(!self.api_key_visible)
-                                .desired_width((ui.available_width() - 30.0).max(80.0))
-                                .hint_text(flavor.key_hint()),
+                    if flavor == Flavor::GitHubCopilot {
+                        self.github_provider_ui(ui, ctx);
+                    } else {
+                        ui.label(RichText::new("API key").size(11.5).strong());
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.draft.api_key)
+                                    .password(!self.api_key_visible)
+                                    .desired_width((ui.available_width() - 30.0).max(80.0))
+                                    .hint_text(flavor.key_hint()),
+                            );
+                            let (glyph, tip) = if self.api_key_visible {
+                                (tglyph::EYE_OFF, "Hide API key")
+                            } else {
+                                (tglyph::EYE, "Show API key")
+                            };
+                            if icon_button(ui, glyph, tip).clicked() {
+                                self.api_key_visible = !self.api_key_visible;
+                            }
+                        });
+                        ui.label(
+                            RichText::new("Encrypted with Windows DPAPI (your Windows account is the key).")
+                                .size(9.5)
+                                .color(theme::TEXT_FAINT()),
                         );
-                        let (glyph, tip) = if self.api_key_visible {
-                            (tglyph::EYE_OFF, "Hide API key")
-                        } else {
-                            (tglyph::EYE, "Show API key")
-                        };
-                        if icon_button(ui, glyph, tip).clicked() {
-                            self.api_key_visible = !self.api_key_visible;
-                        }
-                    });
-                    ui.label(
-                        RichText::new("Encrypted with Windows DPAPI (your Windows account is the key).")
-                            .size(9.5)
-                            .color(theme::TEXT_FAINT()),
-                    );
+                    }
                     ui.add_space(6.0);
 
-                    ui.label(RichText::new("Base URL").size(11.5).strong());
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.draft.base_url)
-                            .desired_width(f32::INFINITY)
-                            .hint_text(flavor.default_base()),
-                    );
+                    if flavor != Flavor::GitHubCopilot {
+                        ui.label(RichText::new("Base URL").size(11.5).strong());
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.draft.base_url)
+                                .desired_width(f32::INFINITY)
+                                .hint_text(flavor.default_base()),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(
+                                "Endpoint: discovered from your GitHub Copilot token (api.githubcopilot.com for individual plans).",
+                            )
+                            .size(9.5)
+                            .color(theme::TEXT_FAINT()),
+                        );
+                    }
                     ui.add_space(6.0);
 
                     ui.label(RichText::new("Model").size(11.5).strong());
@@ -1139,6 +1446,10 @@ impl AiPanel {
                             )
                             .clicked()
                         {
+                            self.cancel_github_login();
+                            if Flavor::from_id(&self.draft.provider) == Flavor::GitHubCopilot {
+                                self.draft.base_url.clear();
+                            }
                             self.draft.providers.insert(
                                 self.draft.provider.clone(),
                                 config::ProviderPrefs {
@@ -1171,12 +1482,14 @@ impl AiPanel {
                             }
                         }
                         if ui.button(RichText::new("Cancel").size(11.5)).clicked() {
+                            self.cancel_github_login();
                             self.settings_open = false;
                         }
                     });
                 });
             });
         if !open {
+            self.cancel_github_login();
             self.settings_open = false;
         }
         saved
@@ -1196,6 +1509,27 @@ enum UiCmd {
 // ---------------------------------------------------------------------------
 // Small UI helpers
 // ---------------------------------------------------------------------------
+
+fn is_github_url(url: &str) -> bool {
+    url.starts_with("https://github.com/") || url.starts_with("https://www.github.com/")
+}
+
+fn open_url(url: &str) {
+    if !is_github_url(url) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        // No shell: a URL must never be reparsed as a command line.
+        let _ = std::process::Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
 
 fn icon_button(ui: &mut Ui, glyph: char, tip: &str) -> egui::Response {
     let r = ui.add(
@@ -1217,6 +1551,43 @@ fn clip(s: &str, n: usize) -> String {
 
 fn mask_preview(s: &str) -> String {
     clip(s, 700)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_copilot_settings_render_without_an_api_key() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let logs: SharedLogs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut panel = AiPanel::new(rt.handle().clone(), logs);
+        panel.cfg.provider = "github-copilot".into();
+        panel.cfg.api_key.clear();
+        panel.cfg.base_url.clear();
+        panel.cfg.model.clear();
+        panel.draft = panel.cfg.clone();
+        panel.settings_open = true;
+
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |_ui| {
+                panel.settings_modal(ctx);
+            });
+        });
+        assert!(!output.shapes.is_empty());
+    }
 }
 
 fn card_ui(ui: &mut Ui, card: &mut Card, toggles: &mut Vec<usize>, idx: usize) {

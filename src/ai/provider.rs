@@ -1,7 +1,8 @@
 //! Provider-agnostic LLM layer.
 //!
 //! One [`Provider`] value wraps any backend: the OpenAI-compatible family
-//! (OpenRouter, OpenAI, Groq, Ollama, custom endpoints) speaks `/chat/completions`
+//! (OpenRouter, OpenAI, Groq, Ollama, GitHub Copilot, custom endpoints) speaks
+//! `/chat/completions`
 //! with SSE streaming; Gemini and Anthropic get native wire formats. All
 //! callers (engine, settings UI) use [`Provider::chat`] and
 //! [`Provider::list_models`] and never touch provider differences.
@@ -10,6 +11,20 @@ use crate::ai::config::AiConfig;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
+
+/// GitHub's public Copilot device-login app (the one Copilot CLI / VS Code
+/// use). Device flow needs no client secret, so a desktop app can use it.
+const COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
+const COPILOT_EDITOR_VERSION: &str = "vscode/1.95.0";
+const COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.26.7";
+const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.26.7";
+const COPILOT_API_VERSION: &str = "2025-04-01";
+const COPILOT_DEFAULT_BASE: &str = "https://api.githubcopilot.com";
+const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
+const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
+const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 
 // ---------------------------------------------------------------------------
 // Wire-neutral conversation model
@@ -91,17 +106,19 @@ pub enum Flavor {
     OpenAi,
     Groq,
     Ollama,
+    GitHubCopilot,
     Gemini,
     Anthropic,
     Custom,
 }
 
 impl Flavor {
-    pub const ALL: [Flavor; 7] = [
+    pub const ALL: [Flavor; 8] = [
         Flavor::OpenRouter,
         Flavor::OpenAi,
         Flavor::Groq,
         Flavor::Ollama,
+        Flavor::GitHubCopilot,
         Flavor::Gemini,
         Flavor::Anthropic,
         Flavor::Custom,
@@ -113,6 +130,7 @@ impl Flavor {
             Flavor::OpenAi => "openai",
             Flavor::Groq => "groq",
             Flavor::Ollama => "ollama",
+            Flavor::GitHubCopilot => "github-copilot",
             Flavor::Gemini => "gemini",
             Flavor::Anthropic => "anthropic",
             Flavor::Custom => "custom",
@@ -124,6 +142,7 @@ impl Flavor {
             "openai" => Flavor::OpenAi,
             "groq" => Flavor::Groq,
             "ollama" => Flavor::Ollama,
+            "github-copilot" | "github_copilot" | "copilot" => Flavor::GitHubCopilot,
             "gemini" => Flavor::Gemini,
             "anthropic" => Flavor::Anthropic,
             "custom" => Flavor::Custom,
@@ -137,6 +156,7 @@ impl Flavor {
             Flavor::OpenAi => "OpenAI",
             Flavor::Groq => "Groq",
             Flavor::Ollama => "Ollama (local)",
+            Flavor::GitHubCopilot => "GitHub Copilot",
             Flavor::Gemini => "Google Gemini",
             Flavor::Anthropic => "Anthropic",
             Flavor::Custom => "Custom (OpenAI-compatible)",
@@ -149,6 +169,7 @@ impl Flavor {
             Flavor::OpenAi => "https://api.openai.com/v1",
             Flavor::Groq => "https://api.groq.com/openai/v1",
             Flavor::Ollama => "http://localhost:11434/v1",
+            Flavor::GitHubCopilot => COPILOT_DEFAULT_BASE,
             Flavor::Gemini => "https://generativelanguage.googleapis.com/v1beta",
             Flavor::Anthropic => "https://api.anthropic.com",
             Flavor::Custom => "http://localhost:8080/v1",
@@ -161,6 +182,7 @@ impl Flavor {
             Flavor::OpenAi => "sk-…",
             Flavor::Groq => "gsk_…",
             Flavor::Ollama => "not required for a local Ollama",
+            Flavor::GitHubCopilot => "sign in with GitHub below",
             Flavor::Gemini => "AIza…",
             Flavor::Anthropic => "sk-ant-…",
             Flavor::Custom => "depends on your endpoint",
@@ -182,6 +204,14 @@ pub struct Provider {
     pub base_url: String,
     pub api_key: String,
     http: reqwest::Client,
+    /// Short-lived Copilot session tokens, cached until `expires_at`.
+    copilot: AsyncMutex<Option<CopilotSession>>,
+}
+
+struct CopilotSession {
+    token: String,
+    api_base: String,
+    expires_at: i64,
 }
 
 fn err_str(e: reqwest::Error) -> String {
@@ -222,6 +252,7 @@ impl Provider {
             base_url,
             api_key: cfg.api_key.trim().to_string(),
             http,
+            copilot: AsyncMutex::new(None),
         }
     }
 
@@ -254,6 +285,7 @@ impl Provider {
                 }
                 self.openai_models().await
             }
+            Flavor::GitHubCopilot => self.copilot_models().await,
             Flavor::Gemini => self.gemini_models().await,
             Flavor::Anthropic => self.anthropic_models().await,
             _ => self.openai_models().await,
@@ -283,6 +315,102 @@ impl Provider {
             .unwrap_or_default();
         out.sort();
         Ok(out)
+    }
+
+    async fn copilot_models(&self) -> Result<Vec<String>, String> {
+        let (token, base) = self.copilot_session().await?;
+        let mut req = self
+            .http
+            .get(format!("{}/models", base.trim_end_matches('/')))
+            .bearer_auth(&token);
+        for (k, v) in copilot_headers("user") {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await.map_err(err_str)?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(err_str)?;
+        if !status.is_success() {
+            return Err(format!(
+                "GitHub Copilot model list failed (HTTP {}): {}",
+                status.as_u16(),
+                clip(&body, 240)
+            ));
+        }
+        let v: Value = serde_json::from_str(&body).map_err(|e| format!("bad JSON: {e}"))?;
+        let mut out = copilot_model_ids(&v);
+        if out.is_empty() {
+            return Err("GitHub returned no Copilot chat models for this account. Check that the Copilot subscription is active and allows API use.".into());
+        }
+        out.sort_by_key(|m| m.to_ascii_lowercase());
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Exchange the long-lived GitHub login token for a short-lived Copilot
+    /// API token, caching it until just before it expires.
+    async fn copilot_session(&self) -> Result<(String, String), String> {
+        let now = chrono::Utc::now().timestamp();
+        {
+            let guard = self.copilot.lock().await;
+            if let Some(s) = guard.as_ref() {
+                if s.expires_at > now + 60 {
+                    return Ok((s.token.clone(), s.api_base.clone()));
+                }
+            }
+        }
+
+        let github = self.api_key.trim();
+        if github.is_empty() {
+            return Err(
+                "GitHub Copilot is not signed in. Open AI settings and press \"Sign in with GitHub\"."
+                    .into(),
+            );
+        }
+        let resp = self
+            .http
+            .get(COPILOT_TOKEN_URL)
+            .header("Authorization", format!("token {github}"))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .header("Editor-Version", COPILOT_EDITOR_VERSION)
+            .header("Editor-Plugin-Version", COPILOT_PLUGIN_VERSION)
+            .header("User-Agent", COPILOT_USER_AGENT)
+            .header("X-GitHub-Api-Version", COPILOT_API_VERSION)
+            .send()
+            .await
+            .map_err(err_str)?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(match status.as_u16() {
+                401 => "GitHub rejected the Copilot sign-in. Sign in again from AI settings.".to_string(),
+                403 => "This GitHub account does not have Copilot API access. Check that the Copilot plan is active and allows API use, or sign in with another account.".to_string(),
+                404 => "GitHub Copilot is not enabled for this account.".to_string(),
+                429 => "GitHub rate-limited the Copilot token request. Wait a minute and try again.".to_string(),
+                code if (500..=599).contains(&code) => {
+                    "GitHub Copilot is temporarily unavailable. Try again shortly.".to_string()
+                }
+                code => format!("GitHub Copilot token request failed (HTTP {code})."),
+            });
+        }
+        let v: Value = resp.json().await.map_err(err_str)?;
+        let token = v["token"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "GitHub returned no Copilot API token.".to_string())?;
+        let expires_at = v["expires_at"]
+            .as_i64()
+            .or_else(|| v["expires_at"].as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(now + 1200);
+        let discovered = v["endpoints"]["api"].as_str().unwrap_or("");
+        let api_base = copilot_api_base(&self.base_url, discovered);
+        let session = CopilotSession {
+            token: token.to_string(),
+            api_base: api_base.clone(),
+            expires_at,
+        };
+        *self.copilot.lock().await = Some(session);
+        Ok((token.to_string(), api_base))
     }
 
     async fn ollama_tags(&self) -> Result<Vec<String>, String> {
@@ -384,6 +512,10 @@ impl Provider {
             return Err("no model selected — open AI settings and pick a model".to_string());
         }
         match self.flavor {
+            Flavor::GitHubCopilot => {
+                self.copilot_chat(model, messages, tools, temperature, stream, on_delta)
+                    .await
+            }
             Flavor::Gemini => self.gemini_chat(model, messages, tools, temperature, on_delta).await,
             Flavor::Anthropic => {
                 self.anthropic_chat(model, messages, tools, temperature, on_delta)
@@ -414,21 +546,131 @@ impl Provider {
         stream: bool,
         on_delta: &mut (dyn FnMut(&str) + Send),
     ) -> Result<ChatReply, String> {
+        self.openai_chat_with(
+            self.url("/chat/completions"),
+            if self.api_key.is_empty() {
+                None
+            } else {
+                Some(self.api_key.as_str())
+            },
+            &[],
+            model,
+            messages,
+            tools,
+            Some(temperature),
+            stream,
+            on_delta,
+        )
+        .await
+    }
+
+    /// GitHub Copilot speaks the OpenAI wire format behind a short-lived
+    /// session token and a handful of Copilot-specific headers.
+    async fn copilot_chat(
+        &self,
+        model: &str,
+        messages: &[Msg],
+        tools: &[ToolDef],
+        temperature: f32,
+        stream: bool,
+        on_delta: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<ChatReply, String> {
+        let (token, base) = self.copilot_session().await?;
+        let initiator = if messages
+            .iter()
+            .any(|m| m.role == "assistant" || m.role == "tool")
+        {
+            "agent"
+        } else {
+            "user"
+        };
+        let headers = copilot_headers(initiator);
+        // Reasoning models reject an explicit temperature on some Copilot
+        // backends; omit it there and let the model use its default.
+        let temp = copilot_temperature_supported(model).then_some(temperature);
+        let endpoint = format!("{}/chat/completions", base.trim_end_matches('/'));
+        let result = self
+            .openai_chat_with(
+                endpoint.clone(),
+                Some(&token),
+                &headers,
+                model,
+                messages,
+                tools,
+                temp,
+                stream,
+                on_delta,
+            )
+            .await;
+        // Older Copilot Claude backends rejected the `system` role. Retry
+        // once with the system prompt as an assistant turn, before any
+        // streaming deltas can have been emitted.
+        if let Err(e) = &result {
+            if e.contains("HTTP 400") && e.to_ascii_lowercase().contains("system") {
+                let converted: Vec<Msg> = messages
+                    .iter()
+                    .map(|m| {
+                        if m.role == "system" {
+                            Msg {
+                                role: "assistant".into(),
+                                ..m.clone()
+                            }
+                        } else {
+                            m.clone()
+                        }
+                    })
+                    .collect();
+                return self
+                    .openai_chat_with(
+                        endpoint,
+                        Some(&token),
+                        &headers,
+                        model,
+                        &converted,
+                        tools,
+                        temp,
+                        stream,
+                        on_delta,
+                    )
+                    .await;
+            }
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn openai_chat_with(
+        &self,
+        endpoint: String,
+        bearer: Option<&str>,
+        extra: &[(&str, String)],
+        model: &str,
+        messages: &[Msg],
+        tools: &[ToolDef],
+        temperature: Option<f32>,
+        stream: bool,
+        on_delta: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<ChatReply, String> {
         let wire: Vec<Value> = messages.iter().map(openai_msg).collect();
         let mut body = json!({
             "model": model,
             "messages": wire,
-            "temperature": temperature,
             "stream": stream,
         });
+        if let Some(t) = temperature {
+            body["temperature"] = json!(t);
+        }
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.iter().map(openai_tool).collect());
             body["tool_choice"] = json!("auto");
         }
 
-        let mut req = self.http.post(self.url("/chat/completions")).json(&body);
-        if !self.api_key.is_empty() {
-            req = req.bearer_auth(&self.api_key);
+        let mut req = self.http.post(endpoint).json(&body);
+        if let Some(key) = bearer.filter(|k| !k.is_empty()) {
+            req = req.bearer_auth(key);
+        }
+        for (k, v) in extra {
+            req = req.header(*k, v);
         }
         req = self.extra_headers(req);
         let resp = req.send().await.map_err(err_str)?;
@@ -442,33 +684,7 @@ impl Provider {
             self.openai_sse(resp, on_delta).await
         } else {
             let v: Value = resp.json().await.map_err(err_str)?;
-            let msg = &v["choices"][0]["message"];
-            let text = msg["content"]
-                .as_str()
-                .map(|s| s.to_string())
-                // Some models emit content as parts.
-                .or_else(|| {
-                    msg["content"].as_array().map(|a| {
-                        a.iter()
-                            .filter_map(|p| p["text"].as_str())
-                            .collect::<Vec<_>>()
-                            .join("")
-                    })
-                })
-                .unwrap_or_default();
-            let mut calls = Vec::new();
-            if let Some(arr) = msg["tool_calls"].as_array() {
-                for (i, c) in arr.iter().enumerate() {
-                    calls.push(ToolCall {
-                        id: c["id"]
-                            .as_str()
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| format!("call_{i}")),
-                        name: c["function"]["name"].as_str().unwrap_or("").to_string(),
-                        args: c["function"]["arguments"].as_str().unwrap_or("{}").to_string(),
-                    });
-                }
-            }
+            let (text, calls) = parse_openai_reply(&v);
             if !text.is_empty() {
                 on_delta(&text);
             }
@@ -519,6 +735,52 @@ impl Provider {
                 };
                 if let Some(err) = v.get("error") {
                     return Err(format!("provider error: {}", clip(&err.to_string(), 300)));
+                }
+                // Copilot's newer Claude models can stream Anthropic-native
+                // events even through the OpenAI-compatible endpoint.
+                if v["type"].as_str() == Some("message_stop") {
+                    done = true;
+                    break;
+                }
+                if v["type"].as_str() == Some("content_block_start")
+                    && v["content_block"]["type"].as_str() == Some("tool_use")
+                {
+                    let idx = v["index"].as_u64().unwrap_or(0) as usize;
+                    let e = parts.entry(idx).or_default();
+                    if let Some(id) = v["content_block"]["id"].as_str() {
+                        e.id = id.to_string();
+                    }
+                    if let Some(name) = v["content_block"]["name"].as_str() {
+                        e.name = name.to_string();
+                    }
+                    if let Some(input) = v["content_block"].get("input") {
+                        let has_input = !input.is_null()
+                            && input.as_object().is_none_or(|o| !o.is_empty());
+                        if has_input {
+                            e.args = input.to_string();
+                        }
+                    }
+                }
+                if v["type"].as_str() == Some("content_block_delta") {
+                    let delta = &v["delta"];
+                    match delta["type"].as_str() {
+                        Some("text_delta") => {
+                            if let Some(c) = delta["text"].as_str() {
+                                if !c.is_empty() {
+                                    text.push_str(c);
+                                    on_delta(c);
+                                }
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            let idx = v["index"].as_u64().unwrap_or(0) as usize;
+                            let e = parts.entry(idx).or_default();
+                            if let Some(p) = delta["partial_json"].as_str() {
+                                e.args.push_str(p);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 let delta = &v["choices"][0]["delta"];
                 if let Some(c) = delta["content"].as_str() {
@@ -801,6 +1063,264 @@ fn push_content(contents: &mut Vec<(String, Vec<Value>)>, role: &str, part: Valu
     contents.push((role.to_string(), vec![part]));
 }
 
+// ---------------------------------------------------------------------------
+// GitHub Copilot helpers
+// ---------------------------------------------------------------------------
+
+/// Headers required by the Copilot chat and model endpoints. Authorization is
+/// added by the caller (it is the short-lived Copilot token, not the GitHub
+/// login token).
+fn copilot_headers(initiator: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("Accept", "application/json".into()),
+        ("Copilot-Integration-Id", "vscode-chat".into()),
+        ("Editor-Version", COPILOT_EDITOR_VERSION.into()),
+        ("Editor-Plugin-Version", COPILOT_PLUGIN_VERSION.into()),
+        ("User-Agent", COPILOT_USER_AGENT.into()),
+        ("Openai-Intent", "conversation-panel".into()),
+        ("X-GitHub-Api-Version", COPILOT_API_VERSION.into()),
+        ("X-Request-Id", uuid::Uuid::new_v4().to_string()),
+        (
+            "X-Vscode-User-Agent-Library-Version",
+            "electron-fetch".into(),
+        ),
+        ("X-Initiator", initiator.into()),
+    ]
+}
+
+/// Prefer an explicit base URL, then the endpoint GitHub returns for the
+/// account (Business/Enterprise differ), then the public default. Copilot's
+/// API lives at the root, so a user-pasted `/v1` suffix is removed.
+fn copilot_api_base(configured: &str, discovered: &str) -> String {
+    let configured = configured.trim().trim_end_matches('/');
+    let discovered = discovered.trim().trim_end_matches('/');
+    let chosen = if !configured.is_empty() && configured != COPILOT_DEFAULT_BASE {
+        configured
+    } else if !discovered.is_empty() {
+        discovered
+    } else if !configured.is_empty() {
+        configured
+    } else {
+        COPILOT_DEFAULT_BASE
+    };
+    chosen.trim_end_matches("/v1").trim_end_matches('/').to_string()
+}
+
+/// Chat-capable model ids from `GET /models`. `model_picker_enabled` is
+/// intentionally ignored: GitHub currently reports false for every model even
+/// though the model can still be selected by id.
+fn copilot_model_ids(v: &Value) -> Vec<String> {
+    let Some(arr) = v["data"].as_array().or_else(|| v["models"].as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for m in arr {
+        let kind = m["capabilities"]["type"].as_str().unwrap_or("chat");
+        if kind.eq_ignore_ascii_case("embeddings") {
+            continue;
+        }
+        let Some(id) = m["id"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if id.to_ascii_lowercase().contains("embedding") {
+            continue;
+        }
+        out.push(id.to_string());
+    }
+    out
+}
+
+/// Some reasoning models reject an explicit temperature. Let those use their
+/// own default instead of failing the whole turn.
+fn copilot_temperature_supported(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    !(m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.contains("gpt-5")
+        || m.contains("codex"))
+}
+
+/// Parse an OpenAI-shaped reply, with a fallback for Copilot's newer Claude
+/// models, which can return Anthropic-native content blocks without a
+/// `choices` array.
+fn parse_openai_reply(v: &Value) -> (String, Vec<ToolCall>) {
+    if let Some(msg) = v["choices"][0]["message"].as_object() {
+        let text = msg
+            .get("content")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                msg.get("content").and_then(|c| c.as_array()).map(|a| {
+                    a.iter()
+                        .filter_map(|p| p["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+            })
+            .unwrap_or_default();
+        let mut calls = Vec::new();
+        if let Some(arr) = msg.get("tool_calls").and_then(|c| c.as_array()) {
+            for (i, c) in arr.iter().enumerate() {
+                calls.push(ToolCall {
+                    id: c["id"]
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("call_{i}")),
+                    name: c["function"]["name"].as_str().unwrap_or("").to_string(),
+                    args: c["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or("{}")
+                        .to_string(),
+                });
+            }
+        }
+        return (text, calls);
+    }
+
+    let mut text = v["content"].as_str().unwrap_or("").to_string();
+    let mut calls = Vec::new();
+    if let Some(blocks) = v["content"].as_array() {
+        for block in blocks {
+            match block["type"].as_str().unwrap_or("") {
+                "text" => text.push_str(block["text"].as_str().unwrap_or("")),
+                "tool_use" => {
+                    let name = block["name"].as_str().unwrap_or("");
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let args = match &block["input"] {
+                        Value::String(s) => s.clone(),
+                        Value::Null => "{}".to_string(),
+                        other => other.to_string(),
+                    };
+                    calls.push(ToolCall {
+                        id: block["id"]
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("call_{}", calls.len())),
+                        name: name.to_string(),
+                        args,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    (text, calls)
+}
+
+struct GitHubDeviceCode {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    interval: u64,
+}
+
+fn parse_device_code(v: &Value) -> Result<GitHubDeviceCode, String> {
+    let device_code = v["device_code"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "GitHub returned no device code.".to_string())?;
+    let user_code = v["user_code"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "GitHub returned no user code.".to_string())?;
+    let verification_uri = v["verification_uri"]
+        .as_str()
+        .or_else(|| v["verification_uri_complete"].as_str())
+        .filter(|s| {
+            s.starts_with("https://github.com/") || s.starts_with("https://www.github.com/")
+        })
+        .ok_or_else(|| "GitHub returned no verification URL.".to_string())?;
+    Ok(GitHubDeviceCode {
+        device_code: device_code.to_string(),
+        user_code: user_code.to_string(),
+        verification_uri: verification_uri.to_string(),
+        expires_in: v["expires_in"].as_u64().unwrap_or(900).clamp(60, 3600),
+        interval: v["interval"].as_u64().unwrap_or(5).clamp(1, 60),
+    })
+}
+
+/// Run GitHub's OAuth device flow. `on_code` is called once with the code the
+/// user types at `verification_uri`; the returned string is the long-lived
+/// GitHub access token (stored with the other secrets, never logged).
+pub async fn github_device_login<F>(on_code: F) -> Result<String, String>
+where
+    F: FnOnce(&str, &str, u64) + Send + 'static,
+{
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("cannot create GitHub login client: {e}"))?;
+
+    let device: Value = http
+        .post(GITHUB_DEVICE_CODE_URL)
+        .header("Accept", "application/json")
+        .header("User-Agent", COPILOT_USER_AGENT)
+        .json(&json!({
+            "client_id": COPILOT_CLIENT_ID,
+            "scope": "read:user",
+        }))
+        .send()
+        .await
+        .map_err(err_str)?
+        .error_for_status()
+        .map_err(err_str)?
+        .json()
+        .await
+        .map_err(err_str)?;
+    let code = parse_device_code(&device)?;
+    on_code(&code.user_code, &code.verification_uri, code.expires_in);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(code.expires_in);
+    let mut interval = code.interval;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("GitHub sign-in timed out. Try again.".into());
+        }
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+        let poll: Value = http
+            .post(GITHUB_ACCESS_TOKEN_URL)
+            .header("Accept", "application/json")
+            .header("User-Agent", COPILOT_USER_AGENT)
+            .json(&json!({
+                "client_id": COPILOT_CLIENT_ID,
+                "device_code": &code.device_code,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            }))
+            .send()
+            .await
+            .map_err(err_str)?
+            .error_for_status()
+            .map_err(err_str)?
+            .json()
+            .await
+            .map_err(err_str)?;
+
+        if let Some(token) = poll["access_token"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(token.to_string());
+        }
+        match poll["error"].as_str().unwrap_or("") {
+            "authorization_pending" => {}
+            "slow_down" => interval = interval.saturating_add(5),
+            "expired_token" => return Err("The GitHub sign-in code expired. Try again.".into()),
+            "access_denied" => return Err("GitHub sign-in was declined.".into()),
+            other if !other.is_empty() => {
+                let desc = poll["error_description"].as_str().unwrap_or(other);
+                return Err(format!("GitHub sign-in failed: {}", clip(desc, 200)));
+            }
+            _ => return Err("GitHub returned an unexpected sign-in response.".into()),
+        }
+    }
+}
+
 fn openai_msg(m: &Msg) -> Value {
     match m.role.as_str() {
         "assistant" => {
@@ -877,5 +1397,172 @@ fn gemini_schema(v: Value) -> Value {
         }
         Value::Array(arr) => Value::Array(arr.into_iter().map(gemini_schema).collect()),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copilot_flavor_round_trips() {
+        assert_eq!(Flavor::GitHubCopilot.id(), "github-copilot");
+        assert_eq!(Flavor::from_id("github-copilot"), Flavor::GitHubCopilot);
+        assert_eq!(Flavor::from_id("copilot"), Flavor::GitHubCopilot);
+        assert_eq!(Flavor::GitHubCopilot.label(), "GitHub Copilot");
+        assert_eq!(
+            Flavor::GitHubCopilot.default_base(),
+            "https://api.githubcopilot.com"
+        );
+        assert!(Flavor::ALL.contains(&Flavor::GitHubCopilot));
+    }
+
+    #[test]
+    fn copilot_model_ids_skip_embeddings_and_keep_chat_models() {
+        let v = json!({
+            "data": [
+                {
+                    "id": "gpt-4o",
+                    "model_picker_enabled": false,
+                    "capabilities": { "type": "chat" }
+                },
+                {
+                    "id": "text-embedding-3-small",
+                    "capabilities": { "type": "embeddings" }
+                },
+                {
+                    "id": "legacy-embedding-model",
+                    "capabilities": {}
+                },
+                { "capabilities": { "type": "chat" } },
+                {
+                    "id": "claude-sonnet-4",
+                    "capabilities": { "type": "chat" }
+                }
+            ]
+        });
+        assert_eq!(
+            copilot_model_ids(&v),
+            vec!["gpt-4o".to_string(), "claude-sonnet-4".to_string()]
+        );
+    }
+
+    #[test]
+    fn copilot_model_ids_accept_models_key() {
+        let v = json!({ "models": [{ "id": "gpt-5", "capabilities": { "type": "chat" } }] });
+        assert_eq!(copilot_model_ids(&v), vec!["gpt-5".to_string()]);
+    }
+
+    #[test]
+    fn copilot_headers_include_required_copilot_metadata() {
+        let headers = copilot_headers("agent");
+        let get = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("Copilot-Integration-Id"), Some("vscode-chat"));
+        assert_eq!(get("Editor-Plugin-Version"), Some("copilot-chat/0.26.7"));
+        assert_eq!(get("X-GitHub-Api-Version"), Some("2025-04-01"));
+        assert_eq!(get("X-Initiator"), Some("agent"));
+        assert!(get("X-Request-Id").is_some_and(|id| !id.is_empty()));
+    }
+
+    #[test]
+    fn copilot_api_base_uses_discovered_endpoint_but_honours_an_override() {
+        assert_eq!(
+            copilot_api_base("", "https://api.business.githubcopilot.com/"),
+            "https://api.business.githubcopilot.com"
+        );
+        assert_eq!(
+            copilot_api_base("https://api.githubcopilot.com", ""),
+            "https://api.githubcopilot.com"
+        );
+        assert_eq!(
+            copilot_api_base("https://proxy.example.test/v1/", "https://ignored.test"),
+            "https://proxy.example.test"
+        );
+    }
+
+    #[test]
+    fn copilot_temperature_is_omitted_for_reasoning_models() {
+        assert!(!copilot_temperature_supported("o3-mini"));
+        assert!(!copilot_temperature_supported("gpt-5.1-codex"));
+        assert!(copilot_temperature_supported("gpt-4o"));
+        assert!(copilot_temperature_supported("claude-sonnet-4"));
+    }
+
+    #[test]
+    fn parse_openai_reply_handles_openai_tool_calls() {
+        let v = json!({
+            "choices": [{
+                "message": {
+                    "content": "checking",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "create_server",
+                            "arguments": "{\"name\":\"staging\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let (text, calls) = parse_openai_reply(&v);
+        assert_eq!(text, "checking");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "create_server");
+        assert_eq!(calls[0].args, "{\"name\":\"staging\"}");
+    }
+
+    #[test]
+    fn parse_openai_reply_handles_anthropic_native_blocks() {
+        let v = json!({
+            "content": [
+                { "type": "text", "text": "I can do that." },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "add_forward",
+                    "input": { "session": "staging", "local_port": 15433 }
+                }
+            ]
+        });
+        let (text, calls) = parse_openai_reply(&v);
+        assert_eq!(text, "I can do that.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "toolu_1");
+        assert_eq!(calls[0].name, "add_forward");
+        assert!(calls[0].args.contains("\"local_port\":15433"));
+    }
+
+    #[test]
+    fn parse_device_code_rejects_non_https_verification_urls() {
+        let ok = json!({
+            "device_code": "device",
+            "user_code": "ABCD-1234",
+            "verification_uri": "https://github.com/login/device",
+            "expires_in": 900,
+            "interval": 5
+        });
+        let parsed = parse_device_code(&ok).expect("valid device code");
+        assert_eq!(parsed.user_code, "ABCD-1234");
+        assert_eq!(parsed.interval, 5);
+
+        let bad = json!({
+            "device_code": "device",
+            "user_code": "ABCD-1234",
+            "verification_uri": "javascript:alert(1)"
+        });
+        assert!(parse_device_code(&bad).is_err());
+
+        let wrong_host = json!({
+            "device_code": "device",
+            "user_code": "ABCD-1234",
+            "verification_uri": "https://example.test/login/device"
+        });
+        assert!(parse_device_code(&wrong_host).is_err());
     }
 }

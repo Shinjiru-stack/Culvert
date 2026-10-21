@@ -41,8 +41,9 @@ for your approval at every fork in the road.
   output stop at a redaction gate before they reach a provider. Passwords and
   passphrases for new servers/tunnels are typed into a local masked field on
   the approval card and never enter the model conversation. Works with
-  OpenRouter, OpenAI, Groq, Gemini, Anthropic, a local Ollama (fully offline) or
-  any OpenAI-compatible endpoint. See [AI Copilot](#ai-copilot).
+  OpenRouter, OpenAI, Groq, Gemini, Anthropic, GitHub Copilot (with an active
+  subscription), a local Ollama (fully offline) or any OpenAI-compatible
+  endpoint. See [AI Copilot](#ai-copilot).
 - **Sessions sidebar** — save host, port, username and auth once; double-click
   any session to open a shell tab (right-click for edit/duplicate/delete).
 - **Full menu bar** — Terminal / Sessions / View / Tools / Macros / Help above
@@ -238,12 +239,21 @@ local editor. Context — active session, file-browser directory, selected file,
 running tunnels, saved profiles — is attached automatically, so
 `/var/log/nginx` in the file browser plus *“Show the latest errors”* just works.
 
-**Providers** — OpenRouter, OpenAI, Groq, Ollama (fully local), Google Gemini,
-Anthropic, or any custom OpenAI-compatible endpoint. The settings panel has
-provider, API key, base URL, model (with a *Fetch models* helper), temperature,
-a streaming toggle and a *Test connection* button. Each provider keeps its own
-key, base URL and model: switch to Gemini and back, and Ollama's settings return
-as you left them.
+**Providers** — OpenRouter, OpenAI, Groq, Ollama (fully local), GitHub Copilot,
+Google Gemini, Anthropic, or any custom OpenAI-compatible endpoint. The
+settings panel has provider, credentials, base URL, model (with a *Fetch
+models* helper), temperature, a streaming toggle and a *Test connection*
+button. Each provider keeps its own key, base URL and model: switch to Gemini
+and back, and Ollama's settings return as you left them.
+
+**GitHub Copilot** works with an existing Copilot Pro, Pro+, Business or
+Enterprise subscription. Choose *GitHub Copilot*, press **Sign in with GitHub**,
+and enter the one-time code at `github.com/login/device`. The token is sealed
+with Windows DPAPI; Culvert exchanges it for a short-lived Copilot API token,
+discovers the correct endpoint (including Business/Enterprise hosts), and lists
+the chat models your plan exposes. No separate API key purchase is needed.
+Available models, request limits and acceptable-use rules are controlled by
+GitHub's plan and terms.
 
 **Security layer** — nothing sensitive leaves the machine unchecked. Culvert
 detects private keys, certificates, passwords, tokens, API keys, connection

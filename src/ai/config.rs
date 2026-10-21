@@ -3,8 +3,9 @@
 //! machine. Persisted next to the other Culvert JSON files
 //! (`%APPDATA%\culvert\ai.json`).
 //!
-//! The API key is sealed with Windows DPAPI (see `crate::secrets`) before it
-//! is written, exactly like saved session passwords — the JSON around it
+//! The API key (or GitHub Copilot login token) is sealed with Windows DPAPI
+//! (see `crate::secrets`) before it is written, exactly like saved session
+//! passwords — the JSON around it
 //! stays readable, the key itself does not.
 
 use serde::{Deserialize, Serialize};

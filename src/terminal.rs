@@ -952,30 +952,22 @@ impl TerminalSession {
                 ),
                 egui::vec2(cell_w, cell_h),
             );
+            // A slim bar instead of a full block: the block used to cover a
+            // whole cell, which read as a thick slab sitting behind the last
+            // typed word. The bar marks the insertion point without hiding the
+            // character under it.
+            let bar = Rect::from_min_size(
+                egui::pos2(crect.left() + 1.0, crect.top() + 1.0),
+                egui::vec2(2.0, (crect.height() - 2.0).max(1.0)),
+            );
             if focused {
                 if blink_on {
-                    // Solid block cursor, like MobaXterm/xterm. A light wash
-                    // keeps the glyph underneath readable.
-                    painter.rect_filled(
-                        crect,
-                        0.0,
-                        Color32::from_rgba_unmultiplied(229, 229, 229, 110),
-                    );
-                    painter.rect_stroke(
-                        crect,
-                        0.0,
-                        Stroke::new(1.0_f32, Color32::from_gray(229)),
-                        StrokeKind::Inside,
-                    );
+                    painter.rect_filled(bar, 1.0, Color32::from_gray(229));
                 }
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
             } else {
-                painter.rect_stroke(
-                    crect,
-                    0.0,
-                    Stroke::new(1.0_f32, Color32::from_gray(140)),
-                    StrokeKind::Inside,
-                );
+                // Still show where the caret is, just dimmer and steady.
+                painter.rect_filled(bar, 1.0, Color32::from_gray(120));
             }
         }
 
