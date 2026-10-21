@@ -66,6 +66,14 @@ pub mod tglyph {
     pub const ERASER: char = '\u{eb8b}';
     /// reload (reconnect session)
     pub const RELOAD: char = '\u{f3ae}';
+    /// arrows-maximize / arrows-minimize (terminal full-screen toggle)
+    pub const EXPAND: char = '\u{ea28}';
+    pub const COLLAPSE: char = '\u{ea29}';
+    /// external-link (pop the terminal out into its own window)
+    pub const POPOUT: char = '\u{ea99}';
+    /// player-play / player-stop (tunnel start/stop toggle)
+    pub const PLAY: char = '\u{ed46}';
+    pub const STOP: char = '\u{ed4a}';
 
     /// Directory / file row glyphs for the SFTP listing.
     pub const FOLDER_ROW: char = '\u{eaad}';

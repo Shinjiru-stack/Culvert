@@ -6,6 +6,7 @@
 
 use crate::ai::{AiPanel, UiAction};
 use crate::log::{push_log, LogEntry, LogLevel, SharedLogs};
+use crate::mcp;
 use crate::session::{
     load_groups, load_sessions, load_tunnels, save_groups, save_sessions, save_tunnels, AuthType,
     ForwardType, PortForward, Protocol, SessionGroup, SshSession, StandaloneTunnel,
@@ -13,7 +14,7 @@ use crate::session::{
 use crate::terminal::{TermStatus, TerminalSession};
 use crate::theme;
 use crate::theme::tglyph;
-use crate::tunnel::{forward_key, TunnelManager};
+use crate::tunnel::{forward_key, standalone_key, TunnelManager, TunnelPhase};
 use crate::version;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -52,9 +53,32 @@ pub struct TunnelApp {
     show_logs: bool,
     /// Split view: show every open shell side-by-side in a grid.
     split_view: bool,
-    /// Terminal focus mode: the shell fills the window (F11 toggles), the
-    /// MobaXterm-style "full screen" for one terminal.
+    /// Terminal focus mode: the shell fills the window and the OS window
+    /// itself goes full-screen (F11 toggles).
     term_fullscreen: bool,
+    /// Last full-screen state pushed to the OS window, so the command is only
+    /// sent on transitions (and external exits are noticed).
+    term_os_fullscreen: bool,
+    /// True once the OS has reported the window as full-screen; guards against
+    /// reading a stale `false` on the frame right after the command is sent.
+    term_os_confirmed: bool,
+    /// Session id of a terminal living in its own OS window ("pop out").
+    /// Stored by id, not index, so closing/reordering tabs cannot point at
+    /// the wrong shell.
+    term_detached: Option<String>,
+    /// The popped-out window has already been asked to focus itself. One
+    /// request per detach is enough; re-requesting every frame would steal
+    /// focus back whenever the user clicks the main window.
+    term_detached_focused: bool,
+    /// MCP server (Tools > MCP server…); None while stopped.
+    mcp: Option<mcp::Server>,
+    mcp_cfg: mcp::McpConfig,
+    mcp_modal: bool,
+    mcp_error: Option<String>,
+    /// The saved preference is honoured once per run; a failed bind must not
+    /// retry every frame.
+    mcp_started_once: bool,
+    mcp_reveal: bool,
     now: f64,
     mark_texture: Option<egui::TextureHandle>,
     /// User-configured local editors shared by every files pane.
@@ -498,6 +522,7 @@ impl TunnelApp {
         let standalone_tunnels = load_tunnels();
         let selected = sessions.first().map(|s| s.id.clone());
         let ai = AiPanel::new(rt.clone(), logs.clone());
+        let mcp_cfg = mcp::McpConfig::load();
         Self {
             sessions,
             groups,
@@ -516,6 +541,16 @@ impl TunnelApp {
             show_logs: false,
             split_view: false,
             term_fullscreen: false,
+            term_os_fullscreen: false,
+            term_os_confirmed: false,
+            term_detached: None,
+            term_detached_focused: false,
+            mcp: None,
+            mcp_cfg,
+            mcp_modal: false,
+            mcp_error: None,
+            mcp_started_once: false,
+            mcp_reveal: false,
             group_editor: None,
             now: 0.0,
             mark_texture: None,
@@ -617,7 +652,7 @@ impl TunnelApp {
         }
         for t in &self.standalone_tunnels {
             for f in &t.forwards {
-                let key = forward_key(&t.id, &f.id);
+                let key = standalone_key(&t.id, &f.id);
                 tunnels.push(crate::ai::CtxTunnel {
                     key: key.clone(),
                     session_label: t.label(),
@@ -888,7 +923,7 @@ impl TunnelApp {
         }
         for t in &self.standalone_tunnels {
             for f in &t.forwards {
-                if forward_key(&t.id, &f.id) == key {
+                if standalone_key(&t.id, &f.id) == key {
                     return Some((t.to_ssh_session(), f.clone()));
                 }
             }
@@ -1118,6 +1153,16 @@ impl TunnelApp {
         }
     }
 
+    /// Move the active tab by `step`, wrapping at both ends. Used by
+    /// Ctrl+Tab / Ctrl+Shift+Tab.
+    fn cycle_tab(&mut self, step: isize) {
+        if self.tabs.len() < 2 {
+            return;
+        }
+        let len = self.tabs.len() as isize;
+        self.active = (self.active as isize + step).rem_euclid(len) as usize;
+    }
+
     /// Chrome-style close operations. Iterating from the end keeps the
     /// earlier indices stable while tabs shift.
     fn close_right_tabs(&mut self, from: usize) {
@@ -1171,6 +1216,7 @@ impl TunnelApp {
         {
             f.auto_reconnect = !f.auto_reconnect;
             let (on, desc) = (f.auto_reconnect, forward_desc(f));
+            let key = standalone_key(session_id, forward_id);
             if self.tunnels.is_running(&key) {
                 self.tunnels.set_auto_reconnect(&key, on);
                 self.toast(
@@ -1204,12 +1250,9 @@ impl TunnelApp {
     }
 
     fn toggle_tunnel(&mut self, session_id: &str, forward_id: &str) {
-        let key = forward_key(session_id, forward_id);
-        if self.tunnels.is_running(&key) {
-            self.tunnels.stop(&key);
-            self.toast(ToastKind::Info, "Tunnel stopped");
-            return;
-        }
+        // Resolve first: a standalone tunnel runs under a synthetic session
+        // with a `tunnel-` id prefix, so the running key comes from the
+        // resolved session, never from the row's id.
         // Session-bound tunnel first; standalone tunnels (own SSH endpoint)
         // fall back to an engine-shaped session built on the fly.
         let found = self
@@ -1234,10 +1277,19 @@ impl TunnelApp {
                     })
             });
         let Some((session, forward)) = found else { return };
+        let key = forward_key(&session.id, &forward.id);
+        if self.tunnels.is_running(&key) {
+            self.tunnels.stop(&key);
+            self.toast(ToastKind::Info, "Tunnel stopped");
+            return;
+        }
         match self.tunnels.start(&session, &forward) {
+            // `start` only binds the local listener / spawns the worker; SSH
+            // may still be connecting. The row now shows Connecting and then
+            // Running (or Failed with the reason), so don't claim success yet.
             Ok(()) => self.toast(
-                ToastKind::Success,
-                format!("Tunnel started · {}", forward_desc(&forward)),
+                ToastKind::Info,
+                format!("Connecting tunnel · {}", forward_desc(&forward)),
             ),
             Err(e) => self.toast(ToastKind::Error, e),
         }
@@ -1256,6 +1308,769 @@ impl TunnelApp {
             Err(e) => self.toast(ToastKind::Error, format!("Could not save tunnels: {e}")),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // MCP: external agents manage saved sessions and tunnels
+    // -----------------------------------------------------------------------
+
+    /// Start the server on the first frame if the user enabled it, then drain
+    /// every pending call. Applying on the UI thread keeps one source of truth
+    /// (and one save path) for both windows and agents.
+    fn tick_mcp(&mut self, ctx: &egui::Context) {
+        if self.mcp.is_none() && !self.mcp_started_once && self.mcp_cfg.enabled {
+            self.mcp_started_once = true;
+            match mcp::Server::start(&self.mcp_cfg, ctx.clone()) {
+                Ok(s) => {
+                    self.mcp = Some(s);
+                    self.mcp_error = None;
+                }
+                Err(e) => self.mcp_error = Some(e),
+            }
+        }
+        let mut pending = Vec::new();
+        if let Some(server) = &self.mcp {
+            while let Some(p) = server.try_recv() {
+                pending.push(p);
+            }
+        }
+        for p in pending {
+            let res = self.apply_mcp(&p.action, ctx);
+            // A tool error is normal (bad name, validation); keep it for the
+            // modal but do not spam the activity log for every failed lookup.
+            if let Err(e) = &res {
+                self.mcp_error = Some(e.clone());
+            }
+            let _ = p.reply.send(res);
+        }
+    }
+
+    fn apply_mcp(
+        &mut self,
+        action: &mcp::Action,
+        ctx: &egui::Context,
+    ) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        match action {
+            mcp::Action::ListSessions => {
+                let list: Vec<_> = self.sessions.iter().map(|s| self.session_json(s)).collect();
+                Ok(json!({ "count": list.len(), "sessions": list }))
+            }
+            mcp::Action::GetSession { name } => {
+                let idx = self.find_session_by(name).ok_or_else(|| {
+                    format!("no session named '{name}' — call culvert_list_sessions first")
+                })?;
+                Ok(json!({ "session": self.session_json(&self.sessions[idx]) }))
+            }
+            mcp::Action::CreateSession { spec } => {
+                let user = spec.username.clone().unwrap_or_default().trim().to_string();
+                let host = spec.host.clone().unwrap_or_default().trim().to_string();
+                let mut s = SshSession::default();
+                s.name = spec.name.clone().unwrap_or_default().trim().to_string();
+                s.host = host.clone();
+                s.port = spec.port.unwrap_or(22);
+                s.username = user.clone();
+                s.protocol = if spec.protocol.as_deref() == Some("rdp") {
+                    Protocol::Rdp
+                } else {
+                    Protocol::Ssh
+                };
+                s.auth_type = if spec.auth.as_deref() == Some("key") {
+                    AuthType::Key
+                } else {
+                    AuthType::Password
+                };
+                s.password = spec.password.clone().unwrap_or_default();
+                s.key_path = spec.key_path.clone().unwrap_or_default().trim().to_string();
+                s.key_passphrase = spec.key_passphrase.clone().unwrap_or_default();
+                if let Some(g) = spec.group.as_deref() {
+                    if !g.trim().is_empty() {
+                        s.group = Some(self.resolve_group(g)?);
+                    }
+                }
+                if s.name.is_empty() {
+                    s.name = format!("{user}@{host}");
+                }
+                s.validate()?;
+                if self
+                    .sessions
+                    .iter()
+                    .any(|x| x.name.eq_ignore_ascii_case(&s.name))
+                {
+                    return Err(format!("a session named '{}' already exists", s.name));
+                }
+                let id = s.id.clone();
+                let name = s.name.clone();
+                self.sessions.push(s);
+                self.selected = Some(id.clone());
+                save_sessions(&self.sessions)
+                    .map_err(|e| format!("kept in memory, but sessions.json failed: {e}"))?;
+                self.toast(ToastKind::Success, format!("MCP: session '{name}' created"));
+                Ok(json!({ "created": { "id": id, "name": name } }))
+            }
+            mcp::Action::UpdateSession { name, spec } => {
+                let idx = self.find_session_by(name).ok_or_else(|| {
+                    format!("no session named '{name}' — call culvert_list_sessions first")
+                })?;
+                let mut s = self.sessions[idx].clone();
+                let was = s.name.clone();
+                if let Some(v) = &spec.name {
+                    if !v.trim().is_empty() {
+                        s.name = v.trim().to_string();
+                    }
+                }
+                if let Some(v) = &spec.host {
+                    s.host = v.trim().to_string();
+                }
+                if let Some(v) = spec.port {
+                    s.port = v;
+                }
+                if let Some(v) = &spec.username {
+                    s.username = v.trim().to_string();
+                }
+                if let Some(v) = &spec.protocol {
+                    s.protocol = if v == "rdp" {
+                        Protocol::Rdp
+                    } else {
+                        Protocol::Ssh
+                    };
+                }
+                if let Some(v) = &spec.auth {
+                    s.auth_type = if v == "key" {
+                        AuthType::Key
+                    } else {
+                        AuthType::Password
+                    };
+                }
+                // Passwords are write-only: an omitted or empty value keeps
+                // the saved one.
+                if let Some(v) = &spec.password {
+                    if !v.is_empty() {
+                        s.password = v.clone();
+                    }
+                }
+                if let Some(v) = &spec.key_path {
+                    s.key_path = v.trim().to_string();
+                }
+                if let Some(v) = &spec.key_passphrase {
+                    s.key_passphrase = v.clone();
+                }
+                if let Some(g) = &spec.group {
+                    s.group = if g.trim().is_empty() {
+                        None
+                    } else {
+                        Some(self.resolve_group(g)?)
+                    };
+                }
+                s.validate()?;
+                if self
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .any(|(i, x)| i != idx && x.name.eq_ignore_ascii_case(&s.name))
+                {
+                    return Err(format!("a session named '{}' already exists", s.name));
+                }
+                let now = s.name.clone();
+                self.sessions[idx] = s;
+                save_sessions(&self.sessions)
+                    .map_err(|e| format!("kept in memory, but sessions.json failed: {e}"))?;
+                self.toast(ToastKind::Info, format!("MCP: session '{now}' updated"));
+                Ok(json!({ "updated": { "name": now, "was": was } }))
+            }
+            mcp::Action::DeleteSession { name } => {
+                let idx = self.find_session_by(name).ok_or_else(|| {
+                    format!("no session named '{name}' — call culvert_list_sessions first")
+                })?;
+                let removed = self.sessions.remove(idx);
+                self.tunnels.stop_for_session(&removed.id);
+                self.tabs
+                    .retain(|tab| !matches!(tab, Tab::Terminal(t) if t.session_id == removed.id));
+                if self.active >= self.tabs.len() {
+                    self.active = self.tabs.len().saturating_sub(1);
+                }
+                if self.selected.as_deref() == Some(removed.id.as_str()) {
+                    self.selected = self.sessions.first().map(|s| s.id.clone());
+                }
+                save_sessions(&self.sessions)
+                    .map_err(|e| format!("removed in memory, but sessions.json failed: {e}"))?;
+                self.toast(ToastKind::Info, format!("MCP: session '{}' deleted", removed.name));
+                Ok(json!({ "deleted": { "name": removed.name } }))
+            }
+            mcp::Action::ListTunnels => {
+                let list: Vec<_> = self
+                    .standalone_tunnels
+                    .iter()
+                    .map(|t| self.tunnel_json(t))
+                    .collect();
+                Ok(json!({ "count": list.len(), "tunnels": list }))
+            }
+            mcp::Action::GetTunnel { name } => {
+                let idx = self.find_tunnel_by(name).ok_or_else(|| {
+                    format!("no tunnel named '{name}' — call culvert_list_tunnels first")
+                })?;
+                Ok(json!({ "tunnel": self.tunnel_json(&self.standalone_tunnels[idx]) }))
+            }
+            mcp::Action::CreateTunnel { spec } => {
+                let name = spec.name.clone().unwrap_or_default().trim().to_string();
+                if name.is_empty() {
+                    return Err("'name' is required".to_string());
+                }
+                if self
+                    .standalone_tunnels
+                    .iter()
+                    .any(|t| t.name.eq_ignore_ascii_case(&name))
+                {
+                    return Err(format!("a tunnel named '{name}' already exists"));
+                }
+                let listen_port = spec
+                    .listen_port
+                    .ok_or("'listen_port' is required for a new tunnel")?;
+                let mut t = StandaloneTunnel {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name,
+                    host: spec.host.clone().unwrap_or_default().trim().to_string(),
+                    port: spec.port.unwrap_or(22),
+                    username: spec.username.clone().unwrap_or_default().trim().to_string(),
+                    auth_type: if spec.auth.as_deref() == Some("key") {
+                        AuthType::Key
+                    } else {
+                        AuthType::Password
+                    },
+                    password: spec.password.clone().unwrap_or_default(),
+                    key_path: spec.key_path.clone().unwrap_or_default().trim().to_string(),
+                    key_passphrase: spec.key_passphrase.clone().unwrap_or_default(),
+                    forwards: Vec::new(),
+                };
+                let mut forward = PortForward {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    fwd_type: forward_kind(spec.kind.as_deref()),
+                    listen_host: non_empty(spec.listen_host.as_deref(), "127.0.0.1"),
+                    listen_port,
+                    dest_host: non_empty(spec.dest_host.as_deref(), "127.0.0.1"),
+                    dest_port: spec.dest_port.unwrap_or(0),
+                    auto_reconnect: spec.auto_reconnect.unwrap_or(false),
+                };
+                if forward.fwd_type == ForwardType::Dynamic {
+                    forward.dest_host.clear();
+                    forward.dest_port = 0;
+                }
+                forward.validate()?;
+                t.validate()?;
+                t.forwards = vec![forward];
+                let id = t.id.clone();
+                let tn = t.name.clone();
+                self.standalone_tunnels.push(t);
+                save_tunnels(&self.standalone_tunnels)
+                    .map_err(|e| format!("kept in memory, but tunnels.json failed: {e}"))?;
+                self.toast(ToastKind::Success, format!("MCP: tunnel '{tn}' created"));
+                Ok(json!({ "created": { "id": id, "name": tn } }))
+            }
+            mcp::Action::UpdateTunnel { name, spec } => {
+                let idx = self.find_tunnel_by(name).ok_or_else(|| {
+                    format!("no tunnel named '{name}' — call culvert_list_tunnels first")
+                })?;
+                let mut t = self.standalone_tunnels[idx].clone();
+                let was = t.name.clone();
+                if let Some(v) = &spec.name {
+                    if !v.trim().is_empty() {
+                        t.name = v.trim().to_string();
+                    }
+                }
+                if let Some(v) = &spec.host {
+                    t.host = v.trim().to_string();
+                }
+                if let Some(v) = spec.port {
+                    t.port = v;
+                }
+                if let Some(v) = &spec.username {
+                    t.username = v.trim().to_string();
+                }
+                if let Some(v) = &spec.auth {
+                    t.auth_type = if v == "key" {
+                        AuthType::Key
+                    } else {
+                        AuthType::Password
+                    };
+                }
+                if let Some(v) = &spec.password {
+                    if !v.is_empty() {
+                        t.password = v.clone();
+                    }
+                }
+                if let Some(v) = &spec.key_path {
+                    t.key_path = v.trim().to_string();
+                }
+                if let Some(v) = &spec.key_passphrase {
+                    t.key_passphrase = v.clone();
+                }
+                let mut forward = t.forwards.first().cloned().unwrap_or_default();
+                if let Some(v) = &spec.kind {
+                    forward.fwd_type = forward_kind(Some(v));
+                }
+                if let Some(v) = &spec.listen_host {
+                    forward.listen_host = non_empty(Some(v), "127.0.0.1");
+                }
+                if let Some(v) = spec.listen_port {
+                    forward.listen_port = v;
+                }
+                if let Some(v) = &spec.dest_host {
+                    forward.dest_host = v.trim().to_string();
+                }
+                if let Some(v) = spec.dest_port {
+                    forward.dest_port = v;
+                }
+                if let Some(v) = spec.auto_reconnect {
+                    forward.auto_reconnect = v;
+                }
+                if forward.fwd_type == ForwardType::Dynamic {
+                    forward.dest_host.clear();
+                    forward.dest_port = 0;
+                }
+                forward.validate()?;
+                t.validate()?;
+                t.forwards = vec![forward];
+                let now = t.name.clone();
+                self.standalone_tunnels[idx] = t;
+                save_tunnels(&self.standalone_tunnels)
+                    .map_err(|e| format!("kept in memory, but tunnels.json failed: {e}"))?;
+                self.toast(ToastKind::Info, format!("MCP: tunnel '{now}' updated"));
+                Ok(json!({ "updated": { "name": now, "was": was } }))
+            }
+            mcp::Action::DeleteTunnel { name } => {
+                let idx = self.find_tunnel_by(name).ok_or_else(|| {
+                    format!("no tunnel named '{name}' — call culvert_list_tunnels first")
+                })?;
+                let removed = self.standalone_tunnels[idx].clone();
+                for f in &removed.forwards {
+                    self.tunnels.stop(&standalone_key(&removed.id, &f.id));
+                }
+                self.standalone_tunnels.remove(idx);
+                save_tunnels(&self.standalone_tunnels)
+                    .map_err(|e| format!("removed in memory, but tunnels.json failed: {e}"))?;
+                self.toast(
+                    ToastKind::Info,
+                    format!("MCP: tunnel '{}' deleted", removed.name),
+                );
+                Ok(json!({ "deleted": { "name": removed.name } }))
+            }
+            mcp::Action::StartTunnel { name } => {
+                let idx = self.find_tunnel_by(name).ok_or_else(|| {
+                    format!("no tunnel named '{name}' — call culvert_list_tunnels first")
+                })?;
+                let t = self.standalone_tunnels[idx].clone();
+                let forward = t
+                    .forwards
+                    .first()
+                    .cloned()
+                    .ok_or("this tunnel has no forward to start")?;
+                if self.tunnels.is_running(&standalone_key(&t.id, &forward.id)) {
+                    return Err(format!("tunnel '{}' is already running", t.name));
+                }
+                let key = standalone_key(&t.id, &forward.id);
+                self.tunnels.start(&t.to_ssh_session(), &forward)?;
+                self.toast(ToastKind::Info, format!("MCP: tunnel '{}' connecting", t.name));
+                // `start` only spawns the worker; SSH is still connecting.
+                // Callers should poll culvert_list_tunnels for state/error.
+                Ok(json!({
+                    "starting": t.name,
+                    "state": match self.tunnels.phase(&key) {
+                        Some(TunnelPhase::Running) => "running",
+                        Some(TunnelPhase::Reconnecting) => "reconnecting",
+                        _ => "starting",
+                    },
+                    "note": "SSH runs in the background; poll culvert_list_tunnels for state and last_error",
+                }))
+            }
+            mcp::Action::StopTunnel { name } => {
+                let idx = self.find_tunnel_by(name).ok_or_else(|| {
+                    format!("no tunnel named '{name}' — call culvert_list_tunnels first")
+                })?;
+                let t = self.standalone_tunnels[idx].clone();
+                let mut stopped = 0usize;
+                for f in &t.forwards {
+                    let key = standalone_key(&t.id, &f.id);
+                    if self.tunnels.is_running(&key) {
+                        self.tunnels.stop(&key);
+                        stopped += 1;
+                    }
+                }
+                if stopped == 0 {
+                    return Err(format!("tunnel '{}' is not running", t.name));
+                }
+                self.toast(ToastKind::Info, format!("MCP: tunnel '{}' stopped", t.name));
+                Ok(json!({ "stopped": t.name }))
+            }
+            mcp::Action::ListForwards { session } => {
+                let targets: Vec<&SshSession> = match session {
+                    Some(name) => {
+                        let idx = self.find_session_by(name).ok_or_else(|| {
+                            format!("no session named '{name}' — call culvert_list_sessions first")
+                        })?;
+                        vec![&self.sessions[idx]]
+                    }
+                    None => self.sessions.iter().collect(),
+                };
+                let mut list = Vec::new();
+                for s in targets {
+                    for f in &s.forwards {
+                        let mut v = self.forward_json(&forward_key(&s.id, &f.id), f);
+                        v["session"] = json!(s.name);
+                        v["session_id"] = json!(s.id);
+                        list.push(v);
+                    }
+                }
+                Ok(json!({ "count": list.len(), "forwards": list }))
+            }
+            mcp::Action::CreateForward { session, spec } => {
+                let idx = self.find_session_by(session).ok_or_else(|| {
+                    format!("no session named '{session}' — call culvert_list_sessions first")
+                })?;
+                if !matches!(self.sessions[idx].protocol, Protocol::Ssh) {
+                    return Err(format!(
+                        "session '{}' is RDP, not SSH — forwards need an SSH connection",
+                        self.sessions[idx].name
+                    ));
+                }
+                let listen_port = spec
+                    .listen_port
+                    .ok_or("'listen_port' is required for a new forward")?;
+                let mut f = PortForward {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    fwd_type: forward_kind(spec.kind.as_deref()),
+                    listen_host: non_empty(spec.listen_host.as_deref(), "127.0.0.1"),
+                    listen_port,
+                    dest_host: non_empty(spec.dest_host.as_deref(), "127.0.0.1"),
+                    dest_port: spec.dest_port.unwrap_or(0),
+                    auto_reconnect: spec.auto_reconnect.unwrap_or(false),
+                };
+                if f.fwd_type == ForwardType::Dynamic {
+                    f.dest_host.clear();
+                    f.dest_port = 0;
+                }
+                f.validate()?;
+                let sname = self.sessions[idx].name.clone();
+                self.sessions[idx].forwards.push(f.clone());
+                save_sessions(&self.sessions)
+                    .map_err(|e| format!("kept in memory, but sessions.json failed: {e}"))?;
+                self.toast(
+                    ToastKind::Success,
+                    format!("MCP: forward :{} added to '{sname}'", f.listen_port),
+                );
+                Ok(json!({
+                    "created": {
+                        "session": sname,
+                        "id": f.id,
+                        "listen_port": f.listen_port,
+                    }
+                }))
+            }
+            mcp::Action::UpdateForward {
+                session,
+                forward,
+                spec,
+            } => {
+                let sidx = self.find_session_by(session).ok_or_else(|| {
+                    format!("no session named '{session}' — call culvert_list_sessions first")
+                })?;
+                let fidx = self.find_forward(&self.sessions[sidx], forward).ok_or_else(|| {
+                    format!(
+                        "no forward '{forward}' on session '{}' — call culvert_list_forwards first",
+                        self.sessions[sidx].name
+                    )
+                })?;
+                let mut f = self.sessions[sidx].forwards[fidx].clone();
+                if let Some(v) = &spec.kind {
+                    f.fwd_type = forward_kind(Some(v));
+                }
+                if let Some(v) = &spec.listen_host {
+                    f.listen_host = non_empty(Some(v), "127.0.0.1");
+                }
+                if let Some(v) = spec.listen_port {
+                    f.listen_port = v;
+                }
+                if let Some(v) = &spec.dest_host {
+                    f.dest_host = v.trim().to_string();
+                }
+                if let Some(v) = spec.dest_port {
+                    f.dest_port = v;
+                }
+                if let Some(v) = spec.auto_reconnect {
+                    f.auto_reconnect = v;
+                }
+                if f.fwd_type == ForwardType::Dynamic {
+                    f.dest_host.clear();
+                    f.dest_port = 0;
+                }
+                if f.dest_host.trim().is_empty() && f.fwd_type != ForwardType::Dynamic {
+                    f.dest_host = "127.0.0.1".to_string();
+                }
+                f.validate()?;
+                let key = forward_key(&self.sessions[sidx].id, &f.id);
+                let was_running = self.tunnels.is_running(&key);
+                let sname = self.sessions[sidx].name.clone();
+                let fid = f.id.clone();
+                let port = f.listen_port;
+                self.sessions[sidx].forwards[fidx] = f;
+                save_sessions(&self.sessions)
+                    .map_err(|e| format!("kept in memory, but sessions.json failed: {e}"))?;
+                if was_running {
+                    self.tunnels.stop(&key);
+                }
+                self.toast(
+                    ToastKind::Info,
+                    format!("MCP: forward :{port} on '{sname}' updated"),
+                );
+                Ok(json!({
+                    "updated": { "session": sname, "id": fid, "listen_port": port },
+                    "stopped_because_running": was_running,
+                }))
+            }
+            mcp::Action::DeleteForward { session, forward } => {
+                let sidx = self.find_session_by(session).ok_or_else(|| {
+                    format!("no session named '{session}' — call culvert_list_sessions first")
+                })?;
+                let fidx = self.find_forward(&self.sessions[sidx], forward).ok_or_else(|| {
+                    format!(
+                        "no forward '{forward}' on session '{}' — call culvert_list_forwards first",
+                        self.sessions[sidx].name
+                    )
+                })?;
+                let sname = self.sessions[sidx].name.clone();
+                let removed = self.sessions[sidx].forwards.remove(fidx);
+                let key = forward_key(&self.sessions[sidx].id, &removed.id);
+                if self.tunnels.is_running(&key) {
+                    self.tunnels.stop(&key);
+                }
+                save_sessions(&self.sessions)
+                    .map_err(|e| format!("removed in memory, but sessions.json failed: {e}"))?;
+                self.toast(
+                    ToastKind::Info,
+                    format!("MCP: forward :{} on '{sname}' deleted", removed.listen_port),
+                );
+                Ok(json!({
+                    "deleted": {
+                        "session": sname,
+                        "id": removed.id,
+                        "listen_port": removed.listen_port,
+                    }
+                }))
+            }
+            mcp::Action::StartForward { session, forward } => {
+                let sidx = self.find_session_by(session).ok_or_else(|| {
+                    format!("no session named '{session}' — call culvert_list_sessions first")
+                })?;
+                let fidx = self.find_forward(&self.sessions[sidx], forward).ok_or_else(|| {
+                    format!(
+                        "no forward '{forward}' on session '{}' — call culvert_list_forwards first",
+                        self.sessions[sidx].name
+                    )
+                })?;
+                let f = self.sessions[sidx].forwards[fidx].clone();
+                let key = forward_key(&self.sessions[sidx].id, &f.id);
+                if self.tunnels.is_running(&key) {
+                    return Err(format!(
+                        "forward :{} on '{}' is already running",
+                        f.listen_port, self.sessions[sidx].name
+                    ));
+                }
+                let sname = self.sessions[sidx].name.clone();
+                self.tunnels.start(&self.sessions[sidx], &f)?;
+                self.toast(
+                    ToastKind::Info,
+                    format!("MCP: forward :{} on '{sname}' connecting", f.listen_port),
+                );
+                Ok(json!({
+                    "starting": { "session": sname, "id": f.id, "listen_port": f.listen_port },
+                    "state": match self.tunnels.phase(&key) {
+                        Some(TunnelPhase::Running) => "running",
+                        Some(TunnelPhase::Reconnecting) => "reconnecting",
+                        _ => "starting",
+                    },
+                    "note": "SSH runs in the background; poll culvert_list_forwards for state and last_error",
+                }))
+            }
+            mcp::Action::StopForward { session, forward } => {
+                let sidx = self.find_session_by(session).ok_or_else(|| {
+                    format!("no session named '{session}' — call culvert_list_sessions first")
+                })?;
+                let fidx = self.find_forward(&self.sessions[sidx], forward).ok_or_else(|| {
+                    format!(
+                        "no forward '{forward}' on session '{}' — call culvert_list_forwards first",
+                        self.sessions[sidx].name
+                    )
+                })?;
+                let f = self.sessions[sidx].forwards[fidx].clone();
+                let key = forward_key(&self.sessions[sidx].id, &f.id);
+                if !self.tunnels.is_running(&key) {
+                    return Err(format!(
+                        "forward :{} on '{}' is not running",
+                        f.listen_port, self.sessions[sidx].name
+                    ));
+                }
+                self.tunnels.stop(&key);
+                let sname = self.sessions[sidx].name.clone();
+                self.toast(
+                    ToastKind::Info,
+                    format!("MCP: forward :{} on '{sname}' stopped", f.listen_port),
+                );
+                Ok(json!({
+                    "stopped": { "session": sname, "id": f.id, "listen_port": f.listen_port }
+                }))
+            }
+            mcp::Action::OpenSession { name } => {
+                let idx = self.find_session_by(name).ok_or_else(|| {
+                    format!("no session named '{name}' — call culvert_list_sessions first")
+                })?;
+                let (id, sname) = (
+                    self.sessions[idx].id.clone(),
+                    self.sessions[idx].name.clone(),
+                );
+                self.open_session(ctx, &id);
+                Ok(json!({ "opened": sname }))
+            }
+        }
+    }
+
+    fn find_session_by(&self, key: &str) -> Option<usize> {
+        let key = key.trim();
+        self.sessions
+            .iter()
+            .position(|s| s.id == key)
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .position(|s| s.name.eq_ignore_ascii_case(key))
+            })
+    }
+
+    fn find_tunnel_by(&self, key: &str) -> Option<usize> {
+        let key = key.trim();
+        self.standalone_tunnels
+            .iter()
+            .position(|t| t.id == key)
+            .or_else(|| {
+                self.standalone_tunnels
+                    .iter()
+                    .position(|t| t.name.eq_ignore_ascii_case(key))
+            })
+    }
+
+    /// A session-bound forward is addressed by its id or its listen port.
+    fn find_forward(&self, s: &SshSession, key: &str) -> Option<usize> {
+        let key = key.trim();
+        s.forwards
+            .iter()
+            .position(|f| f.id == key)
+            .or_else(|| {
+                key.parse::<u16>()
+                    .ok()
+                    .and_then(|port| s.forwards.iter().position(|f| f.listen_port == port))
+            })
+    }
+
+    /// Groups are addressed by id or name; returns the id.
+    fn resolve_group(&self, key: &str) -> Result<String, String> {
+        let key = key.trim();
+        if let Some(g) = self
+            .groups
+            .iter()
+            .find(|g| g.id == key || g.name.eq_ignore_ascii_case(key))
+        {
+            return Ok(g.id.clone());
+        }
+        let names: Vec<&str> = self.groups.iter().map(|g| g.name.as_str()).collect();
+        Err(format!(
+            "unknown group '{key}' — known groups: {}",
+            if names.is_empty() {
+                "(none)".to_string()
+            } else {
+                names.join(", ")
+            }
+        ))
+    }
+
+    /// Public shape of a session. Never includes the password or passphrase —
+    /// only whether they exist.
+    fn session_json(&self, s: &SshSession) -> serde_json::Value {
+        let group = s
+            .group
+            .as_ref()
+            .and_then(|id| self.groups.iter().find(|g| &g.id == id))
+            .map(|g| g.name.clone());
+        let forwards: Vec<_> = s
+            .forwards
+            .iter()
+            .map(|f| self.forward_json(&forward_key(&s.id, &f.id), f))
+            .collect();
+        let forward_count = forwards.len();
+        serde_json::json!({
+            "id": s.id,
+            "name": s.name,
+            "host": s.host,
+            "port": s.port,
+            "username": s.username,
+            "protocol": match s.protocol { Protocol::Ssh => "ssh", Protocol::Rdp => "rdp" },
+            "group": group,
+            "auth": match s.auth_type { AuthType::Password => "password", AuthType::Key => "key" },
+            "key_path": s.key_path,
+            "has_password": !s.password.is_empty(),
+            "has_key_passphrase": !s.key_passphrase.is_empty(),
+            "forward_count": forward_count,
+            "forwards": forwards,
+        })
+    }
+
+    /// One forward with its live state. Passwords live on the owning session or
+    /// standalone tunnel, never here.
+    fn forward_json(&self, key: &str, f: &PortForward) -> serde_json::Value {
+        let phase = self.tunnels.phase(key);
+        let mut value = serde_json::json!({
+            "id": f.id,
+            "kind": match f.fwd_type {
+                ForwardType::Local => "local",
+                ForwardType::Remote => "remote",
+                ForwardType::Dynamic => "dynamic",
+            },
+            "listen_host": f.listen_host,
+            "listen_port": f.listen_port,
+            "dest_host": f.dest_host,
+            "dest_port": f.dest_port,
+            "auto_reconnect": f.auto_reconnect,
+            "running": phase.is_some(),
+            "state": match phase {
+                None => "stopped",
+                Some(TunnelPhase::Starting) => "starting",
+                Some(TunnelPhase::Running) => "running",
+                Some(TunnelPhase::Reconnecting) => "reconnecting",
+            },
+        });
+        if phase.is_none() {
+            if let Some(err) = self.tunnels.last_error(key) {
+                value["last_error"] = serde_json::Value::String(err);
+            }
+        }
+        value
+    }
+
+    fn tunnel_json(&self, t: &StandaloneTunnel) -> serde_json::Value {
+        let forwards: Vec<_> = t
+            .forwards
+            .iter()
+            .map(|f| self.forward_json(&standalone_key(&t.id, &f.id), f))
+            .collect();
+        serde_json::json!({
+            "id": t.id,
+            "name": t.name,
+            "host": t.host,
+            "port": t.port,
+            "username": t.username,
+            "auth": match t.auth_type { AuthType::Password => "password", AuthType::Key => "key" },
+            "key_path": t.key_path,
+            "has_password": !t.password.is_empty(),
+            "forwards": forwards,
+        })
+    }
+
 
     fn save_session_editor(&mut self) {
         let Some(ed) = &mut self.session_editor else {
@@ -1523,8 +2338,15 @@ impl TunnelApp {
     }
 
     fn delete_tunnel(&mut self, session_id: &str, forward_id: &str) {
-        let key = forward_key(session_id, forward_id);
+        // Standalone tunnels run under the synthetic `tunnel-<id>` session
+        // key, so a plain forward_key would leave the process listening.
+        let key = if self.sessions.iter().any(|s| s.id == session_id) {
+            forward_key(session_id, forward_id)
+        } else {
+            standalone_key(session_id, forward_id)
+        };
         self.tunnels.stop(&key);
+        self.tunnels.forget_error(&key);
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             session.forwards.retain(|f| f.id != forward_id);
             self.persist("Tunnel deleted");
@@ -1805,6 +2627,11 @@ impl TunnelApp {
                     self.sidebar_collapsed = false;
                     menu.close();
                 }
+                menu.separator();
+                if menu.button("MCP server…").clicked() {
+                    self.mcp_modal = true;
+                    menu.close();
+                }
             });
 
             // -- Macros --------------------------------------------------------
@@ -1956,6 +2783,7 @@ impl TunnelApp {
             ctx.request_repaint();
         }
         self.tick_ai_terminal(ctx);
+        self.tick_mcp(ctx);
         if self.ai.settings_modal(ctx) {
             self.toast(ToastKind::Success, "AI Copilot settings saved");
         }
@@ -1970,18 +2798,60 @@ impl TunnelApp {
             }
         }
 
-        // F11: give the terminal the whole window (MobaXterm's full screen),
-        // F11 again to restore. Consumed before the terminal draws so a shell
-        // application never sees the key.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
-            if matches!(self.tabs.get(self.active), Some(Tab::Terminal(_))) {
-                self.term_fullscreen = !self.term_fullscreen;
-            }
+        // Ctrl+Tab / Ctrl+Shift+Tab: switch tabs even while a shell has the
+        // keyboard. Consume it before the terminal widget reads input so no
+        // stray Tab reaches the remote process. Check the Shift variant
+        // first: consume_key ignores extra Shift/Alt modifiers.
+        let tab_step = if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::Tab,
+            )
+        }) {
+            Some(-1)
+        } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab)) {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(step) = tab_step {
+            self.cycle_tab(step);
+            ctx.request_repaint();
+        }
+
+        // F11: give the terminal the whole (real, OS-)full-screen window.
+        // Consumed before the terminal draws so a shell application never sees
+        // the key. A popped-out shell handles F11 in its own window.
+        if self.term_detached.is_none()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11))
+            && matches!(self.tabs.get(self.active), Some(Tab::Terminal(_)))
+        {
+            self.term_fullscreen = !self.term_fullscreen;
         }
         let focus_term = self.term_fullscreen
+            && self.term_detached.is_none()
             && matches!(self.tabs.get(self.active), Some(Tab::Terminal(_)));
-        if !focus_term {
+        if !matches!(self.tabs.get(self.active), Some(Tab::Terminal(_))) {
             self.term_fullscreen = false;
+        }
+        // Send the window state only on transitions. If the user leaves full
+        // screen another way (OS shortcut, taskbar), follow them back — but
+        // only after the OS has confirmed it was full-screen, otherwise the
+        // stale `false` on the next frame would undo the command.
+        if focus_term != self.term_os_fullscreen {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(focus_term));
+            self.term_os_fullscreen = focus_term;
+            self.term_os_confirmed = false;
+        } else if self.term_os_fullscreen {
+            match ctx.input(|i| i.viewport().fullscreen) {
+                Some(true) => self.term_os_confirmed = true,
+                Some(false) if self.term_os_confirmed => {
+                    self.term_fullscreen = false;
+                    self.term_os_fullscreen = false;
+                    self.term_os_confirmed = false;
+                }
+                _ => {}
+            }
         }
 
         // Custom title bar (the window is undecorated — see main.rs). Drawn
@@ -2016,14 +2886,30 @@ impl TunnelApp {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(8.0);
                             if ui
-                                .button(RichText::new("Restore").size(11.0))
-                                .on_hover_text("Back to the normal window (F11)")
+                                .button(RichText::new("Minimize").size(11.0))
+                                .on_hover_text("Back to the Culvert window (F11)")
                                 .clicked()
                             {
                                 self.term_fullscreen = false;
                             }
+                            if ui
+                                .button(RichText::new("Pop out").size(11.0))
+                                .on_hover_text("Open this terminal in its own window")
+                                .clicked()
+                            {
+                                self.term_fullscreen = false;
+                                self.term_detached_focused = false;
+                                // A normal child window cannot rise above a
+                                // topmost parent: make sure Culvert is normal.
+                                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                                    egui::WindowLevel::Normal,
+                                ));
+                                if let Some(Tab::Terminal(t)) = self.tabs.get(self.active) {
+                                    self.term_detached = Some(t.session_id.clone());
+                                }
+                            }
                             ui.label(
-                                RichText::new("F11")
+                                RichText::new("F11 full screen")
                                     .size(10.0)
                                     .color(theme::TEXT_FAINT()),
                             );
@@ -2144,16 +3030,145 @@ impl TunnelApp {
                 self.workspace(ui, ctx);
             });
 
+        // Popped-out terminal: a real OS window with native minimize / maximize
+        // / close. Closing it, or "Pop back in", returns the shell to its tab.
+        if let Some(sid) = self.term_detached.clone() {
+            let found = self.tabs.iter().position(|t| match t {
+                Tab::Terminal(t) => t.session_id == sid,
+                _ => false,
+            });
+            if let Some(idx) = found {
+                let mut pop_in = false;
+                let mut tab_cycle: Option<isize> = None;
+                // Ask the freshly created OS window to come to the front once.
+                // Repeating it every frame would steal focus back whenever the
+                // user clicks Culvert.
+                let needs_focus = !self.term_detached_focused;
+                if let Some(Tab::Terminal(term)) = self.tabs.get_mut(idx) {
+                    let title = format!("{} — Culvert", term.title);
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("culvert_terminal_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title(&title)
+                            // The main window is undecorated (see main.rs), and
+                            // child viewports would inherit that. Ask for the
+                            // native frame here: the popped-out terminal needs
+                            // real OS minimize / maximize / close buttons.
+                            .with_decorations(true)
+                            .with_active(true)
+                            .with_inner_size([1000.0, 660.0])
+                            .with_min_inner_size([460.0, 280.0]),
+                        |vctx, _class| {
+                            if needs_focus {
+                                vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            }
+                            // Ctrl+Tab here switches the main window's tabs and
+                            // brings Culvert forward; consume it before the
+                            // shell sees a Tab. Check Shift first: consume_key
+                            // ignores extra Shift/Alt.
+                            if vctx.input_mut(|i| {
+                                i.consume_key(
+                                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                                    egui::Key::Tab,
+                                )
+                            }) {
+                                tab_cycle = Some(-1);
+                            } else if vctx.input_mut(|i| {
+                                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab)
+                            }) {
+                                tab_cycle = Some(1);
+                            }
+                            // F11 toggles this window's own full screen; the
+                            // native title bar handles minimize/maximize/close.
+                            if vctx.input_mut(|i| {
+                                i.consume_key(egui::Modifiers::NONE, egui::Key::F11)
+                            }) {
+                                let on = !vctx
+                                    .input(|i| i.viewport().fullscreen.unwrap_or(false));
+                                vctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+                            }
+                            egui::TopBottomPanel::top("detached_bar")
+                                .exact_height(30.0)
+                                .frame(
+                                    Frame::NONE
+                                        .fill(theme::BG_PANEL())
+                                        .stroke(Stroke::new(1.0_f32, theme::BORDER())),
+                                )
+                                .show(vctx, |ui| {
+                                    ui.horizontal_centered(|ui| {
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            RichText::new(&title)
+                                                .size(11.0)
+                                                .color(theme::TEXT_DIM()),
+                                        );
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                ui.add_space(8.0);
+                                                if ui
+                                                    .button(
+                                                        RichText::new("Pop back in").size(11.0),
+                                                    )
+                                                    .on_hover_text(
+                                                        "Return this shell to its Culvert tab",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    pop_in = true;
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
+                            egui::CentralPanel::default()
+                                .frame(Frame::NONE.fill(theme::BG_WINDOW()))
+                                .show(vctx, |ui| term.ui(ui));
+                            if vctx.input(|i| i.viewport().close_requested()) {
+                                pop_in = true;
+                            }
+                        },
+                    );
+                }
+                if needs_focus {
+                    self.term_detached_focused = true;
+                }
+                if let Some(step) = tab_cycle {
+                    self.cycle_tab(step);
+                    // The user is browsing tabs now: bring Culvert forward
+                    // instead of leaving the pop-out covering the new tab.
+                    self.term_detached_focused = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.request_repaint();
+                }
+                if pop_in {
+                    self.term_detached = None;
+                    self.term_detached_focused = false;
+                    ctx.request_repaint();
+                }
+            } else {
+                // The tab was closed while the window was out.
+                self.term_detached = None;
+                self.term_detached_focused = false;
+            }
+        }
+
         self.session_editor_modal(ctx);
         self.tunnel_editor_modal(ctx);
         self.group_editor_modal(ctx);
         self.confirm_modal(ctx);
         self.logs_modal(ctx);
         self.snippets_modal(ctx);
+        self.mcp_modal(ctx);
         self.toast_ui(ctx);
 
         if any_connecting {
             ctx.request_repaint_after(Duration::from_millis(120));
+        }
+        // Tunnel rows change in the background (connecting -> running, or a
+        // connect failure); keep refreshing until every one has settled.
+        if self.tunnels.any_pending() {
+            ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 
@@ -2807,6 +3822,39 @@ impl TunnelApp {
 
     fn workspace(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let active = self.active;
+
+        // The active shell lives in its own OS window: draw a card instead of
+        // the terminal (drawing both would feed the PTY twice).
+        if let (Some(sid), Some(Tab::Terminal(t))) =
+            (self.term_detached.as_deref(), self.tabs.get(active))
+        {
+            if t.session_id == sid {
+                let title = t.title.clone();
+                ui.add_space(28.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new(format!("{title} is open in its own window"))
+                            .size(15.0)
+                            .color(theme::TEXT()),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "Use that window's own minimize / maximize / close controls, or bring it back here.",
+                        )
+                        .size(11.0)
+                        .color(theme::TEXT_DIM()),
+                    );
+                    ui.add_space(14.0);
+                    if ui.button("Bring it back").clicked() {
+                        self.term_detached = None;
+                        self.term_detached_focused = false;
+                    }
+                });
+                return;
+            }
+        }
+
         let use_grid = self.split_view && self.terminal_tab_count() >= 2;
         if use_grid {
             self.terminal_grid(ui, ctx);
@@ -2817,6 +3865,7 @@ impl TunnelApp {
                 let snippets = self.snippets.clone();
                 let mut manage = false;
                 let fullscreen = self.term_fullscreen;
+                let session_id = term.session_id.clone();
                 let action =
                     terminal_quick_bar(ui, term, &snippets, &mut manage, fullscreen);
                 term.ui(ui);
@@ -2836,6 +3885,17 @@ impl TunnelApp {
                     QuickAction::Reconnect => self.toast(ToastKind::Info, "Reconnecting…"),
                     QuickAction::ToggleFullscreen => {
                         self.term_fullscreen = !self.term_fullscreen;
+                    }
+                    QuickAction::Detach => {
+                        self.term_fullscreen = false;
+                        self.split_view = false;
+                        self.term_detached_focused = false;
+                        // Same as the full-screen bar: never let a topmost
+                        // main window hide the new terminal window.
+                        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                            egui::WindowLevel::Normal,
+                        ));
+                        self.term_detached = Some(session_id);
                     }
                 }
                 return;
@@ -3087,8 +4147,8 @@ impl TunnelApp {
             session_name: String,
             conn: String,
             forward: PortForward,
-            running: bool,
-            reconnecting: bool,
+            phase: Option<TunnelPhase>,
+            error: Option<String>,
             auth: &'static str,
             /// None: bound to a saved session. Some: standalone tunnel id.
             standalone: bool,
@@ -3105,16 +4165,18 @@ impl TunnelApp {
                         AuthType::Password => "Password",
                         AuthType::Key => "Key",
                     };
-                    t.forwards.iter().map(move |f| Row {
-                        session_id: tunnel_id.clone(),
-                        session_name: label.clone(),
-                        conn: conn.clone(),
-                        forward: f.clone(),
-                        running: tunnels.is_running(&forward_key(&tunnel_id, &f.id)),
-                        reconnecting: tunnels
-                            .is_reconnecting(&forward_key(&tunnel_id, &f.id)),
-                        auth,
-                        standalone: true,
+                    t.forwards.iter().map(move |f| {
+                        let key = standalone_key(&tunnel_id, &f.id);
+                        Row {
+                            session_id: tunnel_id.clone(),
+                            session_name: label.clone(),
+                            conn: conn.clone(),
+                            forward: f.clone(),
+                            phase: tunnels.phase(&key),
+                            error: tunnels.last_error(&key),
+                            auth,
+                            standalone: true,
+                        }
                     })
                 })
                 .chain(
@@ -3128,16 +4190,18 @@ impl TunnelApp {
                                 AuthType::Password => "Password",
                                 AuthType::Key => "Key",
                             };
-                            s.forwards.iter().map(move |f| Row {
-                                session_id: session_id.clone(),
-                                session_name: session_name.clone(),
-                                conn: conn.clone(),
-                                forward: f.clone(),
-                                running: tunnels.is_running(&forward_key(&session_id, &f.id)),
-                                reconnecting: tunnels
-                                    .is_reconnecting(&forward_key(&session_id, &f.id)),
-                                auth,
-                                standalone: false,
+                            s.forwards.iter().map(move |f| {
+                                let key = forward_key(&session_id, &f.id);
+                                Row {
+                                    session_id: session_id.clone(),
+                                    session_name: session_name.clone(),
+                                    conn: conn.clone(),
+                                    forward: f.clone(),
+                                    phase: tunnels.phase(&key),
+                                    error: tunnels.last_error(&key),
+                                    auth,
+                                    standalone: false,
+                                }
                             })
                         }),
                 )
@@ -3171,8 +4235,8 @@ impl TunnelApp {
                         &row.session_name,
                         &row.conn,
                         &row.forward,
-                        row.running,
-                        row.reconnecting,
+                        row.phase,
+                        row.error.as_deref(),
                         row.auth,
                     ) {
                         actions.push((
@@ -3210,15 +4274,30 @@ impl TunnelApp {
                     }
                 }
                 RowAction::Delete => {
-                    let label = self
-                        .sessions
-                        .iter()
-                        .find(|s| s.id == session_id)
-                        .and_then(|s| s.forwards.iter().find(|f| f.id == forward_id))
-                        .map(forward_desc)
-                        .unwrap_or_default();
+                    // Standalone tunnels live in their own list; look there
+                    // too so the confirm dialog has a real label and the right
+                    // running key.
+                    let (label, key) = if standalone {
+                        let label = self
+                            .standalone_tunnels
+                            .iter()
+                            .find(|t| t.id == session_id)
+                            .and_then(|t| t.forwards.iter().find(|f| f.id == forward_id))
+                            .map(forward_desc)
+                            .unwrap_or_else(|| "this tunnel".to_string());
+                        (label, standalone_key(&session_id, &forward_id))
+                    } else {
+                        let label = self
+                            .sessions
+                            .iter()
+                            .find(|s| s.id == session_id)
+                            .and_then(|s| s.forwards.iter().find(|f| f.id == forward_id))
+                            .map(forward_desc)
+                            .unwrap_or_else(|| "this tunnel".to_string());
+                        (label, forward_key(&session_id, &forward_id))
+                    };
                     self.confirm = Some(Confirm::Tunnel {
-                        key: forward_key(&session_id, &forward_id),
+                        key,
                         session_id,
                         forward_id,
                         label,
@@ -4224,6 +5303,192 @@ impl TunnelApp {
         });
     }
 
+    // -----------------------------------------------------------------------
+    // MCP modal
+    // -----------------------------------------------------------------------
+
+    fn mcp_modal(&mut self, ctx: &egui::Context) {
+        if !self.mcp_modal {
+            return;
+        }
+        let mut keep = true;
+        let resp = egui::Modal::new(egui::Id::new("mcp_modal")).show(ctx, |ui| {
+            ui.set_width(600.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("MCP server").size(16.0).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        keep = false;
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(
+                    "Let an MCP client (Claude Desktop, Cursor, any agent) list, create, edit, delete, start and stop saved sessions and tunnels. \
+                     It listens on loopback only and every request must carry the token below.",
+                )
+                .size(11.0)
+                .color(theme::TEXT_DIM()),
+            );
+            ui.add_space(8.0);
+
+            let running = self.mcp.is_some();
+            ui.horizontal(|ui| {
+                let (dot, color) = if running {
+                    ("● running", theme::SUCCESS())
+                } else {
+                    ("○ stopped", theme::TEXT_FAINT())
+                };
+                ui.label(RichText::new(dot).size(11.0).color(color));
+                ui.add_space(6.0);
+                if running {
+                    if ui.button("Stop").clicked() {
+                        self.mcp = None;
+                        self.mcp_cfg.enabled = false;
+                        if let Err(e) = self.mcp_cfg.save() {
+                            self.mcp_error = Some(format!("could not write mcp.json: {e}"));
+                        }
+                    }
+                } else if ui.button("Start").clicked() {
+                    match mcp::Server::start(&self.mcp_cfg, ctx.clone()) {
+                        Ok(s) => {
+                            self.mcp = Some(s);
+                            self.mcp_cfg.enabled = true;
+                            self.mcp_started_once = true;
+                            self.mcp_error = None;
+                            if let Err(e) = self.mcp_cfg.save() {
+                                self.mcp_error =
+                                    Some(format!("running, but mcp.json failed: {e}"));
+                            }
+                        }
+                        Err(e) => self.mcp_error = Some(e),
+                    }
+                }
+                if ui.button("Copy client config").clicked() {
+                    ctx.copy_text(client_config());
+                }
+                if ui.button("New token").clicked() {
+                    let was_running = self.mcp.is_some();
+                    self.mcp = None;
+                    self.mcp_cfg.token = mcp::new_token();
+                    if was_running {
+                        match mcp::Server::start(&self.mcp_cfg, ctx.clone()) {
+                            Ok(s) => {
+                                self.mcp = Some(s);
+                                self.mcp_error = None;
+                            }
+                            Err(e) => self.mcp_error = Some(e),
+                        }
+                    }
+                    if let Err(e) = self.mcp_cfg.save() {
+                        self.mcp_error = Some(format!("could not write mcp.json: {e}"));
+                    }
+                }
+            });
+            if let Some(err) = &self.mcp_error {
+                ui.add_space(4.0);
+                ui.label(RichText::new(err).size(10.5).color(theme::DANGER()));
+            }
+
+            ui.add_space(10.0);
+            // Show what the running server actually uses; while stopped, show
+            // what it will use on the next Start.
+            let (endpoint, token) = match &self.mcp {
+                Some(server) => (server.url(), server.token().to_string()),
+                None => (self.mcp_cfg.url(), self.mcp_cfg.token.clone()),
+            };
+            egui::Grid::new("mcp_grid")
+                .num_columns(2)
+                .spacing([10.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Endpoint")
+                            .size(10.5)
+                            .color(theme::TEXT_DIM()),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(&endpoint)
+                                .size(11.0)
+                                .monospace()
+                                .color(theme::TEXT()),
+                        );
+                        if ui.small_button("Copy").clicked() {
+                            ctx.copy_text(endpoint.clone());
+                        }
+                    });
+                    ui.end_row();
+                    ui.label(RichText::new("Token").size(10.5).color(theme::TEXT_DIM()));
+                    ui.horizontal(|ui| {
+                        let shown = if self.mcp_reveal {
+                            token.clone()
+                        } else {
+                            "•".repeat(28)
+                        };
+                        ui.label(
+                            RichText::new(shown)
+                                .size(11.0)
+                                .monospace()
+                                .color(theme::TEXT()),
+                        );
+                        if ui
+                            .small_button(if self.mcp_reveal { "Hide" } else { "Show" })
+                            .clicked()
+                        {
+                            self.mcp_reveal = !self.mcp_reveal;
+                        }
+                        if ui.small_button("Copy").clicked() {
+                            ctx.copy_text(token.clone());
+                        }
+                    });
+                    ui.end_row();
+                });
+
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new("Client config (stdio shim)")
+                    .size(11.0)
+                    .strong(),
+            );
+            ui.label(
+                RichText::new(
+                    "Add this to Claude Desktop / Cursor's MCP config and restart the client. \
+                     The shim forwards to the running app and reads the token from mcp.json.",
+                )
+                .size(10.5)
+                .color(theme::TEXT_DIM()),
+            );
+            let mut snippet = client_config();
+            ui.add(
+                egui::TextEdit::multiline(&mut snippet)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY)
+                    .interactive(false),
+            );
+            ui.label(
+                RichText::new("HTTP clients: POST JSON-RPC to the endpoint with `Authorization: Bearer <token>`.")
+                    .size(10.5)
+                    .color(theme::TEXT_DIM()),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!(
+                    "Settings: {}",
+                    mcp::config_file().display()
+                ))
+                .size(10.0)
+                .monospace()
+                .color(theme::TEXT_FAINT()),
+            );
+        });
+        if resp.should_close() {
+            keep = false;
+        }
+        self.mcp_modal = keep;
+    }
+
     fn toast_ui(&mut self, ctx: &egui::Context) {
         let Some(t) = &self.toast else { return };
         let age = self.now - t.born;
@@ -4508,17 +5773,48 @@ fn tunnel_row(
     session_name: &str,
     conn: &str,
     forward: &PortForward,
-    running: bool,
-    reconnecting: bool,
+    phase: Option<TunnelPhase>,
+    error: Option<&str>,
     auth_label: &str,
 ) -> Option<RowAction> {
     let mut action = None;
-    let (dot_color, dot_tip) = if reconnecting {
-        (theme::WARNING(), "SSH link down — reconnecting automatically")
-    } else if running {
-        (theme::SUCCESS(), "Running")
-    } else {
-        (theme::INFO(), "Stopped")
+    let running = phase.is_some();
+    let (dot_color, dot_tip, state_label, state_fg, state_bg) = match phase {
+        Some(TunnelPhase::Starting) => (
+            theme::WARNING(),
+            "Connecting to the SSH host and setting up the forward…",
+            "Connecting",
+            theme::WARNING(),
+            theme::WARNING_BG(),
+        ),
+        Some(TunnelPhase::Reconnecting) => (
+            theme::WARNING(),
+            "SSH link down — retrying automatically",
+            "Retrying",
+            theme::WARNING(),
+            theme::WARNING_BG(),
+        ),
+        Some(TunnelPhase::Running) => (
+            theme::SUCCESS(),
+            "Tunnel is live",
+            "Running",
+            theme::SUCCESS(),
+            theme::SUCCESS_BG(),
+        ),
+        None if error.is_some() => (
+            theme::DANGER(),
+            "The last attempt failed — the reason is shown below",
+            "Failed",
+            theme::DANGER(),
+            theme::DANGER_BG(),
+        ),
+        None => (
+            theme::INFO(),
+            "Stopped",
+            "Stopped",
+            theme::TEXT_FAINT(),
+            theme::BG_PANEL_ALT(),
+        ),
     };
     let (a_fg, a_bg) = auth_palette(auth_label);
 
@@ -4539,6 +5835,7 @@ fn tunnel_row(
                         ui.spacing_mut().item_spacing.x = 6.0;
                         let (t_fg, t_bg) = fwd_palette(&forward.fwd_type);
                         chip(ui, forward.fwd_type.short(), t_fg, t_bg);
+                        chip(ui, state_label, state_fg, state_bg).on_hover_text(dot_tip);
                         chip(ui, auth_label, a_fg, a_bg);
                         if forward.auto_reconnect {
                             chip(ui, "↻ auto", theme::ACCENT_TEXT(), theme::ACCENT_SOFT())
@@ -4550,16 +5847,35 @@ fn tunnel_row(
                                 .color(theme::TEXT_FAINT()),
                         );
                     });
+                    // Surface failures right on the row; the full message is
+                    // also in Activity. This includes per-connection forwarding
+                    // errors while the listener itself is still "Running"
+                    // (e.g. the server has AllowTcpForwarding no).
+                    if let Some(err) = error {
+                        let one_line = err.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let shown: String = if one_line.chars().count() > 110 {
+                            format!("{}…", one_line.chars().take(110).collect::<String>())
+                        } else {
+                            one_line
+                        };
+                        let prefix = if running {
+                            "Last connection failed"
+                        } else {
+                            "Last attempt failed"
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("{prefix}: {shown}"))
+                                    .size(10.0)
+                                    .color(theme::DANGER()),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(err);
+                    }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let (start_fg, start_bg, start_hover) = if running {
-                        (theme::DANGER(), theme::DANGER_BG(), Color32::from_rgb(248, 226, 226))
-                    } else {
-                        (theme::SUCCESS(), theme::SUCCESS_BG(), Color32::from_rgb(223, 241, 232))
-                    };
-                    if soft_pill(ui, if running { "Stop" } else { "Start" }, start_fg, start_bg, start_hover)
-                        .clicked()
-                    {
+                    if tunnel_toggle_button(ui, running).clicked() {
                         action = Some(RowAction::Toggle);
                     }
                     if ghost_button(ui, RichText::new("Edit").size(10.5).color(theme::TEXT_DIM()), false)
@@ -4604,6 +5920,34 @@ fn tunnel_row(
     action
 }
 
+/// Compact play/stop control: green play when stopped, red stop while a
+/// tunnel exists (connecting, running or retrying), so Stop is always one
+/// click away even if the SSH connect is hanging.
+fn tunnel_toggle_button(ui: &mut Ui, active: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 22.0), Sense::click());
+    let (fg, bg, hover) = if active {
+        (theme::DANGER(), theme::DANGER_BG(), Color32::from_rgb(248, 226, 226))
+    } else {
+        (theme::SUCCESS(), theme::SUCCESS_BG(), Color32::from_rgb(223, 241, 232))
+    };
+    let fill = if resp.hovered() { hover } else { bg };
+    ui.painter().rect(
+        rect,
+        3.0,
+        fill,
+        Stroke::new(1.0_f32, fg.gamma_multiply(0.45)),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        if active { tglyph::STOP } else { tglyph::PLAY },
+        theme::icon(14.0),
+        fg,
+    );
+    resp.on_hover_text(if active { "Stop tunnel" } else { "Start tunnel" })
+}
+
 /// Terminal quick-bar actions surfaced to the app for toasts/flags.
 #[derive(Clone, Copy, PartialEq)]
 enum QuickAction {
@@ -4613,6 +5957,7 @@ enum QuickAction {
     Cleared,
     Reconnect,
     ToggleFullscreen,
+    Detach,
 }
 
 /// MobaXterm-style session toolbar above the shell: copy/paste/clear/
@@ -4730,55 +6075,120 @@ fn terminal_quick_bar(
                     }
                 },
             );
-            // Full-screen this terminal (F11); the same button restores it.
-            let tip = if fullscreen {
-                "Leave full screen (F11)"
-            } else {
-                "Full screen terminal (F11)"
-            };
+            // View controls: one boxed, segmented group with proper Tabler
+            // glyphs; the left segment toggles full screen, the right pops the
+            // terminal into its own OS window.
             ui.add_space(2.0);
-            if fullscreen_button(ui, fullscreen)
-                .on_hover_text(tip)
-                .clicked()
-            {
+            let (toggle_fs, detach) = view_control_group(ui, fullscreen);
+            if toggle_fs {
                 action = QuickAction::ToggleFullscreen;
+            }
+            if detach {
+                action = QuickAction::Detach;
             }
         });
     });
     action
 }
 
-/// Full-screen toggle drawn by hand (four corner brackets): no icon-font
-/// glyph needed, and it flips its shape when the terminal is full-screen.
-fn fullscreen_button(ui: &mut Ui, on: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 22.0), Sense::click());
+/// Trimmed argument, or the fallback for omitted/blank values.
+fn non_empty(value: Option<&str>, fallback: &str) -> String {
+    match value.map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
+fn forward_kind(kind: Option<&str>) -> ForwardType {
+    match kind.map(|k| k.trim().to_ascii_lowercase()).as_deref() {
+        Some("remote") => ForwardType::Remote,
+        Some("dynamic") => ForwardType::Dynamic,
+        _ => ForwardType::Local,
+    }
+}
+
+/// The stdio shim is installed next to the app (see Cargo.toml's second bin).
+fn mcp_shim_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_default()
+        .join("culvert-mcp.exe")
+}
+
+fn client_config() -> String {
+    let path = mcp_shim_path().display().to_string().replace('\\', "\\\\");
+    format!(
+        "{{\n  \"mcpServers\": {{\n    \"culvert\": {{ \"command\": \"{path}\" }}\n  }}\n}}"
+    )
+}
+
+/// A single bordered control holding the full-screen and pop-out segments.
+/// Proper Tabler glyphs in a shared box make the pair read as one view menu
+/// instead of two unrelated, hand-drawn icons.
+fn view_control_group(ui: &mut Ui, fullscreen: bool) -> (bool, bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(60.0, 22.0), Sense::hover());
+    let mid = rect.center().x;
+    let fs_rect = egui::Rect::from_min_max(rect.min, egui::pos2(mid, rect.max.y));
+    let pop_rect = egui::Rect::from_min_max(egui::pos2(mid, rect.min.y), rect.max);
+    let fs = ui.interact(fs_rect, ui.id().with("term_fs_seg"), Sense::click());
+    let pop = ui.interact(pop_rect, ui.id().with("term_pop_seg"), Sense::click());
+
     let p = ui.painter();
-    if resp.hovered() {
-        p.rect_filled(rect, 3.0, theme::ACCENT_SOFT());
+    p.rect(
+        rect,
+        4.0,
+        theme::BG_CARD(),
+        Stroke::new(1.0_f32, theme::BORDER()),
+        egui::StrokeKind::Inside,
+    );
+    if fullscreen || fs.hovered() {
+        p.rect_filled(fs_rect.shrink(1.5), 3.0, theme::ACCENT_SOFT());
     }
-    let c = rect.center();
-    let r = if on { 4.0 } else { 7.0 };
-    let arm = 4.0;
-    // Brackets point inward to expand; outward to collapse.
-    let dir = if on { -1.0_f32 } else { 1.0_f32 };
-    let stroke = Stroke::new(1.4_f32, theme::TEXT_DIM());
-    for (sx, sy) in [
-        (-1.0_f32, -1.0_f32),
-        (1.0, -1.0),
-        (-1.0, 1.0),
-        (1.0, 1.0),
-    ] {
-        let corner = egui::pos2(c.x + sx * r, c.y + sy * r);
-        p.line_segment(
-            [corner, egui::pos2(corner.x + dir * sx * arm, corner.y)],
-            stroke,
-        );
-        p.line_segment(
-            [corner, egui::pos2(corner.x, corner.y + dir * sy * arm)],
-            stroke,
-        );
+    if pop.hovered() {
+        p.rect_filled(pop_rect.shrink(1.5), 3.0, theme::ACCENT_SOFT());
     }
-    resp
+    p.line_segment(
+        [
+            egui::pos2(mid, rect.top() + 4.0),
+            egui::pos2(mid, rect.bottom() - 4.0),
+        ],
+        Stroke::new(1.0_f32, theme::BORDER()),
+    );
+    p.text(
+        fs_rect.center(),
+        Align2::CENTER_CENTER,
+        if fullscreen {
+            tglyph::COLLAPSE
+        } else {
+            tglyph::EXPAND
+        },
+        theme::icon(14.0),
+        if fullscreen || fs.hovered() {
+            theme::ACCENT_TEXT()
+        } else {
+            theme::TEXT_DIM()
+        },
+    );
+    p.text(
+        pop_rect.center(),
+        Align2::CENTER_CENTER,
+        tglyph::POPOUT,
+        theme::icon(14.0),
+        if pop.hovered() {
+            theme::ACCENT_TEXT()
+        } else {
+            theme::TEXT_DIM()
+        },
+    );
+
+    let fs = fs.on_hover_text(if fullscreen {
+        "Leave full screen (F11)"
+    } else {
+        "Full screen terminal (F11)"
+    });
+    let pop = pop.on_hover_text("Pop this terminal out into its own window");
+    (fs.clicked(), pop.clicked())
 }
 
 /// Terminal-style tab chip; right-click opens the Chrome-style tab menu.

@@ -4,6 +4,7 @@ mod app;
 mod ai;
 mod filebrowser;
 mod log;
+mod mcp;
 mod secrets;
 mod session;
 mod snippets;

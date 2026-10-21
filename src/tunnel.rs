@@ -12,7 +12,7 @@ use crate::ssh::{self, SharedSshHandle};
 use russh::client;
 use russh::*;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,6 +23,13 @@ use tokio_util::sync::CancellationToken;
 /// Key identifying a running tunnel: session id + forward id.
 pub fn forward_key(session_id: &str, forward_id: &str) -> String {
     format!("{session_id}::{forward_id}")
+}
+
+/// Standalone tunnels run under a synthetic session whose id is
+/// `tunnel-<tunnel id>` (see `StandaloneTunnel::to_ssh_session`). Use this
+/// wherever a running key is computed from a `tunnels.json` id.
+pub fn standalone_key(tunnel_id: &str, forward_id: &str) -> String {
+    forward_key(&format!("tunnel-{tunnel_id}"), forward_id)
 }
 
 /// First reconnect delay; doubles up to `MAX_RECONNECT_DELAY` per attempt
@@ -69,6 +76,8 @@ async fn serve_local(
     label: String,
     bind: String,
     cancel: CancellationToken,
+    errors: SharedErrors,
+    key: String,
 ) {
     loop {
         tokio::select! {
@@ -83,6 +92,8 @@ async fn serve_local(
                         let logs2 = logs.clone();
                         let label2 = label.clone();
                         let dh = dest_host.clone();
+                        let errors2 = errors.clone();
+                        let key2 = key.clone();
                         let desc = format!("local {bind} -> {dh}:{dest_port} [{peer}]");
                         push_log(&logs, LogEntry::new(LogLevel::Info, &label, &format!("Incoming {peer} -> {dh}:{dest_port}")));
                         tokio::spawn(async move {
@@ -95,11 +106,24 @@ async fn serve_local(
                                 )
                                 .await
                             {
-                                Ok(ch) => bridge(sock, ch, logs2, label2, desc).await,
-                                Err(e) => push_log(
-                                    &logs2,
-                                    LogEntry::new(LogLevel::Error, &label2, &format!("direct-tcpip to {dh}:{dest_port} failed: {e}")),
-                                ),
+                                Ok(ch) => {
+                                    // The server allowed this forward: drop any
+                                    // earlier per-connection failure.
+                                    clear_tunnel_error(&errors2, &key2);
+                                    bridge(sock, ch, logs2, label2, desc).await
+                                }
+                                Err(e) => {
+                                    let message =
+                                        format!("direct-tcpip to {dh}:{dest_port} failed: {e}");
+                                    push_log(
+                                        &logs2,
+                                        LogEntry::new(LogLevel::Error, &label2, &message),
+                                    );
+                                    // Keep this visible on the tunnel row:
+                                    // "Running" only means listener + SSH are
+                                    // up; this is a forwarding denial.
+                                    record_tunnel_error(&errors2, &key2, &message);
+                                }
                             }
                         });
                     }
@@ -218,6 +242,33 @@ enum CycleExit {
     Lost { established: bool },
 }
 
+/// Remember the why of a failed start so the tunnel row can show it without
+/// making the user open the Activity log.
+fn record_tunnel_error(errors: &SharedErrors, key: &str, message: &str) {
+    if let Ok(mut errors) = errors.lock() {
+        errors.insert(key.to_string(), message.to_string());
+    }
+}
+
+fn clear_tunnel_error(errors: &SharedErrors, key: &str) {
+    if let Ok(mut errors) = errors.lock() {
+        errors.remove(key);
+    }
+}
+
+/// First attempt uses the listener pre-bound by `start` (so bind errors reach
+/// the caller synchronously). Reconnect attempts bind a fresh listener: the
+/// previous one was closed with the failed attempt.
+async fn forward_listener(
+    prepared: Option<std::net::TcpListener>,
+    bind: &str,
+) -> std::io::Result<TcpListener> {
+    match prepared {
+        Some(listener) => TcpListener::from_std(listener),
+        None => TcpListener::bind(bind).await,
+    }
+}
+
 /// Runs ONE tunnel attempt until it stops or the connection drops: connect,
 /// set up the forward, serve, wait. `prepared` is a locally pre-bound
 /// std listener (Local/Dynamic) so bind errors are reported synchronously to
@@ -228,6 +279,9 @@ async fn run_once(
     prepared: Option<std::net::TcpListener>,
     logs: SharedLogs,
     cancel: CancellationToken,
+    phase: &Arc<AtomicU8>,
+    errors: &SharedErrors,
+    key: &str,
 ) -> CycleExit {
     let label = session.name.clone();
     let (fwd_tx, fwd_rx) = tokio::sync::mpsc::unbounded_channel::<Channel<client::Msg>>();
@@ -235,10 +289,9 @@ async fn run_once(
     let handle: SharedSshHandle = match ssh::connect(session, logs.clone(), fwd_tx).await {
         Ok(h) => Arc::new(h),
         Err(e) => {
-            push_log(
-                &logs,
-                LogEntry::new(LogLevel::Error, &label, &format!("Tunnel not started: {e:#}")),
-            );
+            let message = format!("Tunnel not started: {e:#}");
+            push_log(&logs, LogEntry::new(LogLevel::Error, &label, &message));
+            record_tunnel_error(errors, key, &message);
             return CycleExit::Lost { established: false };
         }
     };
@@ -251,18 +304,19 @@ async fn run_once(
 
     match forward.fwd_type {
         ForwardType::Local => {
-            let Some(l) = prepared else { return CycleExit::Lost { established: false } };
-            let Ok(listener) = TcpListener::from_std(l) else {
-                push_log(
-                    &logs,
-                    LogEntry::new(LogLevel::Error, &label, "Listener setup failed"),
-                );
-                let _ = handle
-                    .disconnect(Disconnect::ByApplication, "listener setup failed", "")
-                    .await;
-                return CycleExit::Lost { established: false };
-            };
             let bind = format!("{}:{}", forward.listen_host, forward.listen_port);
+            let listener = match forward_listener(prepared, &bind).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    let message = format!("Cannot listen on {bind}: {e} (port in use?)");
+                    push_log(&logs, LogEntry::new(LogLevel::Error, &label, &message));
+                    record_tunnel_error(errors, key, &message);
+                    let _ = handle
+                        .disconnect(Disconnect::ByApplication, "listener setup failed", "")
+                        .await;
+                    return CycleExit::Lost { established: false };
+                }
+            };
             push_log(
                 &logs,
                 LogEntry::new(
@@ -277,23 +331,26 @@ async fn run_once(
             let (h, l, lb) = (handle.clone(), logs.clone(), label.clone());
             let (dh, dp) = (forward.dest_host.clone(), forward.dest_port as u32);
             let c = cancel.clone();
+            let errs = errors.clone();
+            let k = key.to_string();
             bg.push(tokio::spawn(async move {
-                serve_local(listener, h, dh, dp, l, lb, bind, c).await;
+                serve_local(listener, h, dh, dp, l, lb, bind, c, errs, k).await;
             }));
         }
         ForwardType::Dynamic => {
-            let Some(l) = prepared else { return CycleExit::Lost { established: false } };
-            let Ok(listener) = TcpListener::from_std(l) else {
-                push_log(
-                    &logs,
-                    LogEntry::new(LogLevel::Error, &label, "Listener setup failed"),
-                );
-                let _ = handle
-                    .disconnect(Disconnect::ByApplication, "listener setup failed", "")
-                    .await;
-                return CycleExit::Lost { established: false };
-            };
             let bind = format!("{}:{}", forward.listen_host, forward.listen_port);
+            let listener = match forward_listener(prepared, &bind).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    let message = format!("Cannot listen on {bind}: {e} (port in use?)");
+                    push_log(&logs, LogEntry::new(LogLevel::Error, &label, &message));
+                    record_tunnel_error(errors, key, &message);
+                    let _ = handle
+                        .disconnect(Disconnect::ByApplication, "listener setup failed", "")
+                        .await;
+                    return CycleExit::Lost { established: false };
+                }
+            };
             push_log(
                 &logs,
                 LogEntry::new(
@@ -339,17 +396,12 @@ async fn run_once(
                     remote_dispatch = Some((target, bind_desc));
                 }
                 Err(e) => {
-                    push_log(
-                        &logs,
-                        LogEntry::new(
-                            LogLevel::Error,
-                            &label,
-                            &format!(
-                                "remote forward {bind_host}:{} denied: {e}",
-                                forward.listen_port
-                            ),
-                        ),
+                    let message = format!(
+                        "remote forward {bind_host}:{} denied: {e}",
+                        forward.listen_port
                     );
+                    push_log(&logs, LogEntry::new(LogLevel::Error, &label, &message));
+                    record_tunnel_error(errors, key, &message);
                     let _ = handle
                         .disconnect(Disconnect::ByApplication, "forward denied", "")
                         .await;
@@ -358,6 +410,11 @@ async fn run_once(
             }
         }
     }
+
+    // SSH is authenticated and the forward is live: the row can finally say
+    // "Running" (until now it was "Connecting…").
+    phase.store(PHASE_RUNNING, Ordering::Relaxed);
+    clear_tunnel_error(errors, key);
 
     // Wait for the user to stop, or the SSH connection to die. When the
     // russh connection task ends the handler (and its fwd_tx) is dropped.
@@ -467,7 +524,8 @@ async fn run_tunnel_task(
     cancel: CancellationToken,
     key: String,
     auto: Arc<AtomicBool>,
-    reconnecting: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
+    errors: SharedErrors,
     shared_running: SharedRunningMap,
     instance: u64,
 ) {
@@ -476,7 +534,17 @@ async fn run_tunnel_task(
     let mut delay = RECONNECT_DELAY;
 
     loop {
-        let exit = run_once(&session, &forward, prepared.take(), logs.clone(), cancel.clone()).await;
+        let exit = run_once(
+            &session,
+            &forward,
+            prepared.take(),
+            logs.clone(),
+            cancel.clone(),
+            &phase,
+            &errors,
+            &key,
+        )
+        .await;
         match exit {
             CycleExit::Cancelled => {
                 push_log(&logs, LogEntry::new(LogLevel::Info, &label, "Tunnel stopped"));
@@ -499,14 +567,14 @@ async fn run_tunnel_task(
                     );
                     break;
                 }
-                reconnecting.store(true, Ordering::Relaxed);
+                phase.store(PHASE_RECONNECTING, Ordering::Relaxed);
                 push_log(
                     &logs,
                     LogEntry::new(
                         LogLevel::Info,
                         &label,
                         &format!(
-                            "Auto-reconnect in {delay:?}{} — port stays bound, it resumes once the link is back",
+                            "Auto-reconnect in {delay:?}{} — listener is re-bound when the link is back",
                             if established { "" } else { " (retry)" }
                         ),
                     ),
@@ -527,7 +595,6 @@ async fn run_tunnel_task(
     // Mark the tunnel as ended: the UI flips back to "stopped" even if the
     // user never pressed Stop. The instance check keeps this from clobbering
     // a freshly started replacement tunnel on the same key.
-    reconnecting.store(false, Ordering::Relaxed);
     if let Ok(mut map) = shared_running.lock() {
         if map
             .get(&key)
@@ -543,23 +610,53 @@ async fn run_tunnel_task(
 // Manager: tracks running tunnels from the UI thread
 // ---------------------------------------------------------------------------
 
+/// User-visible lifecycle of one started tunnel. The entry exists as soon as
+/// Start is pressed, but it only becomes `Running` once SSH is authenticated
+/// and the forward is actually in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunnelPhase {
+    /// SSH connecting / forward being set up (or first retry pending).
+    Starting,
+    /// Forward is live.
+    Running,
+    /// The link dropped and auto-reconnect is waiting to try again.
+    Reconnecting,
+}
+
+const PHASE_STARTING: u8 = 0;
+const PHASE_RUNNING: u8 = 1;
+const PHASE_RECONNECTING: u8 = 2;
+
+fn phase_from_u8(value: u8) -> TunnelPhase {
+    match value {
+        PHASE_RUNNING => TunnelPhase::Running,
+        PHASE_RECONNECTING => TunnelPhase::Reconnecting,
+        _ => TunnelPhase::Starting,
+    }
+}
+
 struct RunningTunnel {
     cancel: CancellationToken,
     /// Live auto-reconnect switch (mirrors `forward.auto_reconnect`; can be
     /// flipped while the tunnel is running).
     auto: Arc<AtomicBool>,
-    /// True while the SSH link is down and a reconnect is scheduled.
-    reconnecting: Arc<AtomicBool>,
+    /// Lifecycle state, written by the supervisor task and read by the UI.
+    phase: Arc<AtomicU8>,
     /// Guards against a dying supervisor removing a newer tunnel's entry.
     instance: u64,
 }
 
 type SharedRunningMap = Arc<Mutex<HashMap<String, RunningTunnel>>>;
+/// Last failure per tunnel key. Kept after the supervisor exits so the row
+/// can explain *why* a Start attempt ended immediately, instead of silently
+/// flipping back to "Stopped" with the error only in the Activity log.
+type SharedErrors = Arc<Mutex<HashMap<String, String>>>;
 
 pub struct TunnelManager {
     rt: tokio::runtime::Handle,
     logs: SharedLogs,
     running: SharedRunningMap,
+    errors: SharedErrors,
     instances: AtomicU64,
 }
 
@@ -569,6 +666,7 @@ impl TunnelManager {
             rt,
             logs,
             running: Arc::new(Mutex::new(HashMap::new())),
+            errors: Arc::new(Mutex::new(HashMap::new())),
             instances: AtomicU64::new(1),
         }
     }
@@ -577,13 +675,27 @@ impl TunnelManager {
         self.running.lock().map(|m| m.contains_key(key)).unwrap_or(false)
     }
 
-    /// True when the tunnel is up but its SSH link is currently down
-    /// (auto-reconnect is waiting to bring it back).
-    pub fn is_reconnecting(&self, key: &str) -> bool {
+    /// Current lifecycle state, or `None` when no supervisor is running.
+    pub fn phase(&self, key: &str) -> Option<TunnelPhase> {
+        let map = self.running.lock().ok()?;
+        map.get(key)
+            .map(|t| phase_from_u8(t.phase.load(Ordering::Relaxed)))
+    }
+
+    /// Last connection/setup failure for this key, until the next Start.
+    pub fn last_error(&self, key: &str) -> Option<String> {
+        self.errors.lock().ok().and_then(|m| m.get(key).cloned())
+    }
+
+    /// True while any tunnel is still connecting or waiting to reconnect, so
+    /// the UI can repaint promptly when its state changes.
+    pub fn any_pending(&self) -> bool {
         self.running
             .lock()
-            .ok()
-            .and_then(|m| m.get(key).map(|t| t.reconnecting.load(Ordering::Relaxed)))
+            .map(|m| {
+                m.values()
+                    .any(|t| t.phase.load(Ordering::Relaxed) != PHASE_RUNNING)
+            })
             .unwrap_or(false)
     }
 
@@ -623,14 +735,17 @@ impl TunnelManager {
 
         let cancel = CancellationToken::new();
         let auto = Arc::new(AtomicBool::new(forward.auto_reconnect));
-        let reconnecting = Arc::new(AtomicBool::new(false));
+        let phase = Arc::new(AtomicU8::new(PHASE_STARTING));
+        if let Ok(mut errors) = self.errors.lock() {
+            errors.remove(&key);
+        }
         let instance = self.instances.fetch_add(1, Ordering::Relaxed);
         self.running.lock().map_err(|_| "internal error".to_string())?.insert(
             key.clone(),
             RunningTunnel {
                 cancel: cancel.clone(),
                 auto: auto.clone(),
-                reconnecting: reconnecting.clone(),
+                phase: phase.clone(),
                 instance,
             },
         );
@@ -644,7 +759,8 @@ impl TunnelManager {
             cancel,
             key,
             auto,
-            reconnecting,
+            phase,
+            self.errors.clone(),
             self.running.clone(),
             instance,
         ));
@@ -656,8 +772,17 @@ impl TunnelManager {
         // cancel; the task's guarded cleanup sees the entry already gone.
         let entry = self.running.lock().ok().and_then(|mut m| m.remove(key));
         if let Some(r) = entry {
-            r.reconnecting.store(false, Ordering::Relaxed);
             r.cancel.cancel();
+        }
+        if let Ok(mut errors) = self.errors.lock() {
+            errors.remove(key);
+        }
+    }
+
+    /// Drop a saved tunnel's remembered failure (after delete).
+    pub fn forget_error(&mut self, key: &str) {
+        if let Ok(mut errors) = self.errors.lock() {
+            errors.remove(key);
         }
     }
 

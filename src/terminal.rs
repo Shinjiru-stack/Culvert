@@ -35,6 +35,53 @@ fn wheel_lines(accum: &mut f32, dy: f32, step: f32) -> i32 {
     lines
 }
 
+/// Number of lines currently sitting above the live screen.
+///
+/// vt100 exposes the current offset but not the populated length. Setting the
+/// offset to `usize::MAX` clamps it to that length, so probe and restore: the
+/// view never changes and the scrollbar knows its true range.
+fn scrollback_max(parser: &mut vt100::Parser) -> usize {
+    let screen = parser.screen_mut();
+    let current = screen.scrollback();
+    screen.set_scrollback(usize::MAX);
+    let max = screen.scrollback();
+    screen.set_scrollback(current);
+    max
+}
+
+/// Thin scrollbar on the terminal's right edge: the thumb fills the track in
+/// proportion to the visible rows and sits at the bottom when the live screen
+/// is showing. Hover/drag brightens it.
+fn draw_scrollbar(
+    ui: &egui::Ui,
+    track: Rect,
+    max: usize,
+    offset: usize,
+    rows: usize,
+    hot: bool,
+) {
+    let painter = ui.painter_at(track);
+    painter.rect_filled(track, 4.0, Color32::from_gray(22));
+    if max == 0 || track.height() <= 1.0 {
+        return;
+    }
+    let visible = rows.max(1) as f32;
+    let total = max as f32 + visible;
+    let h = (track.height() * visible / total).clamp(18.0, track.height());
+    let frac = offset as f32 / max as f32;
+    let top = track.top() + (1.0 - frac.clamp(0.0, 1.0)) * (track.height() - h);
+    let thumb = Rect::from_min_size(
+        egui::pos2(track.left() + 1.5, top),
+        egui::vec2((track.width() - 3.0).max(2.0), h),
+    );
+    let color = if hot {
+        Color32::from_gray(155)
+    } else {
+        Color32::from_gray(84)
+    };
+    painter.rect_filled(thumb, 3.0, color);
+}
+
 // ---------------------------------------------------------------------------
 // Messages between UI thread and the async shell task
 // ---------------------------------------------------------------------------
@@ -600,16 +647,33 @@ impl TerminalSession {
             )
         });
 
-        // Focus: click to focus, like a real terminal.
-        let resp = ui.interact(rect, self.focus_id, egui::Sense::click());
+        let inner = rect.shrink(4.0);
+        // Reserve a slim scrollbar gutter on the right at all times, so the
+        // text grid (and the remote PTY width) never jumps when output starts
+        // growing.
+        let gutter = 11.0;
+        let body = Rect::from_min_max(
+            inner.min,
+            egui::pos2(
+                (inner.right() - gutter).max(inner.left() + 8.0),
+                inner.bottom(),
+            ),
+        );
+        let sb_rect = Rect::from_min_max(
+            egui::pos2(body.right() + 3.0, inner.top()),
+            egui::pos2(inner.right(), inner.bottom()),
+        );
+
+        // Focus: click the text area to focus, like a real terminal. This rect
+        // deliberately stops before the scrollbar strip — a full-width rect
+        // registered first would swallow every click on the bar.
+        let resp = ui.interact(body, self.focus_id, egui::Sense::click());
         if resp.clicked() {
             resp.request_focus();
         }
         let focused = ui.memory(|m| m.has_focus(self.focus_id));
-
-        let inner = rect.shrink(4.0);
-        let cols = ((inner.width() / cell_w).floor() as i64).clamp(2, 500) as u16;
-        let rows = ((inner.height() / cell_h).floor() as i64).clamp(2, 300) as u16;
+        let cols = ((body.width() / cell_w).floor() as i64).clamp(2, 500) as u16;
+        let rows = ((body.height() / cell_h).floor() as i64).clamp(2, 300) as u16;
         if cols != self.cols || rows != self.rows {
             self.cols = cols;
             self.rows = rows;
@@ -628,6 +692,24 @@ impl TerminalSession {
                     let target = (current + lines).max(0) as usize;
                     self.parser.screen_mut().set_scrollback(target);
                 }
+            }
+        }
+
+        // Scrollbar: drag the thumb, or click anywhere on the track to jump.
+        // Registered after the canvas so it wins the hit test on its strip.
+        let sb = ui.interact(
+            sb_rect,
+            self.focus_id.with("scrollbar"),
+            egui::Sense::click_and_drag(),
+        );
+        let sb_max = scrollback_max(&mut self.parser);
+        if (sb.dragged() || sb.clicked()) && sb_max > 0 {
+            if let Some(p) = ui.ctx().pointer_interact_pos() {
+                let frac =
+                    ((p.y - sb_rect.top()) / sb_rect.height().max(1.0)).clamp(0.0, 1.0);
+                let target = (((1.0 - frac) * sb_max as f32).round() as usize).min(sb_max);
+                self.parser.screen_mut().set_scrollback(target);
+                self.scroll_accum = 0.0;
             }
         }
 
@@ -695,7 +777,15 @@ impl TerminalSession {
             }
         }
 
-        self.paint(ui, inner, &font_id, cell_w, cell_h, focused);
+        self.paint(ui, body, &font_id, cell_w, cell_h, focused);
+        draw_scrollbar(
+            ui,
+            sb_rect,
+            sb_max,
+            self.parser.screen().scrollback(),
+            rows as usize,
+            sb.hovered() || sb.dragged(),
+        );
 
         // Overlays for connection lifecycle.
         match &self.status {
@@ -1396,6 +1486,27 @@ mod tests {
 
     fn no_mods() -> Modifiers {
         Modifiers::default()
+    }
+
+    /// The scrollbar needs the populated scrollback length, which vt100 only
+    /// reveals by clamping an oversized offset.
+    #[test]
+    fn scrollback_range_is_measured_and_restored() {
+        let mut p = vt100::Parser::new(4, 20, 200);
+        for i in 0..50 {
+            p.process(format!("line {i}\r\n").as_bytes());
+        }
+        let max = scrollback_max(&mut p);
+        assert!(max > 10, "expected scrollback, got {max}");
+
+        p.screen_mut().set_scrollback(3);
+        assert_eq!(p.screen().scrollback(), 3);
+        // Probing must leave the view where the user left it.
+        assert_eq!(scrollback_max(&mut p), max);
+        assert_eq!(p.screen().scrollback(), 3);
+
+        p.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(p.screen().scrollback(), max);
     }
 
     /// A touchpad dribbles a few pixels per frame; the terminal must still

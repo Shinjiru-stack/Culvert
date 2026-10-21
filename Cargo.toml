@@ -10,6 +10,12 @@ license = "MIT"
 name = "culvert"
 path = "src/main.rs"
 
+# Stdio MCP shim for clients that cannot speak HTTP (Claude Desktop, Cursor).
+# It forwards newline-delimited JSON-RPC to the running app.
+[[bin]]
+name = "culvert-mcp"
+path = "src/bin/culvert-mcp.rs"
+
 [dependencies]
 eframe = "0.32"
 egui = "0.32"

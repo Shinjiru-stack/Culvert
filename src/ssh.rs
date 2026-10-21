@@ -79,12 +79,19 @@ pub async fn connect(
     config.keepalive_interval = Some(std::time::Duration::from_secs(25));
     config.keepalive_max = 3;
     let config = Arc::new(config);
-    let mut handle = client::connect(
-        config,
-        (session.host.trim(), session.port),
-        ClientHandler::new(forwarded_tx),
+    // Without a deadline an unreachable host can sit in TCP connect for a
+    // minute or more: the tunnel row looked "running" while nothing happened
+    // and Activity only said "Connecting…". Fail with a real error instead.
+    let mut handle = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        client::connect(
+            config,
+            (session.host.trim(), session.port),
+            ClientHandler::new(forwarded_tx),
+        ),
     )
     .await
+    .map_err(|_| anyhow::anyhow!("SSH connect to {addr_str} timed out after 20s"))?
     .map_err(|e| anyhow::anyhow!("SSH connect to {addr_str} failed: {e}"))?;
 
     push_log(

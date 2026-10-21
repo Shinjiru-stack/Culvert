@@ -51,10 +51,14 @@ for your approval at every fork in the road.
   the WSL address so mstsc actually dials them.
 - **Built-in terminal tabs** — real PTY SSH sessions with 256-colour support,
   scrollback, resize, paste and proper key encoding (Ctrl codes, arrows, F-keys).
-  Wheel and touchpad deltas both scroll the 4 000-line buffer (Shift+PageUp /
-  Shift+PageDown page it), and **F11** — or the corner-bracket button on the
-  terminal bar — gives the shell the whole window MobaXterm-style, with a slim
-  Restore strip to pop it back.
+  A slim scrollbar on the right tracks the whole 4 000-line buffer (drag it, or
+  click the track to jump); wheel and touchpad deltas scroll as well, and
+  Shift+PageUp / Shift+PageDown page. **F11** — or the corner-bracket button on
+  the terminal bar — makes the window itself full-screen (the OS window, not a
+  layout trick) with a slim bar holding **Minimize** back to Culvert and
+  **Pop out**. Popping out moves the shell into a real, separately movable
+  window with native minimize / maximize / close; closing it, or **Pop back
+  in**, returns the shell to its tab (the tab shows a card while it is out).
   If a session drops you get a reconnect card instead of a dead tab.
 - **Session quick-bar** — Copy / Paste / Clear / Reconnect one row above the
   shell, plus a **Macros** menu that fires saved command snippets into it.
@@ -231,6 +235,42 @@ and redacted values appear as `[REDACTED]` markers.
 decision is listed in the panel's *History* tab and appended to
 `%APPDATA%\culvert\ai-audit.log`.
 
+## MCP server (drive Culvert from an agent)
+
+Culvert exposes its saved SSH sessions and tunnels over the
+[Model Context Protocol](https://modelcontextprotocol.io), so an MCP-capable
+agent (Claude Desktop, Cursor, a custom client) can do the clicking from a
+prompt.
+
+Open **Tools → MCP server…**, press **Start**, then copy the generated client
+config into your MCP client — or point an HTTP client at the endpoint with the
+bearer token. The stdio shim `culvert-mcp.exe` is installed next to
+`culvert.exe`; it reads the port and token from `%APPDATA%\culvert\mcp.json`,
+so rotating the token in the UI is enough and no secret goes into the client
+config.
+
+Tools: `culvert_list_sessions`, `culvert_get_session`,
+`culvert_create_session`, `culvert_update_session`,
+`culvert_delete_session`, `culvert_open_session`, plus
+`culvert_list_tunnels`, `culvert_get_tunnel`, `culvert_create_tunnel`,
+`culvert_update_tunnel`, `culvert_delete_tunnel`, `culvert_start_tunnel` and
+`culvert_stop_tunnel` for standalone tunnels (their own SSH endpoint).
+Session-bound tunnels — the rows that reuse a saved session's connection — are
+covered by `culvert_list_forwards`, `culvert_create_forward`,
+`culvert_update_forward`, `culvert_delete_forward`, `culvert_start_forward`
+and `culvert_stop_forward`. Sessions and standalone tunnels can be addressed
+by name or id; session forwards by their id or listen port.
+
+Security:
+
+- The listener binds `127.0.0.1` only and rejects requests without the
+  per-install bearer token.
+- Passwords and passphrases are **write-only**: a tool may set a new one, but
+  replies only report `has_password` / `has_key_passphrase` — the value is
+  never returned, logged, or shown in tool output.
+- Delete and start/stop apply immediately, exactly like the UI; the tool
+  descriptions say so, so agents can confirm with you first.
+
 ## Download
 
 Grab `culvert-<version>-windows-x64.zip` from the
@@ -268,7 +308,8 @@ field before saving.
 | `Ctrl+V` | Paste into the focused terminal |
 | `Ctrl+C` | Interrupt (SIGINT) in the focused terminal — like a real terminal |
 | `Shift+PageUp` / `Shift+PageDown` | Page the terminal scrollback |
-| `F11` | Full-screen the focused terminal, again to restore |
+| Mouse wheel / drag the scrollbar | Scroll the terminal (click the track to jump) |
+| `F11` | Full-screen the terminal in the OS window, again to restore |
 
 ## Where your data lives
 
@@ -285,7 +326,9 @@ them. Existing plaintext files are upgraded in place the first time Culvert
 loads them. The rest of each file stays human-readable JSON.
 
 The AI Copilot keeps its settings (provider, model, security mode) in
-`ai.json` next to those, with the audit trail in `ai-audit.log`.
+`ai.json` next to those, with the audit trail in `ai-audit.log`. The MCP
+server's on/off switch, port and bearer token live in `mcp.json` (the token is
+a random local secret; it is only as sensitive as the loopback listener).
 
 Upgrading from an earlier build? Your sessions are imported automatically from
 the old `ssh-tunnel-manager` folder the first time Culvert runs.
@@ -345,6 +388,8 @@ workflow tags and publishes that version automatically.
 | `src/session.rs` | Session/forward models, validation, JSON persistence |
 | `src/log.rs` | Activity log types |
 | `src/ai/` | AI Copilot: provider layer, agent engine, tool registry, security/redaction, panel UI |
+| `src/mcp.rs` | MCP server: loopback JSON-RPC transport, token auth, tool schemas, UI-thread actions |
+| `src/bin/culvert-mcp.rs` | Stdio MCP shim that forwards to the running app |
 | `build.rs` | Embeds the icon + metadata into the Windows `.exe` |
 | `assets/` | Brand icon and bundled UI fonts (Inter, JetBrains Mono) |
 | `tests/docker/` | Test servers: SSH container and an xrdp 0.10 RDP container for verifying RDP hand-off (`refresh-rdp.sh`) |
