@@ -37,6 +37,7 @@ pub mod tglyph {
     pub const CHEVRON_RIGHT: char = '\u{ea61}';
     pub const CHEVRON_LEFT: char = '\u{ea60}';
     pub const CHEVRON_UP: char = '\u{ea62}';
+    pub const CHEVRON_DOWN: char = '\u{ea5f}';
     /// plug (quick connect)
     pub const PLUG: char = '\u{ebd9}';
 
@@ -88,6 +89,21 @@ pub mod tglyph {
     pub const SEND: char = '\u{eb1e}';
     pub const GEAR: char = '\u{eb20}';
     pub const HISTORY: char = '\u{ebea}';
+    /// check (menu ticks, connected state)
+    pub const CHECK: char = '\u{ea5e}';
+    /// help / info-circle (Help menu and About)
+    pub const HELP: char = '\u{eabf}';
+    pub const INFO: char = '\u{eac5}';
+    /// keyboard (shortcut sheet)
+    pub const KEYBOARD: char = '\u{ebd6}';
+    /// world / desktop (links, RDP sessions)
+    pub const WORLD: char = '\u{eb54}';
+    pub const DESKTOP: char = '\u{ea89}';
+    /// palette / list (preferences and menus)
+    pub const PALETTE: char = '\u{eb01}';
+    pub const LIST: char = '\u{eb6b}';
+    /// pin (keep the popped-out terminal on top)
+    pub const PIN: char = '\u{ec9c}';
     /// x (close)
     pub const CLOSE: char = '\u{78}';
 }

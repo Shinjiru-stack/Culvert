@@ -11,6 +11,34 @@ use russh::ChannelMsg;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const SCROLLBACK_LINES: usize = 4000;
+
+/// Width of one terminal cell, measured the same way egui lays text out.
+///
+/// `Fonts::glyph_width` returns the unhinted advance (about 7.147 px for
+/// Consolas 13), while a real text run uses a slightly narrower rounded
+/// advance (about 7.002 px). Using the former made the cursor grid drift right
+/// by a fraction of a pixel per column, so at the end of a command the caret
+/// landed on the last typed glyph instead of the empty cell after it.
+fn cell_width(ui: &egui::Ui, font_id: &FontId) -> f32 {
+    const PROBE_COLS: usize = 64;
+    let probe = "M".repeat(PROBE_COLS);
+    let galley = ui.fonts(|f| f.layout_no_wrap(probe, font_id.clone(), Color32::WHITE));
+    (galley.size().x / PROBE_COLS as f32).max(1.0)
+}
+
+/// Slim insertion caret inside one terminal cell.
+///
+/// The cell height is egui's full line height, which is noticeably taller than
+/// the glyph ink. A full-height bar therefore looked like a fence with a long
+/// tail below the baseline. Keep a 2 px wide bar, but shorten it to roughly the
+/// text height and centre it in the cell.
+fn terminal_caret_rect(cell: Rect) -> Rect {
+    let height = (cell.height() * 0.72).max(8.0).min(cell.height());
+    Rect::from_center_size(
+        egui::pos2(cell.left() + 2.0, cell.center().y),
+        egui::vec2(2.0, height),
+    )
+}
 /// Terminal canvas. MobaXterm keeps its shell black regardless of the app
 /// chrome, so the canvas no longer follows the light/dark palette switch.
 #[allow(non_snake_case)]
@@ -640,12 +668,8 @@ impl TerminalSession {
         painter.rect_filled(rect, 0.0, TERM_BG());
 
         let font_id = FontId::new(13.0, FontFamily::Monospace);
-        let (cell_w, cell_h) = ui.fonts(|f| {
-            (
-                f.glyph_width(&font_id, 'M').max(1.0),
-                f.row_height(&font_id).max(1.0),
-            )
-        });
+        let cell_w = cell_width(ui, &font_id);
+        let cell_h = ui.fonts(|f| f.row_height(&font_id).max(1.0));
 
         let inner = rect.shrink(4.0);
         // Reserve a slim scrollbar gutter on the right at all times, so the
@@ -954,12 +978,10 @@ impl TerminalSession {
             );
             // A slim bar instead of a full block: the block used to cover a
             // whole cell, which read as a thick slab sitting behind the last
-            // typed word. The bar marks the insertion point without hiding the
-            // character under it.
-            let bar = Rect::from_min_size(
-                egui::pos2(crect.left() + 1.0, crect.top() + 1.0),
-                egui::vec2(2.0, (crect.height() - 2.0).max(1.0)),
-            );
+            // typed word. Keep the bar shorter than the cell and vertically
+            // centred so it reads as a text caret rather than a full-height
+            // fence with a long tail below the baseline.
+            let bar = terminal_caret_rect(crect);
             if focused {
                 if blink_on {
                     painter.rect_filled(bar, 1.0, Color32::from_gray(229));
@@ -1266,6 +1288,13 @@ pub fn encode_key(key: &egui::Key, mods: egui::Modifiers, app_cursor: bool) -> O
     let ctrl = mods.ctrl || mods.command;
     let alt = mods.alt && !ctrl;
 
+    // Alt+Tab (and Alt+Shift+Tab) belongs to the Windows window switcher.
+    // Even if the event reaches the terminal, never turn it into a literal tab
+    // inside the remote shell.
+    if mods.alt && *key == K::Tab {
+        return None;
+    }
+
     // Ctrl+letter / ctrl+punctuation → ASCII control codes. Non-character
     // keys (arrows, F-keys, …) fall through so their ctrl form is encoded
     // as an xterm modifier parameter below.
@@ -1549,6 +1578,34 @@ mod tests {
     }
 
     #[test]
+    fn alt_tab_is_left_to_the_window_switcher() {
+        let alt = Modifiers { alt: true, ..no_mods() };
+        assert_eq!(encode_key(&Key::Tab, alt, false), None);
+        let alt_shift = Modifiers {
+            alt: true,
+            shift: true,
+            ..no_mods()
+        };
+        assert_eq!(encode_key(&Key::Tab, alt_shift, false), None);
+        // Alt+letter still works as the shell's meta prefix.
+        assert_eq!(
+            encode_key(&Key::B, alt, false),
+            Some(b"\x1bb".to_vec())
+        );
+    }
+
+    #[test]
+    fn caret_is_shorter_than_the_cell_and_centred() {
+        let cell = Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(8.0, 16.0));
+        let caret = terminal_caret_rect(cell);
+        assert_eq!(caret.width(), 2.0);
+        assert!(caret.height() < cell.height());
+        assert!((caret.center().y - cell.center().y).abs() < 0.01);
+        assert!(caret.top() > cell.top());
+        assert!(caret.bottom() < cell.bottom());
+    }
+
+    #[test]
     fn arrows_respect_application_cursor() {
         assert_eq!(encode_key(&Key::ArrowUp, no_mods(), false), Some(b"\x1b[A".to_vec()));
         assert_eq!(encode_key(&Key::ArrowUp, no_mods(), true), Some(b"\x1bOA".to_vec()));
@@ -1620,5 +1677,35 @@ Swap:          2.0G        128M        1.9G";
         assert!(d.df_text.contains("/dev/sda1"));
         assert!(d.free_text.contains("buff/cache"));
         assert!(d.free_text.contains("Swap:"));
+    }
+
+    #[test]
+    fn monospace_cell_width_matches_the_rendered_advance() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let font_id = FontId::new(13.0, FontFamily::Monospace);
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let mut drift = 0.0_f32;
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // A command-line length row: after 49 columns the caret must
+                // still sit on the next cell, not on the final glyph.
+                let text = "kubectl".repeat(7);
+                let galley =
+                    ui.fonts(|f| f.layout_no_wrap(text.clone(), font_id.clone(), Color32::WHITE));
+                let cell = cell_width(ui, &font_id);
+                drift = (cell * text.chars().count() as f32 - galley.size().x).abs();
+            });
+        });
+        assert!(
+            drift < 1.0,
+            "caret drift after 49 columns was {drift} px"
+        );
     }
 }

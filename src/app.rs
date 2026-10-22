@@ -70,6 +70,8 @@ pub struct TunnelApp {
     /// request per detach is enough; re-requesting every frame would steal
     /// focus back whenever the user clicks the main window.
     term_detached_focused: bool,
+    /// Keep the popped-out terminal above other windows (pin toggle).
+    detached_topmost: bool,
     /// MCP server (Tools > MCP server…); None while stopped.
     mcp: Option<mcp::Server>,
     mcp_cfg: mcp::McpConfig,
@@ -97,6 +99,12 @@ pub struct TunnelApp {
     /// Snippet manager modal open, with the pre-edit backup for Cancel.
     snippets_open: bool,
     snippets_backup: Vec<crate::snippets::Snippet>,
+    /// App-wide Preferences dialog (appearance, workspace panels, storage).
+    prefs_open: bool,
+    /// Keyboard-shortcut reference sheet (Help > Keyboard shortcuts, F1).
+    shortcuts_open: bool,
+    /// About dialog (Help > About Culvert).
+    about_open: bool,
     /// Split view column ratio (draggable divider), 0.25–0.75.
     split_ratio: f32,
     /// Quick-connect target input: user@host:port.
@@ -495,7 +503,12 @@ enum TabMenu {
     CloseSelf,
     CloseOthers,
     CloseRight,
+    CloseLeft,
     CloseAll,
+    Reconnect,
+    Detach,
+    Fullscreen,
+    CopyTitle,
 }
 
 /// Left-sidebar tools, MobaXterm-style: the compact bar shows saved sessions
@@ -550,6 +563,7 @@ impl TunnelApp {
             term_os_confirmed: false,
             term_detached: None,
             term_detached_focused: false,
+            detached_topmost: false,
             mcp: None,
             mcp_cfg,
             mcp_modal: false,
@@ -567,6 +581,9 @@ impl TunnelApp {
             snippets: crate::snippets::load_snippets(),
             snippets_open: false,
             snippets_backup: Vec::new(),
+            prefs_open: false,
+            shortcuts_open: false,
+            about_open: false,
             split_ratio: 0.5,
             quick_connect: String::new(),
             ai,
@@ -1313,6 +1330,12 @@ impl TunnelApp {
     /// earlier indices stable while tabs shift.
     fn close_right_tabs(&mut self, from: usize) {
         for i in (from + 1..self.tabs.len()).rev() {
+            self.close_tab(i);
+        }
+    }
+
+    fn close_left_tabs(&mut self, from: usize) {
+        for i in (1..from).rev() {
             self.close_tab(i);
         }
     }
@@ -2742,27 +2765,33 @@ impl TunnelApp {
 
     fn menu_bar(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
+            ui.spacing_mut().button_padding = egui::vec2(9.0, 4.0);
 
             // -- Terminal -----------------------------------------------------
-            ui.menu_button("Terminal", |menu| {
+ui.menu_button("Terminal", |menu| {
+                menu.set_min_width(250.0);
+                menu.spacing_mut().item_spacing.y = 1.0;
+
+                let connected = matches!(self.tabs.get(self.active), Some(Tab::Terminal(_)));
                 let mut copied = false;
                 let mut pasted = false;
                 let mut cleared = false;
                 let mut reconnected = false;
                 let mut closed = false;
-                let mut connected = false;
-                if let Some(Tab::Terminal(t)) = self.tabs.get_mut(self.active) {
-                    connected = true;
-                    if menu.button("Copy screen").clicked() {
+                let mut toggle_focus = false;
+                let mut detach_sid: Option<String> = None;
+                if menu_row(menu, tglyph::COPY, "Copy screen", "", connected, false).clicked() {
+                    if let Some(Tab::Terminal(t)) = self.tabs.get_mut(self.active) {
                         let text = t.visible_text();
                         if !text.trim().is_empty() {
-                            menu.ctx().copy_text(text);
+                            ctx.copy_text(text);
                             copied = true;
                         }
-                        menu.close();
                     }
-                    if menu.button("Paste").clicked() {
+                    menu.close();
+                }
+                if menu_row(menu, tglyph::PASTE, "Paste", "", connected, false).clicked() {
+                    if let Some(Tab::Terminal(t)) = self.tabs.get_mut(self.active) {
                         let text = arboard::Clipboard::new()
                             .and_then(|mut c| c.get_text())
                             .unwrap_or_default();
@@ -2770,30 +2799,66 @@ impl TunnelApp {
                             t.paste_text(&text);
                             pasted = true;
                         }
-                        menu.close();
                     }
-                    if menu.button("Clear screen").clicked() {
+                    menu.close();
+                }
+                if menu_row(menu, tglyph::ERASER, "Clear screen", "", connected, false).clicked() {
+                    if let Some(Tab::Terminal(t)) = self.tabs.get_mut(self.active) {
                         t.clear_screen();
                         cleared = true;
-                        menu.close();
                     }
-                    menu.separator();
-                    if menu.button("Reconnect shell").clicked() {
+                    menu.close();
+                }
+                menu.separator();
+                if menu_row(menu, tglyph::RELOAD, "Reconnect shell", "", connected, false).clicked()
+                {
+                    if let Some(Tab::Terminal(t)) = self.tabs.get_mut(self.active) {
                         t.reconnect();
                         reconnected = true;
-                        menu.close();
                     }
-                    menu.separator();
-                    if menu.button("Close tab").clicked() {
-                        closed = true;
-                        menu.close();
+                    menu.close();
+                }
+                if menu_row(
+                    menu,
+                    tglyph::EXPAND,
+                    if self.term_fullscreen {
+                        "Leave full-screen terminal"
+                    } else {
+                        "Full-screen terminal"
+                    },
+                    "F11",
+                    connected,
+                    false,
+                )
+                .clicked()
+                {
+                    toggle_focus = true;
+                    menu.close();
+                }
+                if menu_row(menu, tglyph::POPOUT, "Pop out terminal", "", connected, false).clicked()
+                {
+                    if let Some(Tab::Terminal(t)) = self.tabs.get(self.active) {
+                        detach_sid = Some(t.session_id.clone());
                     }
+                    menu.close();
+                }
+                menu.separator();
+                if menu_row(
+                    menu,
+                    tglyph::CLOSE,
+                    "Close tab",
+                    "",
+                    self.active > 0,
+                    true,
+                )
+                .clicked()
+                {
+                    closed = true;
+                    menu.close();
                 }
                 if !connected {
-                    menu.label(
-                        RichText::new("No shell open — connect a session first.")
-                            .weak(),
-                    );
+                    menu.separator();
+                    menu_row(menu, tglyph::SESSION, "No shell open", "", false, false);
                 }
                 // Act after the borrow ends.
                 if copied {
@@ -2806,7 +2871,22 @@ impl TunnelApp {
                     self.toast(ToastKind::Success, "Screen cleared");
                 }
                 if reconnected {
-                    self.toast(ToastKind::Info, "Reconnecting…");
+                    self.toast(ToastKind::Info, "Reconnecting...");
+                }
+                if toggle_focus {
+                    self.term_fullscreen = !self.term_fullscreen;
+                }
+                if let Some(sid) = detach_sid {
+                    self.term_fullscreen = false;
+                    self.split_view = false;
+                    self.term_detached_focused = false;
+                    self.detached_topmost = false;
+                    self.term_detached = Some(sid);
+                    // Never let a topmost main window hide the new shell.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                        egui::WindowLevel::Normal,
+                    ));
+                    ctx.request_repaint();
                 }
                 if closed {
                     if self.active > 0 {
@@ -2819,146 +2899,286 @@ impl TunnelApp {
 
             // -- Sessions -----------------------------------------------------
             ui.menu_button("Sessions", |menu| {
-                if menu.button("New session…  (Ctrl+N)").clicked() {
+                menu.set_min_width(250.0);
+                menu.spacing_mut().item_spacing.y = 1.0;
+                if menu_row(menu, tglyph::FILE_PLUS, "New session...", "Ctrl+N", true, false)
+                    .clicked()
+                {
                     self.session_editor = Some(SessionEditor::new());
                     menu.close();
                 }
-                if menu.button("New tunnel…  (Ctrl+T)").clicked() {
+                if menu_row(menu, tglyph::TUNNEL, "New tunnel...", "Ctrl+T", true, false).clicked() {
                     self.tunnel_editor = Some(TunnelEditor::new_standalone());
                     menu.close();
                 }
-                if !self.sessions.is_empty() {
-                    menu.separator();
-                    let mut open_id: Option<String> = None;
-                    for s in self.sessions.iter().take(12) {
-                        if menu.button(RichText::new(&s.name).size(12.0)).clicked() {
-                            open_id = Some(s.id.clone());
-                            menu.close();
-                        }
-                    }
-                    if let Some(id) = open_id {
-                        self.open_session(ctx, &id);
+                if menu_row(menu, tglyph::PLUG, "Quick connect", "", true, false).clicked() {
+                    self.sidebar_collapsed = false;
+                    self.side_mode = SideMode::Sessions;
+                    menu.close();
+                }
+                menu.separator();
+                menu.label(
+                    RichText::new("SAVED SESSIONS")
+                        .size(9.0)
+                        .color(theme::TEXT_FAINT()),
+                );
+                let mut open_id: Option<String> = None;
+                for s in self.sessions.iter().take(12) {
+                    let glyph = if s.protocol == Protocol::Rdp {
+                        tglyph::DESKTOP
+                    } else {
+                        tglyph::SESSION
+                    };
+                    let detail = if s.protocol == Protocol::Rdp {
+                        "RDP".to_string()
+                    } else if s.host.trim().is_empty() {
+                        "SSH".to_string()
+                    } else {
+                        truncate_menu_label(&s.host, 20)
+                    };
+                    if menu_row(
+                        menu,
+                        glyph,
+                        &truncate_menu_label(&s.name, 28),
+                        &detail,
+                        true,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        open_id = Some(s.id.clone());
+                        menu.close();
                     }
                 }
-                if menu.button("Quick connect (sidebar)").clicked() {
-                    menu.close();
+                if self.sessions.is_empty() {
+                    menu_row(
+                        menu,
+                        tglyph::SESSION,
+                        "No saved sessions yet",
+                        "",
+                        false,
+                        false,
+                    );
+                }
+                if let Some(id) = open_id {
+                    self.open_session(ctx, &id);
                 }
             });
 
             // -- View ---------------------------------------------------------
             ui.menu_button("View", |menu| {
-                if menu.checkbox(&mut self.split_view, "Split view").changed() {
-                    menu.close();
-                }
-                if menu
-                    .checkbox(&mut self.show_logs, "Activity log")
-                    .changed()
+                menu.set_min_width(250.0);
+                menu.spacing_mut().item_spacing.y = 1.0;
+                let sessions_active =
+                    !self.sidebar_collapsed && self.side_mode == SideMode::Sessions;
+                let files_active = !self.sidebar_collapsed && self.side_mode == SideMode::Files;
+                if menu_check_row(menu, tglyph::RAIL_SESSIONS, "Sessions panel", sessions_active)
+                    .clicked()
                 {
-                    menu.close();
-                }
-                menu.separator();
-                if menu.button("Files tool").clicked() {
-                    self.side_mode = SideMode::Files;
-                    self.sidebar_collapsed = false;
-                    menu.close();
-                }
-                if menu.button("Sessions tool").clicked() {
-                    self.side_mode = SideMode::Sessions;
-                    menu.close();
-                }
-                menu.separator();
-                if self.sidebar_collapsed {
-                    if menu.button("Expand sidebar").clicked() {
+                    if sessions_active {
+                        self.sidebar_collapsed = true;
+                    } else {
                         self.sidebar_collapsed = false;
-                        menu.close();
+                        self.side_mode = SideMode::Sessions;
                     }
-                } else if menu.button("Collapse sidebar").clicked() {
-                    self.sidebar_collapsed = true;
                     menu.close();
                 }
-                menu.separator();
-                if menu.checkbox(&mut self.ai.open, "AI Copilot").changed() {
+                if menu_check_row(menu, tglyph::RAIL_FILES, "Files panel", files_active).clicked() {
+                    if files_active {
+                        self.sidebar_collapsed = true;
+                    } else {
+                        self.sidebar_collapsed = false;
+                        self.side_mode = SideMode::Files;
+                    }
+                    menu.close();
+                }
+                if menu_check_row(menu, tglyph::SPLIT, "Split view", self.split_view).clicked() {
+                    self.split_view = !self.split_view;
+                    menu.close();
+                }
+                if menu_check_row(menu, tglyph::ACTIVITY, "Activity log", self.show_logs).clicked() {
+                    self.show_logs = !self.show_logs;
+                    menu.close();
+                }
+                let copilot_on = self.ai.open;
+                if menu_check_row(menu, tglyph::COPILOT, "AI Copilot", copilot_on).clicked() {
+                    self.ai.open = !copilot_on;
                     if self.ai.open && self.ai.needs_setup() {
                         self.ai.open_settings();
                     }
                     menu.close();
                 }
-                if menu.button("AI Copilot settings…").clicked() {
-                    self.ai.open_settings();
+                menu.separator();
+                let dark = theme::is_dark();
+                if menu_check_row(
+                    menu,
+                    if dark { tglyph::SUN } else { tglyph::MOON },
+                    "Light theme",
+                    !dark,
+                )
+                .clicked()
+                {
+                    theme::set_dark(!dark);
+                    theme::apply(ctx);
+                    menu.close();
+                }
+                let has_terminal = matches!(self.tabs.get(self.active), Some(Tab::Terminal(_)));
+                if menu_row(
+                    menu,
+                    tglyph::EXPAND,
+                    if self.term_fullscreen {
+                        "Leave full-screen terminal"
+                    } else {
+                        "Full-screen terminal"
+                    },
+                    "F11",
+                    has_terminal,
+                    false,
+                )
+                .clicked()
+                {
+                    self.term_fullscreen = !self.term_fullscreen;
+                    menu.close();
+                }
+                if menu_row(
+                    menu,
+                    tglyph::POPOUT,
+                    "Pop out terminal",
+                    "",
+                    has_terminal,
+                    false,
+                )
+                .clicked()
+                {
+                    if let Some(Tab::Terminal(t)) = self.tabs.get(self.active) {
+                        let sid = t.session_id.clone();
+                        self.term_fullscreen = false;
+                        self.split_view = false;
+                        self.term_detached_focused = false;
+                        self.detached_topmost = false;
+                        self.term_detached = Some(sid);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                            egui::WindowLevel::Normal,
+                        ));
+                        ctx.request_repaint();
+                    }
+                    menu.close();
+                }
+                menu.separator();
+                if menu_row(menu, tglyph::PALETTE, "Preferences...", "Ctrl+,", true, false).clicked() {
+                    self.prefs_open = true;
                     menu.close();
                 }
             });
 
             // -- Tools ---------------------------------------------------------
             ui.menu_button("Tools", |menu| {
-                if menu.button("Snippet manager…").clicked() {
+                menu.set_min_width(250.0);
+                menu.spacing_mut().item_spacing.y = 1.0;
+                if menu_row(menu, tglyph::BOLT, "Snippet manager...", "", true, false).clicked() {
                     self.snippets_backup = self.snippets.clone();
                     self.snippets_open = true;
                     menu.close();
                 }
-                menu.separator();
-                if menu.button("Files browser").clicked() {
+                if menu_row(menu, tglyph::RAIL_FILES, "Files browser", "", true, false).clicked() {
                     self.side_mode = SideMode::Files;
                     self.sidebar_collapsed = false;
                     menu.close();
                 }
-                menu.separator();
-                if menu.button("MCP server…").clicked() {
+                if menu_row(menu, tglyph::PLUG, "MCP server...", "", true, false).clicked() {
                     self.mcp_modal = true;
+                    menu.close();
+                }
+                menu.separator();
+                if menu_row(menu, tglyph::COPILOT, "AI Copilot settings...", "", true, false)
+                    .clicked()
+                {
+                    self.ai.open_settings();
+                    menu.close();
+                }
+                if menu_row(menu, tglyph::PALETTE, "Preferences...", "Ctrl+,", true, false).clicked() {
+                    self.prefs_open = true;
+                    menu.close();
+                }
+                menu.separator();
+                if menu_row(
+                    menu,
+                    tglyph::RAIL_FILES,
+                    "Open configuration folder",
+                    "",
+                    true,
+                    false,
+                )
+                .clicked()
+                {
+                    open_config_folder();
                     menu.close();
                 }
             });
 
             // -- Macros --------------------------------------------------------
             ui.menu_button("Macros", |menu| {
-                if menu.button("Manage snippets…").clicked() {
+                menu.set_min_width(250.0);
+                menu.spacing_mut().item_spacing.y = 1.0;
+                if menu_row(menu, tglyph::BOLT, "Manage snippets...", "", true, false).clicked() {
                     self.snippets_backup = self.snippets.clone();
                     self.snippets_open = true;
                     menu.close();
                 }
-                if !self.snippets.is_empty() {
-                    menu.separator();
-                    for s in self.snippets.clone() {
-                        if menu.button(RichText::new(&s.name).size(12.0)).clicked() {
-                            menu.close();
-                            if let Some(Tab::Terminal(t)) = self.tabs.get_mut(self.active) {
-                                let mut bytes = s.command.as_bytes().to_vec();
-                                if !s.command.ends_with('\n') {
-                                    bytes.push(b'\r');
-                                }
-                                t.send_bytes(bytes);
-                                self.toast(
-                                    ToastKind::Success,
-                                    format!("Macro sent · {}", s.name),
-                                );
-                            } else {
-                                self.toast(
-                                    ToastKind::Info,
-                                    "Open a session shell to run macros",
-                                );
+                menu.separator();
+                let can_run = matches!(self.tabs.get(self.active), Some(Tab::Terminal(_)));
+                for s in self.snippets.clone() {
+                    if menu_row(
+                        menu,
+                        tglyph::BOLT,
+                        &truncate_menu_label(&s.name, 28),
+                        "Run",
+                        can_run,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        menu.close();
+                        if let Some(Tab::Terminal(t)) = self.tabs.get_mut(self.active) {
+                            let mut bytes = s.command.as_bytes().to_vec();
+                            if !s.command.ends_with('\n') {
+                                bytes.push(b'\r');
                             }
+                            t.send_bytes(bytes);
+                            self.toast(ToastKind::Success, format!("Macro sent · {}", s.name));
                         }
                     }
+                }
+                if self.snippets.is_empty() {
+                    menu_row(menu, tglyph::BOLT, "No snippets saved", "", false, false);
                 }
             });
 
             // -- Help ----------------------------------------------------------
             ui.menu_button("Help", |menu| {
-                if menu.button(format!("About Culvert {}", version::tag())).clicked() {
-                    self.toast(
-                        ToastKind::Info,
-                        format!(
-                            "Culvert {} · {} · MIT · SSH, tunnels and an AI Copilot in one exe",
-                            version::tag(),
-                            version::display()
-                        ),
-                    );
+                menu.set_min_width(250.0);
+                menu.spacing_mut().item_spacing.y = 1.0;
+                if menu_row(menu, tglyph::KEYBOARD, "Keyboard shortcuts", "F1", true, false).clicked()
+                {
+                    self.shortcuts_open = true;
                     menu.close();
                 }
-                if menu.button("Open project page").clicked() {
-                    let _ = std::process::Command::new("explorer")
-                        .arg("https://github.com/Shinjiru-stack/Culvert")
-                        .spawn();
+                menu.separator();
+                if menu_row(
+                    menu,
+                    tglyph::INFO,
+                    &format!("About Culvert {}", version::tag()),
+                    "",
+                    true,
+                    false,
+                )
+                .clicked()
+                {
+                    self.about_open = true;
+                    menu.close();
+                }
+                if menu_row(menu, tglyph::WORLD, "Open project page", "", true, false).clicked() {
+                    open_url("https://github.com/Shinjiru-stack/Culvert");
                     menu.close();
                 }
             });
@@ -3069,6 +3289,15 @@ impl TunnelApp {
             }
         }
 
+        // Help and Preferences should work even while a shell owns the
+        // keyboard; neither key is meaningful to a remote program.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+            self.shortcuts_open = !self.shortcuts_open;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+            self.prefs_open = true;
+        }
+
         // Ctrl+Tab / Ctrl+Shift+Tab: switch tabs even while a shell has the
         // keyboard. Consume it before the terminal widget reads input so no
         // stray Tab reaches the remote process. Check the Shift variant
@@ -3170,6 +3399,7 @@ impl TunnelApp {
                             {
                                 self.term_fullscreen = false;
                                 self.term_detached_focused = false;
+                                self.detached_topmost = false;
                                 // A normal child window cannot rise above a
                                 // topmost parent: make sure Culvert is normal.
                                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
@@ -3191,7 +3421,7 @@ impl TunnelApp {
 
         if !focus_term {
             egui::TopBottomPanel::top("menubar")
-                .exact_height(22.0)
+                .exact_height(26.0)
                 .frame(
                     Frame::NONE
                         .fill(theme::BG_PANEL())
@@ -3202,7 +3432,7 @@ impl TunnelApp {
             // Full-width icon toolbar, exactly like MobaXterm's: it sits above the
             // sidebar and the work area rather than inside the content pane.
             egui::TopBottomPanel::top("toolbar")
-                .exact_height(58.0)
+                .exact_height(64.0)
                 .frame(
                     Frame::NONE
                         .fill(theme::BG_PANEL())
@@ -3212,7 +3442,7 @@ impl TunnelApp {
                 .show(ctx, |ui| self.toolbar(ui));
 
             egui::TopBottomPanel::bottom("statusbar")
-                .exact_height(22.0)
+                .exact_height(24.0)
                 .frame(
                     Frame::NONE
                         .fill(theme::SB_BG())
@@ -3303,7 +3533,7 @@ impl TunnelApp {
 
         // Popped-out terminal: a real OS window with native minimize / maximize
         // / close. Closing it, or "Pop back in", returns the shell to its tab.
-        if let Some(sid) = self.term_detached.clone() {
+if let Some(sid) = self.term_detached.clone() {
             let found = self.tabs.iter().position(|t| match t {
                 Tab::Terminal(t) => t.session_id == sid,
                 _ => false,
@@ -3311,24 +3541,31 @@ impl TunnelApp {
             if let Some(idx) = found {
                 let mut pop_in = false;
                 let mut tab_cycle: Option<isize> = None;
+                let mut topmost = self.detached_topmost;
                 // Ask the freshly created OS window to come to the front once.
                 // Repeating it every frame would steal focus back whenever the
                 // user clicks Culvert.
                 let needs_focus = !self.term_detached_focused;
                 if let Some(Tab::Terminal(term)) = self.tabs.get_mut(idx) {
                     let title = format!("{} — Culvert", term.title);
+                    let mut viewport = egui::ViewportBuilder::default()
+                        .with_title(&title)
+                        // The main window is undecorated (see main.rs), and
+                        // child viewports would inherit that. Ask for the
+                        // native frame here: the popped-out terminal needs
+                        // real OS minimize / maximize / close buttons.
+                        .with_decorations(true)
+                        .with_inner_size([1000.0, 660.0])
+                        .with_min_inner_size([460.0, 280.0]);
+                    // Activate the pop-out only on the frame that creates it.
+                    // Passing `with_active(true)` every frame would keep
+                    // stealing focus from Alt+Tab / the taskbar.
+                    if needs_focus {
+                        viewport = viewport.with_active(true);
+                    }
                     ctx.show_viewport_immediate(
                         egui::ViewportId::from_hash_of("culvert_terminal_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title(&title)
-                            // The main window is undecorated (see main.rs), and
-                            // child viewports would inherit that. Ask for the
-                            // native frame here: the popped-out terminal needs
-                            // real OS minimize / maximize / close buttons.
-                            .with_decorations(true)
-                            .with_active(true)
-                            .with_inner_size([1000.0, 660.0])
-                            .with_min_inner_size([460.0, 280.0]),
+                        viewport,
                         |vctx, _class| {
                             if needs_focus {
                                 vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -3359,7 +3596,7 @@ impl TunnelApp {
                                 vctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
                             }
                             egui::TopBottomPanel::top("detached_bar")
-                                .exact_height(30.0)
+                                .exact_height(34.0)
                                 .frame(
                                     Frame::NONE
                                         .fill(theme::BG_PANEL())
@@ -3377,16 +3614,119 @@ impl TunnelApp {
                                             Layout::right_to_left(Align::Center),
                                             |ui| {
                                                 ui.add_space(8.0);
-                                                if ui
-                                                    .button(
-                                                        RichText::new("Pop back in").size(11.0),
-                                                    )
-                                                    .on_hover_text(
-                                                        "Return this shell to its Culvert tab",
-                                                    )
-                                                    .clicked()
+                                                if detached_icon(
+                                                    ui,
+                                                    tglyph::POPOUT,
+                                                    theme::TEXT_DIM(),
+                                                    "Pop back into Culvert",
+                                                    false,
+                                                )
+                                                .clicked()
                                                 {
                                                     pop_in = true;
+                                                }
+                                                let fullscreen = vctx.input(|i| {
+                                                    i.viewport().fullscreen.unwrap_or(false)
+                                                });
+                                                if detached_icon(
+                                                    ui,
+                                                    if fullscreen {
+                                                        tglyph::COLLAPSE
+                                                    } else {
+                                                        tglyph::EXPAND
+                                                    },
+                                                    theme::ACCENT(),
+                                                    if fullscreen {
+                                                        "Leave full-screen"
+                                                    } else {
+                                                        "Full-screen"
+                                                    },
+                                                    fullscreen,
+                                                )
+                                                .clicked()
+                                                {
+                                                    vctx.send_viewport_cmd(
+                                                        egui::ViewportCommand::Fullscreen(
+                                                            !fullscreen,
+                                                        ),
+                                                    );
+                                                }
+                                                if detached_icon(
+                                                    ui,
+                                                    tglyph::PIN,
+                                                    if topmost {
+                                                        theme::ACCENT()
+                                                    } else {
+                                                        theme::TEXT_DIM()
+                                                    },
+                                                    "Stay on top",
+                                                    topmost,
+                                                )
+                                                .clicked()
+                                                {
+                                                    topmost = !topmost;
+                                                    vctx.send_viewport_cmd(
+                                                        egui::ViewportCommand::WindowLevel(
+                                                            if topmost {
+                                                                egui::WindowLevel::AlwaysOnTop
+                                                            } else {
+                                                                egui::WindowLevel::Normal
+                                                            },
+                                                        ),
+                                                    );
+                                                }
+                                                detached_separator(ui);
+                                                if detached_icon(
+                                                    ui,
+                                                    tglyph::RELOAD,
+                                                    theme::TEXT_DIM(),
+                                                    "Reconnect shell",
+                                                    false,
+                                                )
+                                                .clicked()
+                                                {
+                                                    term.reconnect();
+                                                }
+                                                if detached_icon(
+                                                    ui,
+                                                    tglyph::ERASER,
+                                                    theme::TEXT_DIM(),
+                                                    "Clear screen",
+                                                    false,
+                                                )
+                                                .clicked()
+                                                {
+                                                    term.clear_screen();
+                                                }
+                                                if detached_icon(
+                                                    ui,
+                                                    tglyph::PASTE,
+                                                    theme::TEXT_DIM(),
+                                                    "Paste",
+                                                    false,
+                                                )
+                                                .clicked()
+                                                {
+                                                    let text = arboard::Clipboard::new()
+                                                        .and_then(|mut c| c.get_text())
+                                                        .unwrap_or_default();
+                                                    if !text.trim().is_empty() {
+                                                        term.paste_text(&text);
+                                                    }
+                                                }
+                                                if detached_icon(
+                                                    ui,
+                                                    tglyph::COPY,
+                                                    theme::TEXT_DIM(),
+                                                    "Copy screen",
+                                                    false,
+                                                )
+                                                .clicked()
+                                                {
+                                                    let text = term.visible_text();
+                                                    if !text.trim().is_empty() {
+                                                        vctx.copy_text(text);
+                                                    }
                                                 }
                                             },
                                         );
@@ -3404,23 +3744,27 @@ impl TunnelApp {
                 if needs_focus {
                     self.term_detached_focused = true;
                 }
+                self.detached_topmost = topmost;
                 if let Some(step) = tab_cycle {
                     self.cycle_tab(step);
                     // The user is browsing tabs now: bring Culvert forward
                     // instead of leaving the pop-out covering the new tab.
                     self.term_detached_focused = true;
+                    self.detached_topmost = false;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     ctx.request_repaint();
                 }
                 if pop_in {
                     self.term_detached = None;
                     self.term_detached_focused = false;
+                    self.detached_topmost = false;
                     ctx.request_repaint();
                 }
             } else {
                 // The tab was closed while the window was out.
                 self.term_detached = None;
                 self.term_detached_focused = false;
+                self.detached_topmost = false;
             }
         }
 
@@ -3431,6 +3775,9 @@ impl TunnelApp {
         self.logs_modal(ctx);
         self.snippets_modal(ctx);
         self.mcp_modal(ctx);
+        self.preferences_modal(ctx);
+        self.shortcuts_modal(ctx);
+        self.about_modal(ctx);
         self.toast_ui(ctx);
 
         if any_connecting {
@@ -3869,12 +4216,20 @@ impl TunnelApp {
     // Tab strip
     // -----------------------------------------------------------------------
 
-    /// Icon toolbar across the top of the workspace (Tabler glyph tiles).
+    /// Icon toolbar across the top of the workspace (Tabler glyph tiles),
+    /// grouped like MobaXterm: create, browse, arrange, then tools.
     fn toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            if tool_button(ui, tglyph::SESSION, theme::SUCCESS(), "Session", false, "New session")
-                .clicked()
+            if tool_button(
+                ui,
+                tglyph::SESSION,
+                theme::SUCCESS(),
+                "Session",
+                false,
+                "New session — Ctrl+N",
+            )
+            .clicked()
             {
                 self.session_editor = Some(SessionEditor::new());
             }
@@ -3890,6 +4245,7 @@ impl TunnelApp {
             {
                 self.tunnel_editor = Some(TunnelEditor::new_standalone());
             }
+            tool_separator(ui);
             if tool_button(
                 ui,
                 tglyph::RAIL_SESSIONS,
@@ -3916,17 +4272,7 @@ impl TunnelApp {
                 self.sidebar_collapsed = false;
                 self.side_mode = SideMode::Files;
             }
-            // Slim vertical separator between the action and view groups.
-            {
-                let (r, _) = ui.allocate_exact_size(egui::vec2(9.0, 34.0), Sense::hover());
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(r.center().x, r.top() + 4.0),
-                        egui::pos2(r.center().x, r.bottom() - 4.0),
-                    ],
-                    Stroke::new(1.0_f32, theme::BORDER_STRONG()),
-                );
-            }
+            tool_separator(ui);
             let split_active = self.split_view && self.terminal_tab_count() >= 2;
             if tool_button(
                 ui,
@@ -3966,6 +4312,56 @@ impl TunnelApp {
                 if self.ai.open && self.ai.needs_setup() {
                     self.ai.open_settings();
                 }
+            }
+            tool_separator(ui);
+            if tool_button(
+                ui,
+                tglyph::BOLT,
+                theme::WARNING(),
+                "Macros",
+                self.snippets_open,
+                "Command snippets",
+            )
+            .clicked()
+            {
+                self.snippets_backup = self.snippets.clone();
+                self.snippets_open = true;
+            }
+            if tool_button(
+                ui,
+                tglyph::PLUG,
+                theme::SUCCESS(),
+                "MCP",
+                self.mcp.is_some(),
+                "MCP server — let an external agent drive Culvert",
+            )
+            .clicked()
+            {
+                self.mcp_modal = true;
+            }
+            if tool_button(
+                ui,
+                tglyph::GEAR,
+                theme::TEXT_DIM(),
+                "Settings",
+                self.prefs_open,
+                "Preferences — Ctrl+,",
+            )
+            .clicked()
+            {
+                self.prefs_open = true;
+            }
+            if tool_button(
+                ui,
+                tglyph::HELP,
+                theme::INFO(),
+                "Help",
+                self.shortcuts_open,
+                "Keyboard shortcuts — F1",
+            )
+            .clicked()
+            {
+                self.shortcuts_open = true;
             }
         });
     }
@@ -4009,7 +4405,7 @@ impl TunnelApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let active = self.active == 0;
-            let (clicked, _, menu) = tab_chip(ui, "Tunnels", None, active, false);
+            let (clicked, _, menu) = tab_chip(ui, "Tunnels", None, active, false, false);
             if clicked {
                 self.active = 0;
             }
@@ -4033,7 +4429,7 @@ impl TunnelApp {
                         };
                         let title = t.title.clone();
                         let (clicked, closed, menu) =
-                            tab_chip(ui, &title, dot, self.active == i, true);
+                            tab_chip(ui, &title, dot, self.active == i, true, i > 1);
                         if clicked {
                             activate = Some(i);
                         }
@@ -4057,8 +4453,40 @@ impl TunnelApp {
                 match m {
                     TabMenu::CloseSelf => self.close_tab(i),
                     TabMenu::CloseRight => self.close_right_tabs(i),
+                    TabMenu::CloseLeft => self.close_left_tabs(i),
                     TabMenu::CloseOthers => self.close_other_tabs(i),
                     TabMenu::CloseAll => self.close_all_terminal_tabs(),
+                    TabMenu::Reconnect => {
+                        if let Some(Tab::Terminal(t)) = self.tabs.get_mut(i) {
+                            t.reconnect();
+                            self.toast(ToastKind::Info, "Reconnecting...");
+                        }
+                    }
+                    TabMenu::Detach => {
+                        if let Some(Tab::Terminal(t)) = self.tabs.get(i) {
+                            let sid = t.session_id.clone();
+                            self.active = i;
+                            self.term_fullscreen = false;
+                            self.split_view = false;
+                            self.term_detached_focused = false;
+                            self.detached_topmost = false;
+                            self.term_detached = Some(sid);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                                egui::WindowLevel::Normal,
+                            ));
+                            ctx.request_repaint();
+                        }
+                    }
+                    TabMenu::Fullscreen => {
+                        self.active = i;
+                        self.term_fullscreen = true;
+                    }
+                    TabMenu::CopyTitle => {
+                        if let Some(Tab::Terminal(t)) = self.tabs.get(i) {
+                            ctx.copy_text(t.title.clone());
+                            self.toast(ToastKind::Success, "Tab title copied");
+                        }
+                    }
                 }
             }
             // + opens a shell for the selected session (quick-connect style).
@@ -4166,6 +4594,7 @@ impl TunnelApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                             egui::WindowLevel::Normal,
                         ));
+                        self.detached_topmost = false;
                         self.term_detached = Some(session_id);
                     }
                 }
@@ -5539,51 +5968,338 @@ impl TunnelApp {
     // Status bar + toast
     // -----------------------------------------------------------------------
 
+    fn preferences_modal(&mut self, ctx: &egui::Context) {
+        if !self.prefs_open {
+            return;
+        }
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let mut keep = true;
+        let resp = egui::Modal::new(egui::Id::new("preferences_modal")).show(ctx, |ui| {
+            ui.set_width(560.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Preferences").size(16.0).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        keep = false;
+                    }
+                });
+            });
+            ui.label(
+                RichText::new("Appearance and workspace defaults. Changes apply immediately.")
+                    .size(10.5)
+                    .color(theme::TEXT_FAINT()),
+            );
+            ui.add_space(10.0);
+
+            group_box(ui, "Appearance", |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    if theme_card(ui, false, !theme::is_dark()).clicked() {
+                        theme::set_dark(false);
+                        theme::apply(ctx);
+                    }
+                    if theme_card(ui, true, theme::is_dark()).clicked() {
+                        theme::set_dark(true);
+                        theme::apply(ctx);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("The selected theme is saved for the next launch.")
+                        .size(10.0)
+                        .color(theme::TEXT_FAINT()),
+                );
+            });
+
+            group_box(ui, "Workspace", |ui| {
+                ui.checkbox(&mut self.ai.open, "Show the AI Copilot panel");
+                ui.add_space(3.0);
+                ui.checkbox(&mut self.split_view, "Split terminal view");
+                ui.add_space(3.0);
+                ui.checkbox(&mut self.show_logs, "Show the activity log");
+            });
+
+            group_box(ui, "Storage and secrets", |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Configuration: {}",
+                        crate::session::sessions_file().display()
+                    ))
+                    .size(10.0)
+                    .color(theme::TEXT_DIM()),
+                );
+                ui.add_space(5.0);
+                if ui.button("Open configuration folder").clicked() {
+                    open_config_folder();
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(tglyph::SHIELD.to_string())
+                            .font(theme::icon(13.0))
+                            .color(theme::SUCCESS()),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Passwords and keys stay in DPAPI-sealed local files and are never shown to the model.",
+                        )
+                        .size(10.0)
+                        .color(theme::TEXT_DIM()),
+                    );
+                });
+            });
+        });
+        if resp.should_close() || esc {
+            keep = false;
+        }
+        self.prefs_open = keep;
+    }
+
+    fn shortcuts_modal(&mut self, ctx: &egui::Context) {
+        if !self.shortcuts_open {
+            return;
+        }
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let mut keep = true;
+        let resp = egui::Modal::new(egui::Id::new("shortcuts_modal")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Keyboard shortcuts").size(16.0).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        keep = false;
+                    }
+                });
+            });
+            ui.label(
+                RichText::new("Workspace keys work while the terminal has focus unless noted.")
+                    .size(10.5)
+                    .color(theme::TEXT_FAINT()),
+            );
+            ui.add_space(10.0);
+
+            group_box(ui, "Workspace", |ui| {
+                shortcut_row(ui, "Ctrl+N", "New session");
+                shortcut_row(ui, "Ctrl+T", "New tunnel");
+                shortcut_row(ui, "Ctrl+,", "Preferences");
+                shortcut_row(ui, "F1", "This shortcut sheet");
+                shortcut_row(ui, "Esc", "Close the current dialog");
+            });
+            group_box(ui, "Tabs and terminal", |ui| {
+                shortcut_row(ui, "Ctrl+Tab", "Next tab");
+                shortcut_row(ui, "Ctrl+Shift+Tab", "Previous tab");
+                shortcut_row(ui, "F11", "Full-screen terminal");
+                shortcut_row(ui, "Shift+PageUp", "Scroll the terminal back");
+                shortcut_row(ui, "Shift+PageDown", "Scroll the terminal forward");
+            });
+        });
+        if resp.should_close() || esc {
+            keep = false;
+        }
+        self.shortcuts_open = keep;
+    }
+
+    fn about_modal(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let mut keep = true;
+        let resp = egui::Modal::new(egui::Id::new("about_modal")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            let texture = self
+                .mark_texture
+                .get_or_insert_with(|| theme::brand_texture(ctx, 128))
+                .clone();
+            ui.horizontal(|ui| {
+                paint_mark(ui, &texture, 44.0);
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Culvert").size(20.0).strong());
+                    ui.label(
+                        RichText::new(format!("{} · {}", version::tag(), version::display()))
+                            .size(10.5)
+                            .color(theme::TEXT_FAINT()),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        keep = false;
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(
+                    "A native SSH client, tunnel manager, SFTP browser and an AI Copilot that operates them.",
+                )
+                .size(11.5)
+                .color(theme::TEXT_DIM()),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(tglyph::SHIELD.to_string())
+                        .font(theme::icon(14.0))
+                        .color(theme::SUCCESS()),
+                );
+                ui.label(
+                    RichText::new(
+                        "No webview, no external SSH binary, no cloud account required. Built with Rust, egui, russh and a built-in vt100 terminal.",
+                    )
+                    .size(10.0)
+                    .color(theme::TEXT_DIM()),
+                );
+            });
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Project page").clicked() {
+                    open_url("https://github.com/Shinjiru-stack/Culvert");
+                }
+                if ui.button("README").clicked() {
+                    open_url("https://github.com/Shinjiru-stack/Culvert/blob/main/README.md");
+                }
+                if ui.button("Releases").clicked() {
+                    open_url("https://github.com/Shinjiru-stack/Culvert/releases");
+                }
+            });
+        });
+        if resp.should_close() || esc {
+            keep = false;
+        }
+        self.about_open = keep;
+    }
+
+    fn status_segment(
+        ui: &mut Ui,
+        glyph: char,
+        text: &str,
+        tint: Color32,
+        tip: &str,
+    ) -> egui::Response {
+        let resp = ui
+            .horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(
+                    RichText::new(glyph.to_string())
+                        .font(theme::icon(10.5))
+                        .color(tint),
+                );
+                ui.label(
+                    RichText::new(text)
+                        .size(10.0)
+                        .color(theme::SB_TEXT()),
+                );
+            })
+            .response;
+        resp.on_hover_text(tip)
+    }
+
+    fn status_divider(ui: &mut Ui) {
+        ui.add_space(7.0);
+        let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, 12.0), Sense::hover());
+        ui.painter().line_segment(
+            [
+                egui::pos2(r.center().x, r.top()),
+                egui::pos2(r.center().x, r.bottom()),
+            ],
+            Stroke::new(1.0_f32, theme::BORDER()),
+        );
+        ui.add_space(7.0);
+    }
+
     fn statusbar(&mut self, ui: &mut Ui) {
         ui.horizontal_centered(|ui| {
-            ui.add_space(10.0);
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.add_space(8.0);
             let running = self.tunnels.running_count();
+            let total_tunnels = self.standalone_tunnels.len()
+                + self
+                    .sessions
+                    .iter()
+                    .map(|s| s.forwards.len())
+                    .sum::<usize>();
             let shells = self
                 .tabs
                 .iter()
                 .filter(|t| matches!(t, Tab::Terminal(t) if matches!(t.status, TermStatus::Connected)))
                 .count();
-            let parts: Vec<String> = vec![
-                format!(
-                    "{} session{}",
-                    self.sessions.len(),
-                    if self.sessions.len() == 1 { "" } else { "s" }
-                ),
-                format!(
-                    "{} tunnel{} running",
-                    running,
-                    if running == 1 { "" } else { "s" }
-                ),
-                format!(
-                    "{} shell{}",
-                    shells,
-                    if shells == 1 { "" } else { "s" }
-                ),
-            ];
-            ui.label(
-                RichText::new(parts.join("  ·  "))
-                    .size(10.5)
-                    .color(theme::SB_TEXT()),
+            let connecting = self
+                .tabs
+                .iter()
+                .filter(|t| matches!(t, Tab::Terminal(t) if matches!(t.status, TermStatus::Connecting)))
+                .count();
+
+            Self::status_segment(
+                ui,
+                tglyph::RAIL_SESSIONS,
+                &format!("{}", self.sessions.len()),
+                theme::TEXT_DIM(),
+                "Saved sessions",
             );
+            Self::status_divider(ui);
+            Self::status_segment(
+                ui,
+                tglyph::TUNNEL,
+                &format!("{running}/{total_tunnels}"),
+                if running > 0 {
+                    theme::SUCCESS()
+                } else {
+                    theme::TEXT_FAINT()
+                },
+                "Running / saved tunnels",
+            );
+            Self::status_divider(ui);
+            Self::status_segment(
+                ui,
+                tglyph::SESSION,
+                &format!("{shells} shell{}", if shells == 1 { "" } else { "s" }),
+                if shells > 0 {
+                    theme::SUCCESS()
+                } else {
+                    theme::TEXT_FAINT()
+                },
+                "Connected shells",
+            );
+            if connecting > 0 {
+                Self::status_divider(ui);
+                Self::status_segment(
+                    ui,
+                    tglyph::RELOAD,
+                    &format!("{connecting} connecting"),
+                    theme::WARNING(),
+                    "Shells still connecting",
+                );
+            }
+            Self::status_divider(ui);
+            let active_label = match self.tabs.get(self.active) {
+                Some(Tab::Terminal(t)) => truncate_menu_label(&t.title, 34),
+                _ => "Tunnel manager".to_string(),
+            };
+            Self::status_segment(
+                ui,
+                tglyph::LIST,
+                &active_label,
+                theme::SB_TEXT_FAINT(),
+                "Active tab",
+            );
+
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_space(10.0);
+                ui.add_space(8.0);
                 ui.label(
                     RichText::new(version::tag())
                         .size(10.0)
                         .color(theme::SB_TEXT_FAINT()),
                 )
                 .on_hover_text(version::display());
-                ui.add_space(8.0);
+                Self::status_divider(ui);
                 if ui
                     .add(
                         egui::Button::new(
                             RichText::new("Activity")
-                                .size(10.5)
+                                .size(10.0)
                                 .color(theme::SB_TEXT()),
                         )
                         .fill(Color32::TRANSPARENT)
@@ -5593,6 +6309,56 @@ impl TunnelApp {
                     .clicked()
                 {
                     self.show_logs = true;
+                }
+                Self::status_divider(ui);
+                let mcp_on = self.mcp.is_some();
+                Self::status_segment(
+                    ui,
+                    tglyph::PLUG,
+                    if mcp_on { "MCP on" } else { "MCP off" },
+                    if mcp_on {
+                        theme::SUCCESS()
+                    } else {
+                        theme::TEXT_FAINT()
+                    },
+                    "MCP server state",
+                );
+                Self::status_divider(ui);
+                let (ai_text, ai_color) = if self.ai.needs_setup() {
+                    ("AI setup", theme::WARNING())
+                } else if self.ai.open {
+                    ("AI on", theme::SUCCESS())
+                } else {
+                    ("AI off", theme::TEXT_FAINT())
+                };
+                Self::status_segment(
+                    ui,
+                    tglyph::COPILOT,
+                    ai_text,
+                    ai_color,
+                    &self.ai.provider_line(),
+                );
+                Self::status_divider(ui);
+                let (glyph, tint, tip) = if theme::is_dark() {
+                    (tglyph::SUN, theme::WARNING(), "Switch to the light theme")
+                } else {
+                    (tglyph::MOON, theme::INFO(), "Switch to the dark theme")
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(glyph.to_string())
+                                .font(theme::icon(11.0))
+                                .color(tint),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::NONE),
+                    )
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    theme::set_dark(!theme::is_dark());
+                    theme::apply(ui.ctx());
                 }
             });
         });
@@ -6486,6 +7252,106 @@ fn view_control_group(ui: &mut Ui, fullscreen: bool) -> (bool, bool) {
     (fs.clicked(), pop.clicked())
 }
 
+/// One row in a dropdown menu: leading glyph, label, right-aligned shortcut
+/// hint and a full-width hover target. Disabled rows stay visible so the menu
+/// keeps a stable shape, but do not react to the pointer.
+fn menu_row(
+    ui: &mut Ui,
+    glyph: char,
+    label: &str,
+    shortcut: &str,
+    enabled: bool,
+    danger: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(250.0, 24.0),
+        if enabled { Sense::click() } else { Sense::hover() },
+    );
+    if enabled && resp.hovered() {
+        ui.painter().rect_filled(
+            rect.shrink2(egui::vec2(2.0, 0.0)),
+            3.0,
+            theme::ACCENT_SOFT(),
+        );
+    }
+    let text_color = if !enabled {
+        theme::TEXT_FAINT()
+    } else if danger {
+        theme::DANGER()
+    } else {
+        theme::TEXT()
+    };
+    let icon_color = if !enabled {
+        theme::TEXT_FAINT()
+    } else if danger {
+        theme::DANGER()
+    } else {
+        theme::TEXT_DIM()
+    };
+    let y = rect.center().y;
+    let p = ui.painter();
+    p.text(
+        egui::pos2(rect.left() + 10.0, y),
+        Align2::LEFT_CENTER,
+        glyph,
+        theme::icon(13.0),
+        icon_color,
+    );
+    p.text(
+        egui::pos2(rect.left() + 31.0, y),
+        Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(11.5),
+        text_color,
+    );
+    if !shortcut.is_empty() {
+        p.text(
+            egui::pos2(rect.right() - 10.0, y),
+            Align2::RIGHT_CENTER,
+            shortcut,
+            egui::FontId::proportional(9.5),
+            theme::TEXT_FAINT(),
+        );
+    }
+    resp
+}
+
+/// A checkable menu row with the tick on the right, MobaXterm-style.
+fn menu_check_row(ui: &mut Ui, glyph: char, label: &str, checked: bool) -> egui::Response {
+    let resp = menu_row(ui, glyph, label, "", true, false);
+    if checked {
+        ui.painter().text(
+            egui::pos2(resp.rect.right() - 12.0, resp.rect.center().y),
+            Align2::RIGHT_CENTER,
+            tglyph::CHECK,
+            theme::icon(12.0),
+            theme::ACCENT(),
+        );
+    }
+    resp
+}
+
+/// Clamp a menu label so a long session name cannot push the shortcut column
+/// off the popup. Character-based, so multi-byte names stay intact.
+fn truncate_menu_label(text: &str, max: usize) -> String {
+    let mut out: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("explorer").arg(url).spawn();
+}
+
+fn open_config_folder() {
+    if let Some(dir) = crate::session::sessions_file().parent() {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::process::Command::new("explorer").arg(dir).spawn();
+    }
+}
+
 /// Flat MobaXterm-style toolbar tile: colored Tabler glyph over a small
 /// label, no background fill — a soft rounded highlight appears on hover,
 /// accent wash when active. Professional, quiet, and light on the eyes.
@@ -6497,7 +7363,7 @@ fn tool_button(
     active: bool,
     tip: &str,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(54.0, 52.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(58.0, 56.0), Sense::click());
     let p = ui.painter();
     // MobaXterm toolbar tiles are borderless until hovered; the active tool
     // gets a light-blue wash and a saturated strip on its bottom edge.
@@ -6521,20 +7387,73 @@ fn tool_button(
         );
     }
     p.text(
-        egui::pos2(rect.center().x, rect.top() + 20.0),
+        egui::pos2(rect.center().x, rect.top() + 21.0),
         egui::Align2::CENTER_CENTER,
         glyph,
-        theme::icon(24.0),
+        theme::icon(25.0),
         tint,
     );
     p.text(
-        egui::pos2(rect.center().x, rect.bottom() - 10.0),
+        egui::pos2(rect.center().x, rect.bottom() - 11.0),
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(11.0),
         if active { theme::ACCENT_TEXT() } else { theme::TEXT() },
     );
     resp.on_hover_text(tip)
+}
+
+/// Quiet vertical divider between toolbar groups.
+fn tool_separator(ui: &mut Ui) {
+    let (r, _) = ui.allocate_exact_size(egui::vec2(11.0, 40.0), Sense::hover());
+    let x = r.center().x;
+    ui.painter().line_segment(
+        [
+            egui::pos2(x, r.top() + 5.0),
+            egui::pos2(x, r.bottom() - 5.0),
+        ],
+        Stroke::new(1.0_f32, theme::BORDER_STRONG()),
+    );
+}
+
+/// Compact 24x24 icon button for the popped-out terminal toolbar.
+fn detached_icon(
+    ui: &mut Ui,
+    glyph: char,
+    tint: Color32,
+    tip: &str,
+    active: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), Sense::click());
+    if active || resp.hovered() {
+        ui.painter().rect_filled(rect, 2.0, theme::ACCENT_SOFT());
+        ui.painter().rect_stroke(
+            rect,
+            2.0,
+            Stroke::new(1.0_f32, theme::ACCENT()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        glyph,
+        theme::icon(14.0),
+        if active { theme::ACCENT() } else { tint },
+    );
+    resp.on_hover_text(tip)
+}
+
+fn detached_separator(ui: &mut Ui) {
+    let (r, _) = ui.allocate_exact_size(egui::vec2(9.0, 18.0), Sense::hover());
+    let x = r.center().x;
+    ui.painter().line_segment(
+        [
+            egui::pos2(x, r.top() + 3.0),
+            egui::pos2(x, r.bottom() - 3.0),
+        ],
+        Stroke::new(1.0_f32, theme::BORDER_STRONG()),
+    );
 }
 
 /// Narrow far-right rail tile (26x26): flat until hovered, like the crop of
@@ -6569,6 +7488,7 @@ fn tab_chip(
     dot: Option<Color32>,
     active: bool,
     closable: bool,
+    has_left: bool,
 ) -> (bool, bool, Option<TabMenu>) {
     let mut clicked = false;
     let mut closed = false;
@@ -6605,19 +7525,62 @@ fn tab_chip(
                     clicked = true;
                 }
                 label.context_menu(|ui| {
-                    if closable && ui.button("Close tab").clicked() {
-                        menu = Some(TabMenu::CloseSelf);
+                    ui.set_min_width(250.0);
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    if closable {
+                        if menu_row(ui, tglyph::CLOSE, "Close tab", "", true, false).clicked() {
+                            menu = Some(TabMenu::CloseSelf);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if menu_row(ui, tglyph::RELOAD, "Reconnect shell", "", true, false)
+                            .clicked()
+                        {
+                            menu = Some(TabMenu::Reconnect);
+                            ui.close();
+                        }
+                        if menu_row(ui, tglyph::POPOUT, "Pop out tab", "", true, false).clicked() {
+                            menu = Some(TabMenu::Detach);
+                            ui.close();
+                        }
+                        if menu_row(ui, tglyph::EXPAND, "Full-screen tab", "F11", true, false)
+                            .clicked()
+                        {
+                            menu = Some(TabMenu::Fullscreen);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if menu_row(ui, tglyph::COPY, "Copy tab title", "", true, false).clicked() {
+                            menu = Some(TabMenu::CopyTitle);
+                            ui.close();
+                        }
+                        ui.separator();
+                    }
+                    if menu_row(
+                        ui,
+                        tglyph::CLOSE,
+                        "Close tabs to the left",
+                        "",
+                        has_left,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        menu = Some(TabMenu::CloseLeft);
                         ui.close();
                     }
-                    if ui.button("Close tabs to the right").clicked() {
+                    if menu_row(ui, tglyph::CLOSE, "Close tabs to the right", "", true, false)
+                        .clicked()
+                    {
                         menu = Some(TabMenu::CloseRight);
                         ui.close();
                     }
-                    if ui.button("Close other tabs").clicked() {
+                    if menu_row(ui, tglyph::CLOSE, "Close other tabs", "", true, false).clicked() {
                         menu = Some(TabMenu::CloseOthers);
                         ui.close();
                     }
-                    if ui.button("Close all tabs").clicked() {
+                    ui.separator();
+                    if menu_row(ui, tglyph::CLOSE, "Close all tabs", "", true, true).clicked() {
                         menu = Some(TabMenu::CloseAll);
                         ui.close();
                     }
@@ -6798,6 +7761,159 @@ fn proto_tile(
     resp
 }
 
+/// A miniature window preview for the theme picker. Painted rather than
+/// rendered so it stays crisp and does not allocate child widgets.
+fn theme_card(ui: &mut Ui, dark: bool, active: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(190.0, 96.0), Sense::click());
+    let (window, chrome, side, line, text) = if dark {
+        (
+            Color32::from_rgb(13, 17, 23),
+            Color32::from_rgb(22, 27, 34),
+            Color32::from_rgb(28, 33, 40),
+            Color32::from_rgb(48, 54, 61),
+            Color32::from_rgb(230, 237, 243),
+        )
+    } else {
+        (
+            Color32::from_rgb(255, 255, 255),
+            Color32::from_rgb(240, 240, 240),
+            Color32::from_rgb(247, 247, 247),
+            Color32::from_rgb(217, 217, 217),
+            Color32::from_rgb(26, 26, 26),
+        )
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, 4.0, window);
+    p.rect_stroke(
+        rect,
+        4.0,
+        Stroke::new(
+            if active { 2.0_f32 } else { 1.0_f32 },
+            if active {
+                theme::ACCENT()
+            } else {
+                theme::BORDER_STRONG()
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink(1.0);
+    let chrome_rect = egui::Rect::from_min_max(
+        inner.min,
+        egui::pos2(inner.right(), inner.top() + 16.0),
+    );
+    let body = egui::Rect::from_min_max(
+        egui::pos2(inner.left(), chrome_rect.bottom()),
+        egui::pos2(inner.right(), inner.bottom() - 19.0),
+    );
+    let side_rect = egui::Rect::from_min_max(
+        body.min,
+        egui::pos2(body.left() + 44.0, body.bottom()),
+    );
+    p.rect_filled(chrome_rect, 0.0, chrome);
+    p.rect_filled(body, 0.0, window);
+    p.rect_filled(side_rect, 0.0, side);
+    p.line_segment(
+        [
+            egui::pos2(side_rect.right(), body.top()),
+            egui::pos2(side_rect.right(), body.bottom()),
+        ],
+        Stroke::new(1.0_f32, line),
+    );
+    // Fake tab + content lines.
+    p.rect_filled(
+        egui::Rect::from_min_size(
+            egui::pos2(side_rect.right() + 8.0, body.top() + 7.0),
+            egui::vec2(44.0, 11.0),
+        ),
+        2.0,
+        if active {
+            theme::ACCENT_SOFT()
+        } else {
+            side
+        },
+    );
+    for (i, w) in [76.0_f32, 58.0, 68.0].iter().enumerate() {
+        p.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(side_rect.right() + 8.0, body.top() + 26.0 + i as f32 * 7.0),
+                egui::vec2(*w, 3.0),
+            ),
+            1.0,
+            line,
+        );
+    }
+    p.rect_filled(
+        egui::Rect::from_min_size(
+            egui::pos2(inner.left() + 10.0, inner.bottom() - 13.0),
+            egui::vec2(34.0, 5.0),
+        ),
+        2.0,
+        if active {
+            theme::ACCENT()
+        } else {
+            line
+        },
+    );
+    p.text(
+        egui::pos2(inner.right() - 10.0, inner.bottom() - 10.0),
+        Align2::RIGHT_CENTER,
+        if dark { "Dark" } else { "Light" },
+        egui::FontId::proportional(10.5),
+        text,
+    );
+    if active {
+        p.circle_filled(
+            egui::pos2(inner.left() + 11.0, inner.top() + 8.0),
+            6.0,
+            theme::ACCENT(),
+        );
+        p.text(
+            egui::pos2(inner.left() + 11.0, inner.top() + 8.0),
+            Align2::CENTER_CENTER,
+            tglyph::CHECK,
+            theme::icon(8.0),
+            Color32::WHITE,
+        );
+    }
+    resp.on_hover_text(if dark {
+        "Dark theme"
+    } else {
+        "Light theme"
+    })
+}
+
+/// One keycap + description row in the shortcut sheet.
+fn shortcut_row(ui: &mut Ui, keys: &str, action: &str) {
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(138.0, 20.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                Frame::NONE
+                    .fill(theme::BG_BTN())
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER()))
+                    .corner_radius(CornerRadius::same(2))
+                    .inner_margin(Margin::symmetric(6, 2))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(keys)
+                                .font(egui::FontId::monospace(9.5))
+                                .color(theme::TEXT()),
+                        );
+                    });
+            },
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(action)
+                .size(10.5)
+                .color(theme::TEXT_DIM()),
+        );
+    });
+    ui.add_space(3.0);
+}
+
 /// Classic Win32 group box: a 1px rectangle with the caption sitting on the
 /// top border.
 fn group_box(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
@@ -6810,7 +7926,12 @@ fn group_box(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
             top: 14,
             bottom: 10,
         })
-        .show(ui, add);
+        .show(ui, |ui| {
+            // Dialogs look deliberate when every group box spans the same
+            // width, even if one section has shorter rows.
+            ui.set_min_width(ui.available_width());
+            add(ui);
+        });
     let rect = resp.response.rect;
     let galley = ui.painter().layout_no_wrap(
         title.to_owned(),
@@ -7331,6 +8452,17 @@ mod tests {
         app.toast(ToastKind::Success, "Tunnel started");
         assert!(run_frames(&mut app, &ctx, egui::vec2(1024.0, 700.0), 2) > 40);
 
+        // Preferences, shortcut sheet and About dialog.
+        app.prefs_open = true;
+        assert!(run_frames(&mut app, &ctx, egui::vec2(1024.0, 700.0), 2) > 40);
+        app.prefs_open = false;
+        app.shortcuts_open = true;
+        assert!(run_frames(&mut app, &ctx, egui::vec2(1024.0, 700.0), 2) > 40);
+        app.shortcuts_open = false;
+        app.about_open = true;
+        assert!(run_frames(&mut app, &ctx, egui::vec2(1024.0, 700.0), 2) > 40);
+        app.about_open = false;
+
         // Session tab: spawns against a closed port, fails fast, renders
         // both the connecting and disconnected overlays.
         app.open_session(&ctx, "demo-session");
@@ -7343,6 +8475,16 @@ mod tests {
         app.open_session(&ctx, "demo-session");
         assert_eq!(app.tabs.len(), 2);
         assert!(matches!(app.tabs.last(), Some(Tab::Terminal(_))));
+
+        // Popped-out terminal toolbar (native viewport path).
+        let sid = match app.tabs.last() {
+            Some(Tab::Terminal(t)) => t.session_id.clone(),
+            _ => unreachable!(),
+        };
+        app.term_detached = Some(sid);
+        let _ = run_frames(&mut app, &ctx, egui::vec2(1024.0, 700.0), 2);
+        app.term_detached = None;
+        app.term_detached_focused = false;
     }
 
     /// Regression: "New tunnel" must be savable with zero saved sessions —
@@ -7381,6 +8523,14 @@ mod tests {
         let cmd = ssh_command(&s);
         assert!(cmd.contains("root@10.0.0.5"));
         assert!(cmd.contains("-p 22"));
+    }
+
+    #[test]
+    fn menu_labels_clamp_without_splitting_characters() {
+        assert_eq!(truncate_menu_label("production-web-01", 4), "prod…");
+        assert_eq!(truncate_menu_label("éééé", 2), "éé…");
+        assert_eq!(truncate_menu_label("short", 10), "short");
+        assert_eq!(truncate_menu_label("", 4), "");
     }
 
     fn sample_term_run(command: &str) -> AiTermRun {

@@ -46,9 +46,11 @@ for your approval at every fork in the road.
   endpoint. See [AI Copilot](#ai-copilot).
 - **Sessions sidebar** — save host, port, username and auth once; double-click
   any session to open a shell tab (right-click for edit/duplicate/delete).
-- **Full menu bar** — Terminal / Sessions / View / Tools / Macros / Help above
-  a flat tile toolbar (Session · Tunnel · Sessions · Files · Split ·
-  Activity · Copilot), all wired to real actions.
+- **Full menu bar and grouped toolbar** — Terminal / Sessions / View / Tools /
+  Macros / Help with icon menus, shortcut hints and disabled states, above a
+  grouped tile toolbar (Session · Tunnel · Sessions · Files · Split ·
+  Activity · Copilot · Macros · MCP · Settings · Help). Preferences, an
+  in-app keyboard-shortcut sheet (F1) and an About dialog are wired in.
 - **Windows RDP pass-through** — double-click an RDP session to launch the
   system RDP client with saved credentials seeded into Windows Credential
   Manager; loopback targets (WSL/docker relays at `127.0.0.1`) are remapped to
@@ -61,8 +63,10 @@ for your approval at every fork in the road.
   the terminal bar — makes the window itself full-screen (the OS window, not a
   layout trick) with a slim bar holding **Minimize** back to Culvert and
   **Pop out**. Popping out moves the shell into a real, separately movable
-  window with native minimize / maximize / close; closing it, or **Pop back
-  in**, returns the shell to its tab (the tab shows a card while it is out).
+  window with native minimize / maximize / close and a compact toolbar for
+  copy, paste, clear, reconnect, full-screen, stay-on-top and **Pop back in**.
+  Closing it, or **Pop back in**, returns the shell to its tab (the tab shows
+  a card while it is out).
   If a session drops you get a reconnect card instead of a dead tab.
 - **Session quick-bar** — Copy / Paste / Clear / Reconnect one row above the
   shell, plus a **Macros** menu that fires saved command snippets into it.
@@ -357,6 +361,14 @@ field before saving.
 | `Shift+PageUp` / `Shift+PageDown` | Page the terminal scrollback |
 | Mouse wheel / drag the scrollbar | Scroll the terminal (click the track to jump) |
 | `F11` | Full-screen the terminal in the OS window, again to restore |
+| `Ctrl+,` | Open Preferences |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous terminal tab |
+| `F1` | Open the in-app keyboard-shortcut sheet |
+| `Esc` | Close the current dialog |
+
+`Alt+Tab` stays with Windows and is never sent to the remote shell.
+Right-click a terminal tab for the richer tab menu: reconnect, pop out,
+full-screen, copy the title, or close tabs to the left/right/others.
 
 ## Where your data lives
 

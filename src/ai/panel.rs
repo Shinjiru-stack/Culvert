@@ -130,6 +130,16 @@ pub struct AiPanel {
     tab: Tab,
     records: Vec<ExecRecord>,
     pending_action: Option<(u64, UiAction, String)>,
+    /// Follow the newest reply. Cleared when the user scrolls up, restored by
+    /// the jump-to-latest button (or by scrolling back to the bottom).
+    chat_follow: bool,
+    /// Force a scroll on the next frame, used by the jump button.
+    chat_scroll_latest: bool,
+    /// Content size markers, so a streaming reply can request a scroll only
+    /// when something actually changed.
+    chat_last_msgs: usize,
+    chat_last_stream: usize,
+    chat_last_pending: bool,
 
     cmd_tx: UnboundedSender<AiCmd>,
     evt_rx: UnboundedReceiver<AiEvent>,
@@ -168,6 +178,11 @@ impl AiPanel {
             tab: Tab::Chat,
             records: Vec::new(),
             pending_action: None,
+            chat_follow: true,
+            chat_scroll_latest: false,
+            chat_last_msgs: 0,
+            chat_last_stream: 0,
+            chat_last_pending: false,
             cmd_tx,
             evt_rx,
             engine_started: false,
@@ -256,6 +271,8 @@ impl AiPanel {
             card: None,
         });
         self.busy = true;
+        self.chat_follow = true;
+        self.chat_scroll_latest = true;
         self.send(AiCmd::UserMessage(text));
     }
 
@@ -571,13 +588,75 @@ impl AiPanel {
                 self.input_row(ui);
             });
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .show(ui, |ui| match self.tab {
-                Tab::Chat => self.chat_body(ui),
-                Tab::History => self.history_body(ui),
+        // Scroll behaviour: follow a streaming reply until the user scrolls
+        // up, then offer a jump-to-latest button. Scrolling back to the bottom
+        // re-arms following automatically.
+        let chat_rect = ui.available_rect_before_wrap();
+        let wheel_up = self.tab == Tab::Chat
+            && ui.input(|i| {
+                i.raw_scroll_delta.y > 0.5
+                    && i.pointer
+                        .hover_pos()
+                        .is_some_and(|p| chat_rect.contains(p))
             });
+        if wheel_up {
+            self.chat_follow = false;
+        }
+
+        let stream_len = self.streaming.as_ref().map_or(0, |s| s.len());
+        let has_pending = self.pending.is_some();
+        let new_content = self.msgs.len() != self.chat_last_msgs
+            || stream_len != self.chat_last_stream
+            || has_pending != self.chat_last_pending;
+        self.chat_last_msgs = self.msgs.len();
+        self.chat_last_stream = stream_len;
+        self.chat_last_pending = has_pending;
+
+        let scroll_latest = self.chat_scroll_latest || (self.chat_follow && new_content);
+        self.chat_scroll_latest = false;
+        let mut area = egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .stick_to_bottom(self.chat_follow);
+        if scroll_latest {
+            // Clamp to the end; `stick_to_bottom` finishes the job once this
+            // frame's content height is known.
+            area = area.vertical_scroll_offset(f32::MAX);
+        }
+        let out = area.show(ui, |ui| match self.tab {
+            Tab::Chat => self.chat_body(ui),
+            Tab::History => self.history_body(ui),
+        });
+
+        let max_offset = (out.content_size.y - out.inner_rect.height()).max(0.0);
+        let at_bottom = max_offset <= 1.0 || out.state.offset.y >= max_offset - 2.0;
+        if at_bottom {
+            self.chat_follow = true;
+        }
+        if self.tab == Tab::Chat && !at_bottom && max_offset > 20.0 {
+            let btn_rect = egui::Rect::from_center_size(
+                egui::pos2(
+                    out.inner_rect.right() - 20.0,
+                    out.inner_rect.bottom() - 20.0,
+                ),
+                egui::vec2(32.0, 32.0),
+            );
+            let jump = ui.put(
+                btn_rect,
+                egui::Button::new(
+                    RichText::new(tglyph::CHEVRON_DOWN)
+                        .font(theme::icon(16.0))
+                        .color(Color32::WHITE),
+                )
+                .fill(theme::ACCENT())
+                .corner_radius(CornerRadius::same(16))
+                .min_size(egui::vec2(32.0, 32.0)),
+            );
+            if jump.on_hover_text("Jump to the latest reply").clicked() {
+                self.chat_follow = true;
+                self.chat_scroll_latest = true;
+                ui.ctx().request_repaint();
+            }
+        }
     }
 
     fn header(&mut self, ui: &mut Ui) {
@@ -1588,6 +1667,68 @@ mod tests {
         });
         assert!(!output.shapes.is_empty());
     }
+
+    #[test]
+    fn inline_code_uses_the_body_baseline_and_strips_markers() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 480.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let job = inline_job(
+                    ui,
+                    "The highest CPU usage in `irun-app` is **steady**",
+                    Color32::WHITE,
+                );
+                assert_eq!(
+                    job.text,
+                    "The highest CPU usage in irun-app is steady"
+                );
+                assert!(job.wrap.max_width > 1.0);
+                assert!(job.sections.iter().any(|s| {
+                    s.format.font_id.family == egui::FontFamily::Monospace
+                }));
+                assert!(job.sections.iter().any(|s| {
+                    s.format.font_id.family == egui::FontFamily::Proportional
+                }));
+
+                // Laying the job out puts both fonts on the same baseline;
+                // that is what stops inline code from floating above the line.
+                let galley = ui.fonts(|f| f.layout_job(job));
+                let row = &galley.rows[0];
+                let body_y = row
+                    .glyphs
+                    .iter()
+                    .find(|g| g.chr == 'T')
+                    .expect("body glyph")
+                    .pos
+                    .y;
+                let code_y = row
+                    .glyphs
+                    .iter()
+                    .find(|g| g.chr == '-')
+                    .expect("code glyph")
+                    .pos
+                    .y;
+                assert!(
+                    (code_y - body_y).abs() < 0.5,
+                    "inline-code baseline shifted by {} px",
+                    code_y - body_y
+                );
+
+                // An all-code line still gets the body row height via a
+                // zero-width strut.
+                let only = inline_job(ui, "`irun-app`", Color32::WHITE);
+                assert!(only.text.ends_with('\u{200b}'));
+            });
+        });
+    }
 }
 
 fn card_ui(ui: &mut Ui, card: &mut Card, toggles: &mut Vec<usize>, idx: usize) {
@@ -1714,9 +1855,9 @@ fn md_ui(ui: &mut Ui, text: &str, base: Color32) {
             .or_else(|| t.strip_prefix("• "))
         {
             // Keep the bullet in the same run so it hugs the text.
-            ui.horizontal_wrapped(|ui| inline_ui(ui, &format!("• {item}"), base));
+            inline_ui(ui, &format!("• {item}"), base);
         } else {
-            ui.horizontal_wrapped(|ui| inline_ui(ui, t, base));
+            inline_ui(ui, t, base);
         }
     }
     if in_code && !code.is_empty() {
@@ -1747,71 +1888,86 @@ fn code_frame(ui: &mut Ui, code: &str) {
 }
 
 /// `**bold**` + `` `code` `` inside one wrapped line.
+///
+/// Everything goes into a single `LayoutJob` instead of a row of labels: egui
+/// vertically centres each label in a wrapped row, so a smaller inline-code
+/// label used to float above the surrounding sentence. One job keeps every run
+/// on the same baseline and wraps the whole line naturally.
 fn inline_ui(ui: &mut Ui, s: &str, base: Color32) {
-    // Every run is its own label, and egui puts `item_spacing` (8 px) between
-    // labels — that opened gaps before punctuation after an inline `code`
-    // span ("`apk` , not") and after bullets. Hug the runs instead.
-    let prev = ui.spacing().item_spacing.x;
-    ui.spacing_mut().item_spacing.x = 0.0;
-    inline_runs(ui, s, base);
-    ui.spacing_mut().item_spacing.x = prev;
+    let job = inline_job(ui, s, base);
+    if !job.sections.is_empty() {
+        ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Wrap));
+    }
 }
 
-fn inline_runs(ui: &mut Ui, s: &str, base: Color32) {
-    // First split on backticks; odd segments are inline code.
+fn inline_job(ui: &Ui, s: &str, base: Color32) -> egui::text::LayoutJob {
+    let body = egui::FontId::new(11.5, egui::FontFamily::Proportional);
+    let mono = egui::FontId::new(11.5, egui::FontFamily::Monospace);
+    let (body_ascent, body_height, code_ascent) = ui.fonts(|f| {
+        let metrics = |font: &egui::FontId| {
+            let galley =
+                f.layout_no_wrap("M".to_owned(), font.clone(), Color32::WHITE);
+            galley
+                .rows
+                .first()
+                .and_then(|row| row.glyphs.first())
+                .map(|g| (g.font_ascent, g.font_height))
+                .unwrap_or((0.0, 0.0))
+        };
+        let (body_ascent, body_height) = metrics(&body);
+        let (code_ascent, _) = metrics(&mono);
+        (body_ascent, body_height, code_ascent)
+    });
+
+    // Different fonts have different ascent/descent metrics. With egui's
+    // default bottom alignment a smaller-metric monospace run sits a couple of
+    // pixels above the sentence, which is what made inline code "float".
+    // Give the code run a line height whose bottom edge shares the body
+    // baseline, then keep the row tall enough with a body strut below.
+    let body_height = body_height.max(1.0);
+    let code_line_height = (code_ascent + (body_height - body_ascent)).max(1.0);
+    let body_fmt = egui::TextFormat {
+        font_id: body,
+        color: base,
+        line_height: Some(body_height),
+        ..Default::default()
+    };
+    let code_fmt = egui::TextFormat {
+        font_id: mono,
+        color: base,
+        background: theme::BG_PANEL(),
+        expand_bg: 2.0,
+        line_height: Some(code_line_height),
+        ..Default::default()
+    };
+
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = ui.available_width().max(1.0);
+    let mut has_body = false;
+
+    // Split on backticks; odd segments are inline code.
     let mut code_mode = false;
-    let mut rest = s;
-    loop {
-        match rest.find('`') {
-            Some(i) => {
-                let seg = &rest[..i];
-                if code_mode {
-                    ui.label(
-                        RichText::new(seg)
-                            .monospace()
-                            .size(10.5)
-                            .background_color(theme::BG_PANEL())
-                            .color(base),
-                    );
-                } else {
-                    bold_ui(ui, seg, base);
+    for seg in s.split('`') {
+        if !seg.is_empty() {
+            if code_mode {
+                job.append(seg, 0.0, code_fmt.clone());
+            } else {
+                // The bundled font has no bold face; egui's `strong()` only
+                // changes the colour, and the chat already uses that colour.
+                let plain = seg.replace("**", "");
+                if !plain.is_empty() {
+                    job.append(&plain, 0.0, body_fmt.clone());
+                    has_body = true;
                 }
-                code_mode = !code_mode;
-                rest = &rest[i + 1..];
-            }
-            None => {
-                if code_mode {
-                    ui.label(RichText::new(rest).monospace().size(10.5).color(base));
-                } else {
-                    bold_ui(ui, rest, base);
-                }
-                break;
             }
         }
+        code_mode = !code_mode;
     }
-}
 
-fn bold_ui(ui: &mut Ui, s: &str, base: Color32) {
-    let mut bold = false;
-    let mut rest = s;
-    loop {
-        match rest.find("**") {
-            Some(i) => {
-                let seg = &rest[..i];
-                if !seg.is_empty() {
-                    let rt = RichText::new(seg).size(11.5).color(base);
-                    ui.label(if bold { rt.strong() } else { rt });
-                }
-                bold = !bold;
-                rest = &rest[i + 2..];
-            }
-            None => {
-                if !rest.is_empty() {
-                    let rt = RichText::new(rest).size(11.5).color(base);
-                    ui.label(if bold { rt.strong() } else { rt });
-                }
-                break;
-            }
-        }
+    if !has_body && !job.sections.is_empty() {
+        // A zero-width body run supplies the normal row height/baseline when
+        // the whole line is inline code.
+        job.append("\u{200b}", 0.0, body_fmt);
     }
+    job
 }
